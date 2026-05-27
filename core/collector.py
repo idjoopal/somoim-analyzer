@@ -40,11 +40,17 @@ HEADERS = {
 
 # 카테고리 분류
 CAT_LABEL = {"A": "공지", "E": "후기", "J": "가입인사"}
-OUTING_CATS     = ["인물", "인풍", "풍경", "1:1인물", "1:1인물출사"]
-NON_OUTING_CATS = ["보정", "GN", "문화"]
+
+# 제목에서 탐지할 원본 태그 (regex용) — 겹치는 1:1 쌍은 긴 것을 먼저
+RAW_CATS = ["1:1인물출사", "1:1인물", "인물", "인풍", "풍경", "GN", "보정", "문화"]
+# 원본 태그 → 집계·표시용 정규화 카테고리
+CAT_NORMALIZE = {"1:1인물": "인물", "1:1인물출사": "인물", "인풍": "인물&풍경"}
+
+OUTING_CATS     = ["인물", "인물&풍경", "풍경", "GN"]
+NON_OUTING_CATS = ["보정", "문화"]
 ALL_CATS        = OUTING_CATS + NON_OUTING_CATS
 
-CAT_RX    = re.compile(r"\[(" + "|".join(re.escape(c) for c in ALL_CATS) + r")\]")
+CAT_RX    = re.compile(r"\[(" + "|".join(re.escape(c) for c in RAW_CATS) + r")\]")
 CANCEL_RX = re.compile(r"[\(\[]\s*펑\s*[\)\]]")
 
 DATE_PATTERN_WITH_YEAR = r"20(\d{2})[./\-](\d{1,2})[./\-](\d{1,2})"
@@ -75,9 +81,10 @@ def _post_dt(p: dict) -> datetime:
 
 
 def _parse_title_meta(title: str) -> dict:
-    """제목에서 카테고리·취소여부 추출"""
+    """제목에서 카테고리·취소여부 추출 (원본 태그를 정규화 카테고리로 변환)"""
     tags = CAT_RX.findall(title)
-    category = tags[0] if tags else None
+    raw = tags[0] if tags else None
+    category = CAT_NORMALIZE.get(raw, raw) if raw else None
     return {
         "category":    category,
         "is_outing":   category in OUTING_CATS if category else False,

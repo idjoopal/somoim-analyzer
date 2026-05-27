@@ -282,7 +282,7 @@ def _build_sheet_post_stats(wb, posts):
     def utotal(s): return s["A"] + s["A_취소"] + s["E"]
     sorted_users = sorted(user_stats.items(), key=lambda x: -utotal(x[1]))
 
-    hdrs = ["순위","작성자","공지","취소","후기","합계","인물","인풍","풍경",
+    hdrs = ["순위","작성자","공지","취소","후기","합계","인물","인물&풍경","풍경",
             "보정","GN","문화","취소율","좋아요"]
     ws.append([])
     ws.append(hdrs)
@@ -297,7 +297,7 @@ def _build_sheet_post_stats(wb, posts):
         r = ws.max_row + 1
         ws.append([
             rank, author, s["A"], s["A_취소"], s["E"], utotal(s),
-            s["cats"].get("인물", 0), s["cats"].get("인풍", 0), s["cats"].get("풍경", 0),
+            s["cats"].get("인물", 0), s["cats"].get("인물&풍경", 0), s["cats"].get("풍경", 0),
             s["cats"].get("보정", 0), s["cats"].get("GN", 0), s["cats"].get("문화", 0),
             rate, s["likes"],
         ])
@@ -323,7 +323,7 @@ def _build_sheet_post_stats(wb, posts):
             DataBarRule(start_type="min", end_type="max", color="2E75B6", showValue=True),
         )
     _set_col_widths(ws, {
-        "A":5,"B":12,"C":6,"D":6,"E":6,"F":6,"G":6,"H":6,"I":6,
+        "A":5,"B":12,"C":6,"D":6,"E":6,"F":6,"G":6,"H":11,"I":6,
         "J":6,"K":6,"L":6,"M":8,"N":7,
     })
 

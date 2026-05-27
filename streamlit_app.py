@@ -65,11 +65,11 @@ def monthly_table(posts: list[dict], photos: list[dict]) -> dict[str, list[int]]
         return out
 
     return {
-        "진행 출사": by_outing(active),
-        "취소 출사": by_outing(canceled),
-        "후기글":   by_posted(reviews),
-        "사진":     by_posted(photos),
-        "테마 예상": by_posted(themed),
+        "진행 출사":   by_outing(active),
+        "취소 출사":   by_outing(canceled),
+        "후기글":      by_posted(reviews),
+        "사진":        by_posted(photos),
+        "테마사진 참가": by_posted(themed),
     }
 
 
@@ -166,15 +166,15 @@ def theme_participant_ranking(photos: list[dict]) -> list[dict]:
     ]
 
 
-def review_ranking(posts: list[dict]) -> list[dict]:
-    agg: dict[str, dict] = {}
-    for p in posts:
-        if p["cat"] != "E":
-            continue
-        s = agg.setdefault(p["author"], {"작성자": p["author"], "후기": 0, "좋아요": 0})
-        s["후기"] += 1
-        s["좋아요"] += p["likes"]
-    return sorted(agg.values(), key=lambda x: -x["후기"])
+def themed_photos_by_month(photos: list[dict]) -> dict[int, list[dict]]:
+    """댓글 달린 사진(테마사진 후보)을 월별로 모아 작성자순 정렬 — 미리보기 검증용."""
+    out: dict[int, list[dict]] = defaultdict(list)
+    for p in photos:
+        if p["has_comment"]:
+            out[p["posted_at"].month].append(p)
+    for m in out:
+        out[m].sort(key=lambda x: (x["author"], -x["likes"]))
+    return out
 
 
 def outings_table(posts: list[dict]) -> list[dict]:
@@ -415,8 +415,8 @@ def render_basis_box(posts: list[dict], photos: list[dict], period_label: str) -
         f"**분석 기준** — 대상 기간: {period_label}{rng}\n\n"
         "- **기간 기준**: 출사 공지(공지글)는 *출사일*, 후기·가입인사·사진은 *작성일* 기준\n"
         "- **인기**: 좋아요 수(lc)로 정렬, 댓글 수(rn) 병기\n"
-        "- **테마 예상**: 댓글이 달린 사진(rn>0) — 댓글 내용은 비공개라 *추정*\n"
-        "- **취소(펑)**: 제목에 `(펑)`/`[펑]` 포함 · **출사 카테고리**: 인물·인풍·풍경·1:1인물·1:1인물출사",
+        "- **테마사진 참가**: 댓글이 달린 사진(rn>0)을 테마사진 참여로 간주 — 댓글 내용은 비공개라 *추정*\n"
+        "- **취소(펑)**: 제목에 `(펑)`/`[펑]` 포함 · **출사 카테고리**: 인물(1:1인물·1:1인물출사 포함)·인물&풍경·풍경·GN / 활동: 보정·문화",
         icon="ℹ️",
     )
 
@@ -494,7 +494,7 @@ def render_results(year: int, month: int | None, posts: list[dict],
     )
 
     tabs = st.tabs(
-        ["📊 개요", "📌 출사", "📷 사진", "🎨 테마", "🏷️ 카테고리", "👤 사용자", "📋 데이터"]
+        ["📊 개요", "📌 출사", "📷 사진", "🎨 테마사진", "🏷️ 카테고리", "👤 사용자", "📋 데이터"]
     )
 
     with tabs[0]:
@@ -508,7 +508,7 @@ def render_results(year: int, month: int | None, posts: list[dict],
     with tabs[4]:
         _tab_categories(posts)
     with tabs[5]:
-        _tab_users(posts)
+        _tab_users(posts, photos)
     with tabs[6]:
         _tab_data(posts, photos)
 
@@ -523,15 +523,14 @@ def _tab_overview(posts: list[dict], photos: list[dict]) -> None:
                 width="stretch",
             )
     with c2:
-        outing = sum(1 for p in posts if p["cat"] == "A" and p["is_outing"])
-        activity = sum(1 for p in posts if p["cat"] == "A" and not p["is_outing"])
-        if outing + activity > 0:
+        cats = category_counts(posts)
+        if cats:
             st.altair_chart(
-                donut({"출사": outing, "활동(비출사)": activity}, "출사 vs 비출사 활동", scheme="set2"),
+                donut({r["카테고리"]: r["개수"] for r in cats}, "카테고리 분포", scheme="set2"),
                 width="stretch",
             )
     st.altair_chart(monthly_trend_chart(monthly_table(posts, photos)), width="stretch")
-    st.caption("월별 추이 — 출사는 출사일 기준, 후기·사진·테마는 작성일 기준.")
+    st.caption("월별 추이 — 출사는 출사일 기준, 후기·사진·테마사진 참가는 작성일 기준.")
 
     ex = summary_extras(posts, photos)
     st.markdown("#### 핵심 숫자")
@@ -594,8 +593,14 @@ def _tab_outings(posts: list[dict]) -> None:
 
 
 def _tab_photos(photos: list[dict]) -> None:
+    st.info(
+        "💬 **댓글이 달린 사진을 '테마사진 참여'로 간주합니다.** "
+        "(댓글 내용은 비공개라 사진 자체로 추정합니다)",
+        icon="🎨",
+    )
+
     st.markdown("#### 사진 업로드 순위")
-    st.caption("작성자별 사진 수. 테마예상 = 댓글 달린 사진 수, 좋아요는 합계.")
+    st.caption("작성자별 사진 수 · 테마예상 = 댓글 달린(테마사진 참여 추정) 사진 수 · 좋아요 합계.")
     ranking = photo_user_ranking(photos)
     if ranking:
         st.altair_chart(
@@ -614,7 +619,7 @@ def _tab_photos(photos: list[dict]) -> None:
 
     st.markdown("#### 월별 사진 업로드")
     mt = monthly_table(posts=[], photos=photos)
-    st.bar_chart(pd.DataFrame({"사진": mt["사진"], "테마 예상": mt["테마 예상"]},
+    st.bar_chart(pd.DataFrame({"사진": mt["사진"], "테마사진 참가": mt["테마사진 참가"]},
                               index=[f"{m}월" for m in range(1, 13)]))
 
     st.markdown("#### 인기 사진 갤러리")
@@ -630,17 +635,29 @@ def _tab_photos(photos: list[dict]) -> None:
 
 
 def _tab_theme(photos: list[dict]) -> None:
-    st.caption("테마사진 = 댓글이 달린 사진(rn>0). 댓글 내용은 비공개라 테마 이벤트 참여를 *추정*한 값입니다.")
+    st.info(
+        "🎨 **테마사진 = 댓글이 달린 사진(rn>0)** 입니다. 댓글 내용은 비공개라 "
+        "테마 이벤트 참여를 *추정*한 값이니, 아래 월별 미리보기로 실제 테마사진인지 직접 확인하세요.",
+        icon="🎨",
+    )
     user_month, authors, mon_count, mon_list = theme_matrix(photos)
+    by_month = themed_photos_by_month(photos)
 
     st.markdown("#### 월별 테마사진 제출 인원")
     st.bar_chart(pd.DataFrame({"참여 인원": [mon_count[m] for m in range(1, 13)]},
                               index=[f"{m}월" for m in range(1, 13)]))
+    st.caption("각 월을 펼치면 참여자 명단과 그 달 테마사진(댓글 달린 사진) 미리보기를 볼 수 있습니다.")
     months_with = [m for m in range(1, 13) if mon_list[m]]
-    if months_with:
-        for m in months_with:
-            with st.expander(f"{m}월 — {len(mon_list[m])}명"):
-                st.write(", ".join(mon_list[m]))
+    for m in months_with:
+        ph = by_month.get(m, [])
+        with st.expander(f"{m}월 — 참여 {len(mon_list[m])}명 · 테마사진 {len(ph)}장"):
+            st.write("**참여자:** " + ", ".join(mon_list[m]))
+            for i in range(0, len(ph), 5):
+                for col, p in zip(st.columns(5), ph[i:i + 5]):
+                    col.image(
+                        p["url_small"], width="stretch",
+                        caption=f"{p['author']} · 👍{p['likes']} 💬{p['comments']}",
+                    )
 
     st.markdown("#### 테마 매트릭스")
     ch = heatmap(photos)
@@ -657,7 +674,7 @@ def _tab_theme(photos: list[dict]) -> None:
 
 
 def _tab_categories(posts: list[dict]) -> None:
-    st.caption("출사 공지(cat=A) 제목의 [카테고리] 태그 기준. 출사: 인물·인풍·풍경·1:1인물·1:1인물출사 / 활동: 보정·GN·문화.")
+    st.caption("출사 공지(cat=A) 제목의 [카테고리] 태그 기준. 출사: 인물(1:1인물·1:1인물출사 포함)·인물&풍경·풍경·GN / 활동: 보정·문화.")
     rows = category_counts(posts)
     if not rows:
         st.info("분류된 카테고리가 없습니다.")
@@ -675,27 +692,41 @@ def _tab_categories(posts: list[dict]) -> None:
     )
 
 
-def _tab_users(posts: list[dict]) -> None:
-    st.markdown("#### 게시글 종합 랭킹")
-    st.caption("작성자별 전체 게시글 수 (공지+취소+후기). 좋아요는 합계.")
-    rows = top_posters(posts, 15)
+def _tab_users(posts: list[dict], photos: list[dict]) -> None:
+    st.markdown("#### 사용자 활동 종합 랭킹")
+    st.caption(
+        "작성자별 게시글 수(공지+취소+후기)와 업로드한 사진 수. "
+        "게시글 수 → 사진 수 순으로 정렬, 좋아요는 게시글 좋아요 합계."
+    )
+    photo_cnt = {r["작성자"]: r["사진수"] for r in photo_user_ranking(photos)}
+    by_author = {r["작성자"]: r for r in top_posters(posts, n=max(len(posts), 1))}
+    rows = []
+    for author in set(by_author) | set(photo_cnt):
+        pr = by_author.get(author)
+        rows.append({
+            "작성자": author,
+            "게시글": pr["게시글"] if pr else 0,
+            "사진": photo_cnt.get(author, 0),
+            "공지": pr["공지"] if pr else 0,
+            "취소": pr["취소"] if pr else 0,
+            "후기": pr["후기"] if pr else 0,
+            "좋아요": pr["좋아요"] if pr else 0,
+        })
+    rows.sort(key=lambda x: (-x["게시글"], -x["사진"]))
+    rows = rows[:20]
     if rows:
         st.dataframe(
             _ranking_df(rows, "게시글"),
             hide_index=True, width="stretch",
             column_config={
                 "게시글": st.column_config.ProgressColumn(
-                    "게시글", min_value=0, max_value=max(r["게시글"] for r in rows), format="%d"),
+                    "게시글", min_value=0, max_value=max(r["게시글"] for r in rows) or 1, format="%d"),
+                "사진": st.column_config.ProgressColumn(
+                    "사진", min_value=0, max_value=max(r["사진"] for r in rows) or 1, format="%d"),
             },
         )
-
-    st.markdown("#### 후기 작성 순위")
-    st.caption("cat=E 후기글 수 기준.")
-    rev = review_ranking(posts)
-    if rev:
-        st.dataframe(_ranking_df(rev, "후기"), hide_index=True, width="stretch")
     else:
-        st.info("후기글이 없습니다.")
+        st.info("데이터가 없습니다.")
 
 
 def _tab_data(posts: list[dict], photos: list[dict]) -> None:
