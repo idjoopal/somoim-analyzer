@@ -659,12 +659,17 @@ def _build_sheet_insights(wb, posts, posts_A, posts_E, posts_active, posts_cance
         r = row("가장 활발한 달", f"{hot}월", f"{mon_user_count[hot]}명 참여", r, "good")
 
     r += 1
-    r = section("⑤ 카테고리 트렌드", r)
-    total_outing = sum(1 for p in posts_A if p["is_outing"])
-    for cat in ("인풍", "인물", "풍경"):
-        cnt = sum(1 for p in posts_A if p["category"] == cat)
-        if total_outing:
-            r = row(f"[{cat}] 비중", f"{cnt}건 ({cnt/total_outing*100:.1f}%)", "", r)
+    r = section("⑤ 카테고리 트렌드 (출사 공지 기준)", r)
+    all_cats = OUTING_CATS + NON_OUTING_CATS
+    cat_counts = {c: sum(1 for p in posts_A if p["category"] == c) for c in all_cats}
+    total_cat = sum(cat_counts.values())
+    for cat in all_cats:
+        cnt = cat_counts[cat]
+        if not cnt:
+            continue
+        pct = cnt / total_cat * 100 if total_cat else 0
+        kind = "출사" if cat in OUTING_CATS else "활동"
+        r = row(f"[{cat}]", f"{cnt}건 ({pct:.1f}%)", kind, r)
 
     r += 1
     r = section("⑥ 취소율 분석 (공지 3건 이상)", r)
