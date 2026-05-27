@@ -177,17 +177,6 @@ def themed_photos_by_month(photos: list[dict]) -> dict[int, list[dict]]:
     return out
 
 
-def review_ranking(posts: list[dict]) -> list[dict]:
-    agg: dict[str, dict] = {}
-    for p in posts:
-        if p["cat"] != "E":
-            continue
-        s = agg.setdefault(p["author"], {"작성자": p["author"], "후기": 0, "좋아요": 0})
-        s["후기"] += 1
-        s["좋아요"] += p["likes"]
-    return sorted(agg.values(), key=lambda x: -x["후기"])
-
-
 def outings_table(posts: list[dict]) -> list[dict]:
     rows = []
     for p in sorted((p for p in posts if p["cat"] == "A"),
@@ -519,7 +508,7 @@ def render_results(year: int, month: int | None, posts: list[dict],
     with tabs[4]:
         _tab_categories(posts)
     with tabs[5]:
-        _tab_users(posts)
+        _tab_users(posts, photos)
     with tabs[6]:
         _tab_data(posts, photos)
 
@@ -703,27 +692,41 @@ def _tab_categories(posts: list[dict]) -> None:
     )
 
 
-def _tab_users(posts: list[dict]) -> None:
-    st.markdown("#### 게시글 종합 랭킹")
-    st.caption("작성자별 전체 게시글 수 (공지+취소+후기). 좋아요는 합계.")
-    rows = top_posters(posts, 15)
+def _tab_users(posts: list[dict], photos: list[dict]) -> None:
+    st.markdown("#### 사용자 활동 종합 랭킹")
+    st.caption(
+        "작성자별 게시글 수(공지+취소+후기)와 업로드한 사진 수. "
+        "게시글 수 → 사진 수 순으로 정렬, 좋아요는 게시글 좋아요 합계."
+    )
+    photo_cnt = {r["작성자"]: r["사진수"] for r in photo_user_ranking(photos)}
+    by_author = {r["작성자"]: r for r in top_posters(posts, n=max(len(posts), 1))}
+    rows = []
+    for author in set(by_author) | set(photo_cnt):
+        pr = by_author.get(author)
+        rows.append({
+            "작성자": author,
+            "게시글": pr["게시글"] if pr else 0,
+            "사진": photo_cnt.get(author, 0),
+            "공지": pr["공지"] if pr else 0,
+            "취소": pr["취소"] if pr else 0,
+            "후기": pr["후기"] if pr else 0,
+            "좋아요": pr["좋아요"] if pr else 0,
+        })
+    rows.sort(key=lambda x: (-x["게시글"], -x["사진"]))
+    rows = rows[:20]
     if rows:
         st.dataframe(
             _ranking_df(rows, "게시글"),
             hide_index=True, width="stretch",
             column_config={
                 "게시글": st.column_config.ProgressColumn(
-                    "게시글", min_value=0, max_value=max(r["게시글"] for r in rows), format="%d"),
+                    "게시글", min_value=0, max_value=max(r["게시글"] for r in rows) or 1, format="%d"),
+                "사진": st.column_config.ProgressColumn(
+                    "사진", min_value=0, max_value=max(r["사진"] for r in rows) or 1, format="%d"),
             },
         )
-
-    st.markdown("#### 후기 작성 순위")
-    st.caption("cat=E 후기글 수 기준.")
-    rev = review_ranking(posts)
-    if rev:
-        st.dataframe(_ranking_df(rev, "후기"), hide_index=True, width="stretch")
     else:
-        st.info("후기글이 없습니다.")
+        st.info("데이터가 없습니다.")
 
 
 def _tab_data(posts: list[dict], photos: list[dict]) -> None:
