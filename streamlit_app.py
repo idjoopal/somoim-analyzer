@@ -249,15 +249,14 @@ def top_photos(photos: list[dict], n: int = 12) -> list[dict]:
 
 
 def summary_extras(posts: list[dict], photos: list[dict]) -> dict:
-    top_post = max(posts, key=lambda p: p["likes"]) if posts else None
-    top_photo = max(photos, key=lambda p: p["likes"]) if photos else None
     return {
         "게시글 좋아요": sum(p["likes"] for p in posts),
         "게시글 댓글": sum(p["comments"] for p in posts),
         "사진 좋아요": sum(p["likes"] for p in photos),
         "사진 댓글": sum(p["comments"] for p in photos),
-        "top_post": top_post,
-        "top_photo": top_photo,
+        "top_post_likes":    max(posts, key=lambda p: p["likes"]) if posts else None,
+        "top_post_comments": max(posts, key=lambda p: p["comments"]) if posts else None,
+        "top_photo_likes":   max(photos, key=lambda p: p["likes"]) if photos else None,
     }
 
 
@@ -545,12 +544,15 @@ def _tab_overview(posts: list[dict], photos: list[dict]) -> None:
     c[1].metric("게시글 댓글 합", ex["게시글 댓글"])
     c[2].metric("사진 좋아요 합", ex["사진 좋아요"])
     c[3].metric("사진 댓글 합", ex["사진 댓글"])
-    if ex["top_post"]:
-        tp = ex["top_post"]
-        st.markdown(f"**최고 인기 게시글** (👍{tp['likes']} 💬{tp['comments']}) — {tp['author']} · {tp['title']}")
-    if ex["top_photo"]:
-        tph = ex["top_photo"]
-        st.markdown(f"**최고 인기 사진** (👍{tph['likes']} 💬{tph['comments']}) — {tph['author']}")
+    if ex["top_post_likes"]:
+        tp = ex["top_post_likes"]
+        st.markdown(f"**최고 인기 게시글 (좋아요 기준)** 👍{tp['likes']} (💬{tp['comments']}) — {tp['author']} · {tp['title']}")
+    if ex["top_post_comments"]:
+        tc = ex["top_post_comments"]
+        st.markdown(f"**최고 인기 게시글 (댓글 기준)** 💬{tc['comments']} (👍{tc['likes']}) — {tc['author']} · {tc['title']}")
+    if ex["top_photo_likes"]:
+        tph = ex["top_photo_likes"]
+        st.markdown(f"**최고 인기 사진 (좋아요 기준)** 👍{tph['likes']} — {tph['author']}")
 
 
 def _tab_outings(posts: list[dict]) -> None:
