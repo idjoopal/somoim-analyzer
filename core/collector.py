@@ -209,6 +209,7 @@ def collect_posts(
     year: int,
     month: Optional[int] = None,
     progress: ProgressFn = None,
+    keep_unclassified: bool = False,
 ) -> list[dict]:
     """
     게시글 수집 + 필터링.
@@ -221,12 +222,16 @@ def collect_posts(
         year: 대상 연도 (예: 2026)
         month: 대상 월 (None이면 연 전체)
         progress: 진행 콜백 fn(msg: str, pct: float)
+        keep_unclassified: True면 출사일 추론 실패한 cat=A 공지를 버리지 않고
+            outing_date=None으로 포함(연/월 게이트는 작성일 기준)하고 검토 대상으로 표시.
+            기본 False는 기존 동작(추론 실패 공지 제외)을 그대로 유지.
 
     Returns:
         list of dict with keys:
             id, author, wid, title, outing_date(str|None),
             posted_at(datetime), cat, cat_label, category,
-            is_outing, is_canceled, likes, comments, images
+            is_outing, is_canceled, likes, comments, images,
+            needs_review(bool), review_reason(str)
     """
     _emit(progress, "게시글 수집 시작…", 0.0)
     raw = _fetch_paginated("/api/articles", "cs", year, progress, "게시글")
@@ -237,22 +242,34 @@ def collect_posts(
         dt   = _post_dt(p)
         cat  = p.get("cat", "")
         meta = _parse_title_meta(p["at"])
+        review_reasons: list[str] = []
 
         if cat == "A":
             od = infer_outing_date(p["at"], p.get("c", ""), dt)
-            if not od:
-                continue
-            if od.year != year:
-                continue
-            if month is not None and od.month != month:
-                continue
-            outing_date = od.isoformat()
+            if od is None:
+                if not keep_unclassified:
+                    continue
+                if dt.year != year:
+                    continue
+                if month is not None and dt.month != month:
+                    continue
+                outing_date = None
+                review_reasons.append("출사일 미상")
+            else:
+                if od.year != year:
+                    continue
+                if month is not None and od.month != month:
+                    continue
+                outing_date = od.isoformat()
         else:
             if dt.year != year:
                 continue
             if month is not None and dt.month != month:
                 continue
             outing_date = None
+
+        if meta["category"] is None and cat in ("A", "E"):
+            review_reasons.append("카테고리 미상")
 
         posts.append({
             "id":          p["id"],
@@ -269,6 +286,8 @@ def collect_posts(
             "likes":       p.get("lc", 0),
             "comments":    p.get("rn", 0),
             "images":      p.get("ic", 0),
+            "needs_review":  bool(review_reasons),
+            "review_reason": ", ".join(review_reasons),
         })
 
     _emit(progress, f"게시글 필터 후 {len(posts)}개", 0.5)

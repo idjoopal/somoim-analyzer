@@ -1,22 +1,31 @@
 """
 다감노📸 소모임 분석 — Streamlit 앱
 
-년/월을 선택하고 "분석 시작"을 누르면 somoim API에서 게시글·사진을 수집해
-KPI·랭킹·월별 차트를 보여주고, 통계 엑셀을 다운로드한다.
-
-실행:
-    streamlit run streamlit_app.py
+흐름: 수집 → 분류 검토(드롭박스 보정) → 인사이트 + 엑셀 다운로드.
+실행: streamlit run streamlit_app.py
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date, datetime
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
-from core.collector import collect_posts, collect_photos, GROUP_NAME
+from core.collector import (
+    GROUP_NAME,
+    NON_OUTING_CATS,
+    OUTING_CATS,
+    collect_photos,
+    collect_posts,
+)
 from core.excel_builder import build_excel
+
+ALL_CATS = OUTING_CATS + NON_OUTING_CATS
+CAT_OPTIONS = ALL_CATS + ["(없음)"]
+STATUS_OPTIONS = ["진행", "취소"]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -24,7 +33,6 @@ from core.excel_builder import build_excel
 # ═══════════════════════════════════════════════════════════════
 
 def compute_kpis(posts: list[dict], photos: list[dict]) -> dict[str, int]:
-    """대시보드 KPI 6종. excel_builder의 분류 규칙과 동일."""
     posts_A = [p for p in posts if p["cat"] == "A"]
     return {
         "전체 게시글": len(posts),
@@ -37,7 +45,6 @@ def compute_kpis(posts: list[dict], photos: list[dict]) -> dict[str, int]:
 
 
 def monthly_table(posts: list[dict], photos: list[dict]) -> dict[str, list[int]]:
-    """1~12월 12칸 시리즈 5종. 공지는 출사일 기준, 그 외는 작성일 기준."""
     posts_A  = [p for p in posts if p["cat"] == "A"]
     active   = [p for p in posts_A if not p["is_canceled"]]
     canceled = [p for p in posts_A if p["is_canceled"]]
@@ -67,42 +74,411 @@ def monthly_table(posts: list[dict], photos: list[dict]) -> dict[str, list[int]]
 
 
 def top_posters(posts: list[dict], n: int = 10) -> list[dict]:
-    """작성자별 게시글 합계 내림차순 TOP n."""
     agg: dict[str, dict] = {}
     for p in posts:
         s = agg.setdefault(p["author"], {
-            "작성자": p["author"], "게시글": 0, "공지": 0, "후기": 0, "좋아요": 0,
+            "작성자": p["author"], "게시글": 0, "공지": 0, "취소": 0, "후기": 0, "좋아요": 0,
         })
         s["게시글"] += 1
         if p["cat"] == "A":
-            s["공지"] += 1
+            s["취소" if p["is_canceled"] else "공지"] += 1
         elif p["cat"] == "E":
             s["후기"] += 1
         s["좋아요"] += p["likes"]
     return sorted(agg.values(), key=lambda x: -x["게시글"])[:n]
 
 
+def category_counts(posts: list[dict]) -> list[dict]:
+    posts_A = [p for p in posts if p["cat"] == "A"]
+    rows = []
+    for c in ALL_CATS:
+        sub = [p for p in posts_A if p["category"] == c]
+        if sub:
+            rows.append({
+                "카테고리": c,
+                "유형": "출사" if c in OUTING_CATS else "활동",
+                "개수": len(sub),
+                "좋아요": sum(p["likes"] for p in sub),
+            })
+    return sorted(rows, key=lambda x: -x["개수"])
+
+
+def outing_user_ranking(posts: list[dict]) -> list[dict]:
+    agg: dict[str, dict] = {}
+    for p in posts:
+        if p["cat"] != "A":
+            continue
+        s = agg.setdefault(p["author"], {"작성자": p["author"], "진행": 0, "취소": 0})
+        s["취소" if p["is_canceled"] else "진행"] += 1
+    rows = []
+    for s in agg.values():
+        tot = s["진행"] + s["취소"]
+        s["합계"] = tot
+        s["취소율"] = round(s["취소"] / tot * 100, 1) if tot else 0.0
+        rows.append(s)
+    return sorted(rows, key=lambda x: -x["합계"])
+
+
+def cancel_ranking(posts: list[dict], min_notices: int = 3) -> list[dict]:
+    rows = [r for r in outing_user_ranking(posts) if r["합계"] >= min_notices]
+    return sorted(rows, key=lambda x: (-x["취소율"], -x["취소"]))
+
+
+def photo_user_ranking(photos: list[dict]) -> list[dict]:
+    agg: dict[str, dict] = {}
+    for p in photos:
+        s = agg.setdefault(p["author"], {
+            "작성자": p["author"], "사진수": 0, "테마예상": 0, "좋아요": 0, "댓글": 0,
+        })
+        s["사진수"] += 1
+        if p["has_comment"]:
+            s["테마예상"] += 1
+        s["좋아요"] += p["likes"]
+        s["댓글"] += p["comments"]
+    rows = []
+    for s in agg.values():
+        s["테마비율"] = round(s["테마예상"] / s["사진수"] * 100, 1) if s["사진수"] else 0.0
+        s["장당좋아요"] = round(s["좋아요"] / s["사진수"], 1) if s["사진수"] else 0.0
+        rows.append(s)
+    return sorted(rows, key=lambda x: -x["사진수"])
+
+
+def theme_matrix(photos: list[dict]):
+    """테마사진(댓글>0) 작성자×월 매트릭스."""
+    user_month: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for p in photos:
+        if p["has_comment"]:
+            user_month[p["author"]][p["posted_at"].month] += 1
+    authors = sorted(
+        user_month,
+        key=lambda a: (-len(user_month[a]), -sum(user_month[a].values())),
+    )
+    mon_list = {m: sorted(a for a in user_month if m in user_month[a]) for m in range(1, 13)}
+    mon_count = {m: len(mon_list[m]) for m in range(1, 13)}
+    return user_month, authors, mon_count, mon_list
+
+
+def theme_participant_ranking(photos: list[dict]) -> list[dict]:
+    user_month, authors, _, _ = theme_matrix(photos)
+    return [
+        {"작성자": a, "참여월수": len(user_month[a]), "테마사진": sum(user_month[a].values())}
+        for a in authors
+    ]
+
+
+def review_ranking(posts: list[dict]) -> list[dict]:
+    agg: dict[str, dict] = {}
+    for p in posts:
+        if p["cat"] != "E":
+            continue
+        s = agg.setdefault(p["author"], {"작성자": p["author"], "후기": 0, "좋아요": 0})
+        s["후기"] += 1
+        s["좋아요"] += p["likes"]
+    return sorted(agg.values(), key=lambda x: -x["후기"])
+
+
+def outings_table(posts: list[dict]) -> list[dict]:
+    rows = []
+    for p in sorted((p for p in posts if p["cat"] == "A"),
+                    key=lambda x: x["outing_date"] or "0000", reverse=True):
+        od = p["outing_date"]
+        dday = (date.fromisoformat(od) - p["posted_at"].date()).days if od else None
+        rows.append({
+            "출사일": od or "-",
+            "공지일": p["posted_at"].strftime("%Y-%m-%d"),
+            "D-day": f"+{dday}" if dday is not None and dday >= 0 else (str(dday) if dday is not None else "-"),
+            "작성자": p["author"],
+            "카테고리": p["category"] or "-",
+            "유형": "출사" if p["is_outing"] else "활동",
+            "상태": "취소" if p["is_canceled"] else "진행",
+            "제목": p["title"],
+            "좋아요": p["likes"],
+            "댓글": p["comments"],
+        })
+    return rows
+
+
+def reviews_table(posts: list[dict]) -> list[dict]:
+    rows = []
+    for p in sorted((p for p in posts if p["cat"] == "E"),
+                    key=lambda x: x["posted_at"], reverse=True):
+        rows.append({
+            "작성일": p["posted_at"].strftime("%Y-%m-%d"),
+            "월": p["posted_at"].month,
+            "작성자": p["author"],
+            "카테고리": p["category"] or "-",
+            "제목": p["title"],
+            "좋아요": p["likes"],
+            "댓글": p["comments"],
+        })
+    return rows
+
+
+def posts_dataframe(posts: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "ID": p["id"],
+        "작성자": p["author"],
+        "유형": p["cat_label"],
+        "카테고리": p["category"] or "",
+        "제목": p["title"],
+        "작성일": p["posted_at"].strftime("%Y-%m-%d %H:%M"),
+        "출사일": p["outing_date"] or "",
+        "상태": "취소" if p["is_canceled"] else ("진행" if p["cat"] == "A" else ""),
+        "좋아요": p["likes"],
+        "댓글": p["comments"],
+        "이미지수": p["images"],
+    } for p in sorted(posts, key=lambda x: x["posted_at"], reverse=True)])
+
+
+def photos_dataframe(photos: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "ID": p["id"],
+        "작성자": p["author"],
+        "업로드일": p["posted_at"].strftime("%Y-%m-%d %H:%M"),
+        "좋아요": p["likes"],
+        "댓글": p["comments"],
+        "테마예상": "🎨" if p["has_comment"] else "",
+        "고화질 URL": p["url_large"],
+        "썸네일 URL": p["url_thumb"],
+    } for p in sorted(photos, key=lambda x: x["posted_at"], reverse=True)])
+
+
+def top_photos(photos: list[dict], n: int = 12) -> list[dict]:
+    """인기 = 좋아요(lc) 내림차순, 동률은 댓글(rn)."""
+    return sorted(photos, key=lambda p: (-p["likes"], -p["comments"]))[:n]
+
+
+def summary_extras(posts: list[dict], photos: list[dict]) -> dict:
+    top_post = max(posts, key=lambda p: p["likes"]) if posts else None
+    top_photo = max(photos, key=lambda p: p["likes"]) if photos else None
+    return {
+        "게시글 좋아요": sum(p["likes"] for p in posts),
+        "게시글 댓글": sum(p["comments"] for p in posts),
+        "사진 좋아요": sum(p["likes"] for p in photos),
+        "사진 댓글": sum(p["comments"] for p in photos),
+        "top_post": top_post,
+        "top_photo": top_photo,
+    }
+
+
+def period_coverage(posts: list[dict], photos: list[dict]):
+    dts = [p["posted_at"] for p in posts] + [p["posted_at"] for p in photos]
+    return (min(dts).date(), max(dts).date()) if dts else None
+
+
 # ═══════════════════════════════════════════════════════════════
-# 수집 파이프라인 (캐시)
+# 분류 검토 (triage)
+# ═══════════════════════════════════════════════════════════════
+
+def build_editor_df(cat_a_sorted: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame([{
+        "검토": p["review_reason"] or "",
+        "공지일": p["posted_at"].date(),
+        "작성자": p["author"],
+        "제목": p["title"],
+        "카테고리": p["category"] or "(없음)",
+        "출사일": date.fromisoformat(p["outing_date"]) if p["outing_date"] else None,
+        "상태": "취소" if p["is_canceled"] else "진행",
+    } for p in cat_a_sorted])
+    if not df.empty:
+        df["공지일"] = pd.to_datetime(df["공지일"])
+        df["출사일"] = pd.to_datetime(df["출사일"])
+    return df
+
+
+def apply_triage(raw_posts: list[dict], cat_a_sorted: list[dict],
+                 edited: pd.DataFrame, year: int, month: int | None) -> list[dict]:
+    """편집된 cat=A 분류를 적용하고 수집기와 동일 규칙으로 연/월 필터."""
+    final = [dict(p) for p in raw_posts if p["cat"] != "A"]
+
+    for orig, (_, row) in zip(cat_a_sorted, edited.iterrows()):
+        p = dict(orig)
+        cat_val = row["카테고리"]
+        p["category"] = None if cat_val == "(없음)" else cat_val
+        p["is_outing"] = p["category"] in OUTING_CATS
+        p["is_canceled"] = row["상태"] == "취소"
+
+        od = row["출사일"]
+        if pd.isna(od):
+            continue  # 출사일 미상 → 분석 제외
+        od = od.date() if hasattr(od, "date") else od
+        if od.year != year:
+            continue
+        if month is not None and od.month != month:
+            continue
+        p["outing_date"] = od.isoformat()
+        p["needs_review"] = False
+        p["review_reason"] = ""
+        final.append(p)
+
+    return final
+
+
+# ═══════════════════════════════════════════════════════════════
+# Altair 차트
+# ═══════════════════════════════════════════════════════════════
+
+def donut(data: dict[str, int], title: str, scheme: str = "tableau10") -> alt.Chart:
+    df = pd.DataFrame({"구분": list(data.keys()), "값": list(data.values())})
+    return (
+        alt.Chart(df)
+        .mark_arc(innerRadius=55)
+        .encode(
+            theta=alt.Theta("값:Q"),
+            color=alt.Color("구분:N", scale=alt.Scale(scheme=scheme), legend=alt.Legend(title=None)),
+            tooltip=["구분", "값"],
+        )
+        .properties(title=title, height=260)
+    )
+
+
+def hbar(rows: list[dict], cat_col: str, val_col: str, title: str,
+         n: int = 10, scheme: str = "blues") -> alt.Chart:
+    df = pd.DataFrame(rows).head(n)
+    return (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X(f"{val_col}:Q", title=val_col),
+            y=alt.Y(f"{cat_col}:N", sort="-x", title=None),
+            color=alt.Color(f"{val_col}:Q", scale=alt.Scale(scheme=scheme), legend=None),
+            tooltip=list(df.columns),
+        )
+        .properties(title=title, height=max(180, 30 * len(df)))
+    )
+
+
+def heatmap(photos: list[dict], max_authors: int = 30) -> alt.Chart | None:
+    user_month, authors, _, _ = theme_matrix(photos)
+    authors = authors[:max_authors]
+    long = [
+        {"작성자": a, "월": m, "장수": user_month[a].get(m, 0)}
+        for a in authors for m in range(1, 13) if user_month[a].get(m, 0) > 0
+    ]
+    if not long:
+        return None
+    df = pd.DataFrame(long)
+    return (
+        alt.Chart(df)
+        .mark_rect()
+        .encode(
+            x=alt.X("월:O", title="월"),
+            y=alt.Y("작성자:N", sort=authors, title=None),
+            color=alt.Color("장수:Q", scale=alt.Scale(scheme="purples"), legend=alt.Legend(title="장수")),
+            tooltip=["작성자", "월", "장수"],
+        )
+        .properties(title="월별 테마사진 제출 (작성자×월)", height=max(220, 22 * len(authors)))
+    )
+
+
+def monthly_trend_chart(monthly: dict[str, list[int]]) -> alt.Chart:
+    rows = [
+        {"월": m, "구분": label, "건수": v}
+        for label, vals in monthly.items()
+        for m, v in enumerate(vals, 1)
+    ]
+    df = pd.DataFrame(rows)
+    return (
+        alt.Chart(df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("월:O", title="월"),
+            y=alt.Y("건수:Q", title="건수"),
+            color=alt.Color("구분:N", legend=alt.Legend(title=None)),
+            tooltip=["월", "구분", "건수"],
+        )
+        .properties(title="월별 활동 추이", height=320)
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 수집 파이프라인 (캐시) — 엑셀은 검토 후 생성
 # ═══════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def run_analysis(year: int, month: int | None, _progress=None):
-    """수집 + 엑셀 생성. _progress(밑줄)는 캐시 키에서 제외된다."""
-    posts  = collect_posts(year, month, progress=_progress)
+def collect_data(year: int, month: int | None, _progress=None):
+    posts = collect_posts(year, month, progress=_progress, keep_unclassified=True)
     photos = collect_photos(year, month, progress=_progress)
-    xlsx   = build_excel(posts, photos, year, month)
-    return posts, photos, xlsx
+    return posts, photos
 
 
 # ═══════════════════════════════════════════════════════════════
-# 결과 렌더링
+# 렌더링
 # ═══════════════════════════════════════════════════════════════
+
+def render_basis_box(posts: list[dict], photos: list[dict], period_label: str) -> None:
+    cov = period_coverage(posts, photos)
+    rng = ""
+    if cov:
+        rng = f" · 실제 데이터 {cov[0].isoformat()} ~ {cov[1].isoformat()}"
+    st.info(
+        f"**분석 기준** — 대상 기간: {period_label}{rng}\n\n"
+        "- **기간 기준**: 출사 공지(공지글)는 *출사일*, 후기·가입인사·사진은 *작성일* 기준\n"
+        "- **인기**: 좋아요 수(lc)로 정렬, 댓글 수(rn) 병기\n"
+        "- **테마 예상**: 댓글이 달린 사진(rn>0) — 댓글 내용은 비공개라 *추정*\n"
+        "- **취소(펑)**: 제목에 `(펑)`/`[펑]` 포함 · **출사 카테고리**: 인물·인풍·풍경·1:1인물·1:1인물출사",
+        icon="ℹ️",
+    )
+
+
+def render_triage(year: int, month: int | None, raw_posts: list[dict], photos: list[dict]) -> None:
+    st.divider()
+    st.subheader("② 분류 검토 · 보정")
+    cat_a = [p for p in raw_posts if p["cat"] == "A"]
+    cat_a_sorted = sorted(cat_a, key=lambda p: (not p["needs_review"], p["posted_at"]))
+    n_review = sum(1 for p in cat_a if p["needs_review"])
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("출사 공지", len(cat_a))
+    c2.metric("⚠️ 검토 필요", n_review)
+    c3.metric("사진", len(photos))
+    st.caption(
+        "자동 분류가 애매한 공지(출사일 추론 실패·카테고리 미상)를 직접 보정하세요. "
+        "**카테고리·출사일·진행/취소**를 바꾼 뒤 아래 버튼을 누르면 그 분류로 인사이트·엑셀이 생성됩니다. "
+        "출사일을 비워두면 해당 공지는 분석에서 제외됩니다."
+    )
+
+    editor_df = build_editor_df(cat_a_sorted)
+    col_config = {
+        "검토": st.column_config.TextColumn("검토", disabled=True, width="small"),
+        "공지일": st.column_config.DateColumn("공지일", disabled=True, format="YYYY-MM-DD"),
+        "작성자": st.column_config.TextColumn("작성자", disabled=True, width="small"),
+        "제목": st.column_config.TextColumn("제목", disabled=True, width="large"),
+        "카테고리": st.column_config.SelectboxColumn("카테고리", options=CAT_OPTIONS, required=True),
+        "출사일": st.column_config.DateColumn("출사일", format="YYYY-MM-DD"),
+        "상태": st.column_config.SelectboxColumn("상태", options=STATUS_OPTIONS, required=True),
+    }
+    editor_kwargs = dict(
+        column_config=col_config, hide_index=True, width="stretch",
+        num_rows="fixed", key=f"editor_{year}_{month}",
+    )
+
+    if n_review > 0:
+        st.warning(f"검토가 필요한 공지 {n_review}건이 표 위쪽에 있습니다.")
+        edited = st.data_editor(editor_df, **editor_kwargs)
+    else:
+        with st.expander("분류 직접 보정 (선택) — 자동 분류 확인/수정", expanded=False):
+            edited = st.data_editor(editor_df, **editor_kwargs)
+
+    if st.button("✅ 이 분류로 분석 진행", type="primary"):
+        final_posts = apply_triage(raw_posts, cat_a_sorted, edited, year, month)
+        xlsx = build_excel(final_posts, photos, year, month)
+        st.session_state["result"] = (year, month, final_posts, photos, xlsx)
+
+
+def _ranking_df(rows: list[dict], count_col: str) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df.insert(0, "순위", range(1, len(df) + 1))
+    return df
+
 
 def render_results(year: int, month: int | None, posts: list[dict],
                    photos: list[dict], xlsx: bytes) -> None:
     period = f"{year}년" + (f" {month}월" if month else " 전체")
-    st.subheader(f"📊 {period} 결과")
+    st.divider()
+    st.subheader(f"③ {period} 인사이트")
+    render_basis_box(posts, photos, period)
 
     kpis = compute_kpis(posts, photos)
     for col, (label, val) in zip(st.columns(len(kpis)), kpis.items()):
@@ -110,28 +486,242 @@ def render_results(year: int, month: int | None, posts: list[dict],
 
     fname_period = f"{year}" + (f"_{month:02d}" if month else "")
     st.download_button(
-        "📥 엑셀 다운로드",
+        "📥 엑셀 다운로드 (원본 + 인사이트 8개 시트)",
         data=xlsx,
         file_name=f"다감노_{fname_period}_분석.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
 
-    st.markdown("#### 👤 게시글 TOP 10")
-    top = top_posters(posts, 10)
-    if top:
-        df = pd.DataFrame(top)
-        df.insert(0, "순위", range(1, len(df) + 1))
-        st.dataframe(df, hide_index=True, use_container_width=True)
-    else:
-        st.info("해당 기간 게시글이 없습니다.")
+    tabs = st.tabs(
+        ["📊 개요", "📌 출사", "📷 사진", "🎨 테마", "🏷️ 카테고리", "👤 사용자", "📋 데이터"]
+    )
 
-    st.markdown("#### 📅 월별 활동")
-    chart_df = pd.DataFrame(
-        monthly_table(posts, photos),
+    with tabs[0]:
+        _tab_overview(posts, photos)
+    with tabs[1]:
+        _tab_outings(posts)
+    with tabs[2]:
+        _tab_photos(photos)
+    with tabs[3]:
+        _tab_theme(photos)
+    with tabs[4]:
+        _tab_categories(posts)
+    with tabs[5]:
+        _tab_users(posts)
+    with tabs[6]:
+        _tab_data(posts, photos)
+
+
+def _tab_overview(posts: list[dict], photos: list[dict]) -> None:
+    k = compute_kpis(posts, photos)
+    c1, c2 = st.columns(2)
+    with c1:
+        if k["진행 출사"] + k["취소 출사"] > 0:
+            st.altair_chart(
+                donut({"진행": k["진행 출사"], "취소": k["취소 출사"]}, "출사 공지 진행/취소"),
+                width="stretch",
+            )
+    with c2:
+        outing = sum(1 for p in posts if p["cat"] == "A" and p["is_outing"])
+        activity = sum(1 for p in posts if p["cat"] == "A" and not p["is_outing"])
+        if outing + activity > 0:
+            st.altair_chart(
+                donut({"출사": outing, "활동(비출사)": activity}, "출사 vs 비출사 활동", scheme="set2"),
+                width="stretch",
+            )
+    st.altair_chart(monthly_trend_chart(monthly_table(posts, photos)), width="stretch")
+    st.caption("월별 추이 — 출사는 출사일 기준, 후기·사진·테마는 작성일 기준.")
+
+    ex = summary_extras(posts, photos)
+    st.markdown("#### 핵심 숫자")
+    c = st.columns(4)
+    c[0].metric("게시글 좋아요 합", ex["게시글 좋아요"])
+    c[1].metric("게시글 댓글 합", ex["게시글 댓글"])
+    c[2].metric("사진 좋아요 합", ex["사진 좋아요"])
+    c[3].metric("사진 댓글 합", ex["사진 댓글"])
+    if ex["top_post"]:
+        tp = ex["top_post"]
+        st.markdown(f"**최고 인기 게시글** (👍{tp['likes']} 💬{tp['comments']}) — {tp['author']} · {tp['title']}")
+    if ex["top_photo"]:
+        tph = ex["top_photo"]
+        st.markdown(f"**최고 인기 사진** (👍{tph['likes']} 💬{tph['comments']}) — {tph['author']}")
+
+
+def _tab_outings(posts: list[dict]) -> None:
+    st.markdown("#### 월별 출사 공지 (진행/취소)")
+    mt = monthly_table(posts, photos=[])
+    mdf = pd.DataFrame(
+        {"진행 출사": mt["진행 출사"], "취소 출사": mt["취소 출사"]},
         index=[f"{m}월" for m in range(1, 13)],
     )
-    st.bar_chart(chart_df)
+    st.bar_chart(mdf)
+    st.caption("출사일 기준 월별 집계.")
+
+    st.markdown("#### 출사 공지 작성 순위")
+    st.caption("작성자별 cat=A 공지 수 (진행+취소). 출사일이 대상 기간에 든 공지만 집계.")
+    ranking = outing_user_ranking(posts)
+    if ranking:
+        st.altair_chart(hbar(ranking, "작성자", "합계", "공지 수 TOP 10", n=10), width="stretch")
+        st.dataframe(
+            _ranking_df(ranking, "합계"),
+            hide_index=True, width="stretch",
+            column_config={
+                "합계": st.column_config.ProgressColumn(
+                    "합계", min_value=0, max_value=max(r["합계"] for r in ranking), format="%d"),
+                "취소율": st.column_config.NumberColumn("취소율", format="%.1f%%"),
+            },
+        )
+    else:
+        st.info("출사 공지가 없습니다.")
+
+    st.markdown("#### 출사 취소(펑) 순위")
+    st.caption("공지 3건 이상 작성자 중 취소율 높은 순. 취소 = 제목 (펑)/[펑].")
+    cancels = cancel_ranking(posts, min_notices=3)
+    if cancels:
+        st.dataframe(
+            _ranking_df(cancels, "취소"),
+            hide_index=True, width="stretch",
+            column_config={"취소율": st.column_config.NumberColumn("취소율", format="%.1f%%")},
+        )
+    else:
+        st.info("공지 3건 이상인 작성자가 없습니다.")
+
+    st.markdown("#### 출사 공지 전체 목록")
+    rows = outings_table(posts)
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
+def _tab_photos(photos: list[dict]) -> None:
+    st.markdown("#### 사진 업로드 순위")
+    st.caption("작성자별 사진 수. 테마예상 = 댓글 달린 사진 수, 좋아요는 합계.")
+    ranking = photo_user_ranking(photos)
+    if ranking:
+        st.altair_chart(
+            hbar(ranking, "작성자", "사진수", "사진 업로드 TOP 10", n=10, scheme="oranges"),
+            width="stretch",
+        )
+        st.dataframe(
+            _ranking_df(ranking, "사진수"),
+            hide_index=True, width="stretch",
+            column_config={
+                "사진수": st.column_config.ProgressColumn(
+                    "사진수", min_value=0, max_value=max(r["사진수"] for r in ranking), format="%d"),
+                "테마비율": st.column_config.NumberColumn("테마비율", format="%.1f%%"),
+            },
+        )
+
+    st.markdown("#### 월별 사진 업로드")
+    mt = monthly_table(posts=[], photos=photos)
+    st.bar_chart(pd.DataFrame({"사진": mt["사진"], "테마 예상": mt["테마 예상"]},
+                              index=[f"{m}월" for m in range(1, 13)]))
+
+    st.markdown("#### 인기 사진 갤러리")
+    st.caption("좋아요(lc) 상위 12장 · 👍 좋아요 / 💬 댓글 병기.")
+    tops = top_photos(photos, 12)
+    if tops:
+        for i in range(0, len(tops), 4):
+            for col, p in zip(st.columns(4), tops[i:i + 4]):
+                col.image(p["url_medium"], width="stretch",
+                          caption=f"{p['author']} · 👍{p['likes']} 💬{p['comments']}")
+    else:
+        st.info("사진이 없습니다.")
+
+
+def _tab_theme(photos: list[dict]) -> None:
+    st.caption("테마사진 = 댓글이 달린 사진(rn>0). 댓글 내용은 비공개라 테마 이벤트 참여를 *추정*한 값입니다.")
+    user_month, authors, mon_count, mon_list = theme_matrix(photos)
+
+    st.markdown("#### 월별 테마사진 제출 인원")
+    st.bar_chart(pd.DataFrame({"참여 인원": [mon_count[m] for m in range(1, 13)]},
+                              index=[f"{m}월" for m in range(1, 13)]))
+    months_with = [m for m in range(1, 13) if mon_list[m]]
+    if months_with:
+        for m in months_with:
+            with st.expander(f"{m}월 — {len(mon_list[m])}명"):
+                st.write(", ".join(mon_list[m]))
+
+    st.markdown("#### 테마 매트릭스")
+    ch = heatmap(photos)
+    if ch is not None:
+        st.altair_chart(ch, width="stretch")
+    else:
+        st.info("테마사진(댓글 달린 사진)이 없습니다.")
+
+    st.markdown("#### 테마 참여자 순위")
+    st.caption("참여월수(여러 달에 걸친 참여) 우선, 동률은 테마사진 수.")
+    parts = theme_participant_ranking(photos)
+    if parts:
+        st.dataframe(_ranking_df(parts, "테마사진"), hide_index=True, width="stretch")
+
+
+def _tab_categories(posts: list[dict]) -> None:
+    st.caption("출사 공지(cat=A) 제목의 [카테고리] 태그 기준. 출사: 인물·인풍·풍경·1:1인물·1:1인물출사 / 활동: 보정·GN·문화.")
+    rows = category_counts(posts)
+    if not rows:
+        st.info("분류된 카테고리가 없습니다.")
+        return
+    st.altair_chart(
+        hbar(rows, "카테고리", "개수", "카테고리별 공지 수", n=len(rows), scheme="teals"),
+        width="stretch",
+    )
+    st.dataframe(
+        pd.DataFrame(rows), hide_index=True, width="stretch",
+        column_config={
+            "개수": st.column_config.ProgressColumn(
+                "개수", min_value=0, max_value=max(r["개수"] for r in rows), format="%d"),
+        },
+    )
+
+
+def _tab_users(posts: list[dict]) -> None:
+    st.markdown("#### 게시글 종합 랭킹")
+    st.caption("작성자별 전체 게시글 수 (공지+취소+후기). 좋아요는 합계.")
+    rows = top_posters(posts, 15)
+    if rows:
+        st.dataframe(
+            _ranking_df(rows, "게시글"),
+            hide_index=True, width="stretch",
+            column_config={
+                "게시글": st.column_config.ProgressColumn(
+                    "게시글", min_value=0, max_value=max(r["게시글"] for r in rows), format="%d"),
+            },
+        )
+
+    st.markdown("#### 후기 작성 순위")
+    st.caption("cat=E 후기글 수 기준.")
+    rev = review_ranking(posts)
+    if rev:
+        st.dataframe(_ranking_df(rev, "후기"), hide_index=True, width="stretch")
+    else:
+        st.info("후기글이 없습니다.")
+
+
+def _tab_data(posts: list[dict], photos: list[dict]) -> None:
+    st.caption("수집·보정된 원본 데이터 전체입니다. 표 우측 상단에서 검색·정렬, 아래 버튼으로 CSV 저장이 가능합니다.")
+
+    st.markdown(f"#### 게시글 데이터 ({len(posts)}건)")
+    pdf = posts_dataframe(posts)
+    st.dataframe(pdf, hide_index=True, width="stretch", height=360)
+    st.download_button(
+        "⬇️ 게시글 CSV", data=pdf.to_csv(index=False).encode("utf-8-sig"),
+        file_name="다감노_게시글.csv", mime="text/csv",
+    )
+
+    st.markdown(f"#### 사진 데이터 ({len(photos)}건)")
+    phdf = photos_dataframe(photos)
+    st.dataframe(
+        phdf, hide_index=True, width="stretch", height=360,
+        column_config={
+            "고화질 URL": st.column_config.LinkColumn("고화질 URL", display_text="열기"),
+            "썸네일 URL": st.column_config.LinkColumn("썸네일 URL", display_text="열기"),
+        },
+    )
+    st.download_button(
+        "⬇️ 사진 CSV", data=phdf.to_csv(index=False).encode("utf-8-sig"),
+        file_name="다감노_사진.csv", mime="text/csv",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -141,8 +731,9 @@ def render_results(year: int, month: int | None, posts: list[dict],
 def main() -> None:
     st.set_page_config(page_title="다감노 분석", page_icon="📸", layout="wide")
     st.title("📸 다감노 분석")
-    st.caption(f"{GROUP_NAME} 게시글·사진을 수집해 통계 엑셀을 생성합니다.")
+    st.caption(f"{GROUP_NAME} 게시글·사진을 수집해 인사이트와 통계 엑셀을 생성합니다.")
 
+    st.subheader("① 수집")
     current_year = datetime.now().year
     c_year, c_month = st.columns([1, 2])
     with c_year:
@@ -160,20 +751,21 @@ def main() -> None:
                 st.write(msg)
 
             try:
-                posts, photos, xlsx = run_analysis(int(year), month, _progress=on_progress)
-            except Exception as e:  # noqa: BLE001 — 사용자에게 그대로 노출
+                posts, photos = collect_data(int(year), month, _progress=on_progress)
+            except Exception as e:  # noqa: BLE001
                 status.update(label="수집 실패", state="error")
                 st.error("수집 중 오류가 발생했습니다. (somoim API 응답/네트워크 확인)")
                 st.exception(e)
                 st.stop()
 
             progress_bar.progress(1.0, text="완료")
-            status.update(
-                label=f"완료 · 게시글 {len(posts)} / 사진 {len(photos)}",
-                state="complete",
-            )
-        # 다운로드 클릭 시 rerun 되어도 결과가 유지되도록 세션에 보관
-        st.session_state["result"] = (int(year), month, posts, photos, xlsx)
+            status.update(label=f"수집 완료 · 게시글 {len(posts)} / 사진 {len(photos)}", state="complete")
+
+        st.session_state["raw"] = (int(year), month, posts, photos)
+        st.session_state.pop("result", None)
+
+    if "raw" in st.session_state:
+        render_triage(*st.session_state["raw"])
 
     if "result" in st.session_state:
         render_results(*st.session_state["result"])
