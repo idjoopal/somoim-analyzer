@@ -392,13 +392,19 @@ def monthly_trend_chart(monthly: dict[str, list[int]]) -> alt.Chart:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 수집 파이프라인 (캐시) — 엑셀은 검토 후 생성
+# 수집 파이프라인 — 엑셀은 검토 후 생성
 # ═══════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def collect_data(year: int, month: int | None, _progress=None):
-    posts = collect_posts(year, month, progress=_progress, keep_unclassified=True)
-    photos = collect_photos(year, month, progress=_progress)
+def collect_data(year: int, month: int | None, on_progress=None):
+    """somoim 수집. 진행 콜백이 st를 호출하므로 @st.cache_data 대신 세션 캐시 사용
+    (cache_data 안에서 st 호출 시 캐시 히트 replay가 CacheReplayClosureError로 실패)."""
+    key = (year, month)
+    cached = st.session_state.get("_collect_cache")
+    if cached and cached["key"] == key:
+        return cached["data"]
+    posts = collect_posts(year, month, progress=on_progress, keep_unclassified=True)
+    photos = collect_photos(year, month, progress=on_progress)
+    st.session_state["_collect_cache"] = {"key": key, "data": (posts, photos)}
     return posts, photos
 
 
@@ -782,7 +788,7 @@ def main() -> None:
                 st.write(msg)
 
             try:
-                posts, photos = collect_data(int(year), month, _progress=on_progress)
+                posts, photos = collect_data(int(year), month, on_progress=on_progress)
             except Exception as e:  # noqa: BLE001
                 status.update(label="수집 실패", state="error")
                 st.error("수집 중 오류가 발생했습니다. (somoim API 응답/네트워크 확인)")
