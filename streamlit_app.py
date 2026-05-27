@@ -703,7 +703,7 @@ def _tab_categories(posts: list[dict]) -> None:
 def _tab_users(posts: list[dict], photos: list[dict]) -> None:
     st.markdown("#### 사용자 활동 종합 랭킹")
     st.caption(
-        "작성자별 게시글 수(공지+취소+후기)와 업로드한 사진 수. "
+        "작성자별 게시글 수(공지+취소+후기)와 업로드한 사진 수. 게시글이나 사진이 1건 이상인 사용자 전체. "
         "게시글 수 → 사진 수 순으로 정렬, 좋아요는 게시글 좋아요 합계."
     )
     photo_cnt = {r["작성자"]: r["사진수"] for r in photo_user_ranking(photos)}
@@ -721,7 +721,6 @@ def _tab_users(posts: list[dict], photos: list[dict]) -> None:
             "좋아요": pr["좋아요"] if pr else 0,
         })
     rows.sort(key=lambda x: (-x["게시글"], -x["사진"]))
-    rows = rows[:20]
     if rows:
         st.dataframe(
             _ranking_df(rows, "게시글"),
