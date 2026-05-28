@@ -437,7 +437,7 @@ def build_attendees_editor_df(reviews_sorted: list[dict]) -> pd.DataFrame:
             "작성일": p["posted_at"].date(),
             "작성자": p["author"],
             "제목": p["title"],
-            "본문": (body[:140] + "…") if len(body) > 140 else body,
+            "본문": body,
             "참석자": ", ".join(p.get("attendees", [])),
         })
     df = pd.DataFrame(rows)
@@ -879,7 +879,10 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict],
         "작성일": st.column_config.DateColumn("작성일", disabled=True, format="YYYY-MM-DD"),
         "작성자": st.column_config.TextColumn("작성자", disabled=True, width="small"),
         "제목": st.column_config.TextColumn("제목", disabled=True, width="medium"),
-        "본문": st.column_config.TextColumn("본문(미리보기)", disabled=True, width="large"),
+        "본문": st.column_config.TextColumn(
+            "본문", disabled=True, width="large",
+            help="셀을 클릭하면 전체 본문을 펼쳐 볼 수 있습니다.",
+        ),
         "참석자": st.column_config.TextColumn(
             "참석자(쉼표 구분)", help="실명을 쉼표로 구분", width="large"),
     }
@@ -1082,6 +1085,7 @@ def _tab_reviews(posts: list[dict]) -> None:
                 posted = r["posted_at"].strftime("%Y-%m-%d")
                 title = r.get("title") or ""
                 author = r.get("author") or "—"
+                body = r.get("body") or ""
                 attendees = r.get("attendees") or []
                 with st.container(border=True):
                     st.markdown(f"**{title}**")
@@ -1103,6 +1107,9 @@ def _tab_reviews(posts: list[dict]) -> None:
                         )
                     else:
                         st.markdown("**참석자** — _명단 없음_")
+                    if body:
+                        st.markdown("**본문**")
+                        st.text(body)
 
 
 def _tab_attendance(posts: list[dict], master: set[str]) -> None:
