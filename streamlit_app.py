@@ -1402,7 +1402,13 @@ def render_sidebar() -> None:
                         members, _ = collect_members()
                         banned = collect_banned_names()
                         active_mns = {m["mn"] for m in members if m.get("mn")}
-                        joins = collect_join_greetings(progress=on_progress)
+                        joined_dates = [m["joined_at"] for m in members if m.get("joined_at")]
+                        min_joined = min(joined_dates) if joined_dates else None
+                        joins = collect_join_greetings(
+                            progress=on_progress,
+                            active_mns=active_mns,
+                            min_joined_at=min_joined,
+                        )
                         join_aliases = parse_join_name_aliases(joins, active_mns)
                     except Exception as e:  # noqa: BLE001
                         status.update(label="수집 실패", state="error")

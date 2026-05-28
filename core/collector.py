@@ -16,7 +16,7 @@ import re
 import time
 import requests
 from collections import Counter
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Callable, Optional
 
 
@@ -168,14 +168,23 @@ def _fetch_paginated(
     target_year: int,
     progress: ProgressFn = None,
     progress_label: str = "수집",
+    extra_payload: Optional[dict] = None,
+    should_stop: Optional[Callable[[list[dict], datetime], bool]] = None,
 ) -> list[dict]:
-    """공통 페이지네이션 수집기. 대상 연도-1까지 도달하면 중단."""
+    """공통 페이지네이션 수집기. 대상 연도-1까지 도달하면 중단.
+
+    extra_payload: API 호출에 추가할 페이로드(예: `{"cat": "J"}`)로 서버 측 필터링 활용.
+    should_stop: 각 페이지 누적 후 호출하는 조기 종료 콜백 — `(all_items, oldest_dt) -> bool`.
+    """
     all_items: list[dict] = []
     s_t = None
     stop_year = target_year - 1
+    base_payload: dict = {"gid": GROUP_ID, "wql": 20}
+    if extra_payload:
+        base_payload.update(extra_payload)
 
     for page in range(1, 200):
-        payload: dict = {"gid": GROUP_ID, "wql": 20}
+        payload = dict(base_payload)
         if s_t is not None:
             payload["s_t"] = s_t
 
@@ -197,7 +206,11 @@ def _fetch_paginated(
         # 대상 연도 이전이면 중단
         oldest = items[-1]
         oldest_ts = oldest["ot"] if oldest.get("w_t") == 2000000000 else oldest["w_t"]
-        if _ts_to_dt(oldest_ts).year < stop_year:
+        oldest_dt = _ts_to_dt(oldest_ts)
+        if oldest_dt.year < stop_year:
+            break
+
+        if should_stop is not None and should_stop(all_items, oldest_dt):
             break
 
         if data.get("eof") == "Y" or len(items) < 20:
@@ -782,21 +795,56 @@ def find_duplicate_member_names(members: list[dict]) -> set[str]:
 JOIN_NAME_RX = re.compile(r"(?:이름|성함|본명)\s*[:：\-]\s*([가-힣]{2,4})(?![가-힣])")
 
 
-def collect_join_greetings(progress: ProgressFn = None) -> list[dict]:
-    """그룹 시작부터 전체 cat=J(가입인사) 글 수집.
+def collect_join_greetings(
+    progress: ProgressFn = None,
+    active_mns: Optional[set[str]] = None,
+    min_joined_at: Optional[datetime] = None,
+) -> list[dict]:
+    """cat=J(가입인사) 글 수집.
 
-    `_fetch_paginated`에 target_year=1을 넘기면 stop_year=0이 되어 200페이지 한도
-    혹은 eof까지 끝까지 긁는다. 결과에서 cat="J"만 골라 반환.
+    서버에 `{"cat": "J"}`를 함께 보내 가입인사만 받아오므로 게시글 전체를 긁고
+    클라이언트에서 거르는 것보다 훨씬 빠르다.
+
+    Args:
+        active_mns: 활성 멤버 닉네임 집합. 지정하면 author가 이 집합에 속한 글만
+            keep하고, 모든 활성 멤버의 가입인사를 1건씩 확보하면 조기 종료한다.
+            (탈퇴 멤버 가입인사까지 거슬러 올라가지 않아 수집 시간을 크게 줄임.)
+        min_joined_at: 활성 멤버의 가장 이른 가입 시각. 지정하면 페이지의 가장
+            오래된 글이 이 시각보다 이전일 때 종료(안전망).
     """
     _emit(progress, "가입인사 수집 시작…", 0.0)
-    raw = _fetch_paginated("/api/articles", "cs", 1, progress, "가입인사")
+
+    seen_authors: set[str] = set()
+    cutoff = min_joined_at - timedelta(days=7) if min_joined_at else None
+
+    def stop(all_items: list[dict], oldest_dt: datetime) -> bool:
+        if active_mns is not None:
+            for it in all_items:
+                a = it.get("wn", "")
+                if a in active_mns:
+                    seen_authors.add(a)
+            if seen_authors >= active_mns:
+                return True
+        if cutoff is not None and oldest_dt < cutoff:
+            return True
+        return False
+
+    raw = _fetch_paginated(
+        "/api/articles", "cs", 1, progress, "가입인사",
+        extra_payload={"cat": "J"},
+        should_stop=stop,
+    )
+
     out: list[dict] = []
     for p in raw:
         if p.get("cat") != "J":
             continue
+        author = p.get("wn", "")
+        if active_mns is not None and author not in active_mns:
+            continue
         out.append({
             "id":        p["id"],
-            "author":    p.get("wn", ""),
+            "author":    author,
             "title":     p.get("at", ""),
             "body":      p.get("c", ""),
             "posted_at": _post_dt(p),
