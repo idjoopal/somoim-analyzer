@@ -7,7 +7,7 @@ from .collector import (
     parse_member_csv, build_member_master, build_member_candidates, extract_attendees,
     parse_review_outing_date, annotate_review_attendees, match_outings_with_reviews,
 )
-from .excel_builder import build_excel, save_excel
+from .excel_builder import build_excel, save_excel, load_excel_bundle
 
 __all__ = [
     "GROUP_ID", "GROUP_NAME",
@@ -15,5 +15,5 @@ __all__ = [
     "infer_outing_date",
     "parse_member_csv", "build_member_master", "build_member_candidates", "extract_attendees",
     "parse_review_outing_date", "annotate_review_attendees", "match_outings_with_reviews",
-    "build_excel", "save_excel",
+    "build_excel", "save_excel", "load_excel_bundle",
 ]
