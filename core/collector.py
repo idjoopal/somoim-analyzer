@@ -458,6 +458,66 @@ def build_member_master(
     return master
 
 
+def build_member_candidates(
+    posts: list[dict],
+    photos: list[dict],
+    min_freq: int = 3,
+) -> list[dict]:
+    """마스터 editor 사전 채우기용 후보 행 (실명/닉네임 분리).
+
+    각 행: {"실명": str, "닉네임": str, "별칭": str, "포함": bool}.
+    소스:
+    - 후기 본문 빈도 ≥ min_freq 토큰 → '실명' 후보 (닉네임 공란)
+    - 게시글 작성자·사진 업로더 → '닉네임' 후보 (실명 공란)
+    동일 토큰이 여러 소스에 잡히면 같은 행으로 병합, 빈 칸은 채움. 블랙리스트 토큰은 '포함'=False로 초기화(노출은 함).
+    정렬: 포함 우선 → 빈도 desc → 토큰.
+    """
+    name_freq: Counter = Counter()
+    for p in posts:
+        if p.get("cat") != "E":
+            continue
+        body, title = p.get("body", ""), p.get("title", "")
+        cleaned = body.replace(title, " ") if title else body
+        for n in NAME_RX.findall(cleaned):
+            if n not in NAME_BLACKLIST:
+                name_freq[n] += 1
+    body_real = {n: c for n, c in name_freq.items() if c >= min_freq}
+
+    author_freq: Counter = Counter(p["author"] for p in posts if p.get("author"))
+    uploader_freq: Counter = Counter(p["author"] for p in photos if p.get("author"))
+
+    rows: dict[str, dict] = {}
+    freq_map: dict[str, int] = {}
+
+    def add(token: str, *, real: str = "", nick: str = "", freq: int = 0) -> None:
+        if not token:
+            return
+        r = rows.setdefault(token, {"실명": "", "닉네임": "", "별칭": "", "포함": True})
+        if real and not r["실명"]:
+            r["실명"] = real
+        if nick and not r["닉네임"]:
+            r["닉네임"] = nick
+        freq_map[token] = max(freq_map.get(token, 0), freq)
+
+    for n, c in body_real.items():
+        add(n, real=n, freq=c)
+    for n, c in author_freq.items():
+        add(n, nick=n, freq=c)
+    for n, c in uploader_freq.items():
+        add(n, nick=n, freq=c)
+
+    for token in rows:
+        if token in NAME_BLACKLIST:
+            rows[token]["포함"] = False
+
+    return sorted(
+        rows.values(),
+        key=lambda x: (not x["포함"],
+                       -freq_map.get(x["실명"] or x["닉네임"], 0),
+                       x["실명"] or x["닉네임"]),
+    )
+
+
 def extract_attendees(body: str, title: str, member_names: set[str]) -> list[str]:
     """후기 본문에서 마스터 매칭된 이름 추출 (등장 순서 유지, 중복 제거)."""
     if not body:

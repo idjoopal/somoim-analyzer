@@ -7,6 +7,7 @@ from datetime import datetime, date
 from core.collector import (
     parse_member_csv,
     build_member_master,
+    build_member_candidates,
     extract_attendees,
     parse_review_outing_date,
     annotate_review_attendees,
@@ -165,3 +166,87 @@ def test_match_orphan_review_far_date():
     match_outings_with_reviews(notices + [rev])
     assert rev["matched_outing_id"] is None
     assert notices[0]["actually_held"] is False
+
+
+# ── build_member_candidates (6차 마스터 editor 사전 채움) ────────
+def test_candidates_body_frequency_to_real():
+    body = "철수 영희 민수"
+    posts = [{"cat": "E", "title": "", "body": body, "author": "닉a"} for _ in range(3)]
+    rows = build_member_candidates(posts, [], min_freq=3)
+    by_real = {r["실명"]: r for r in rows if r["실명"]}
+    assert {"철수", "영희", "민수"} <= set(by_real)
+    assert all(by_real[n]["포함"] for n in ("철수", "영희", "민수"))
+
+
+def test_candidates_author_and_uploader_become_nick():
+    posts = [{"cat": "A", "title": "", "body": "", "author": "닉a"}]
+    photos = [{"author": "닉b"}, {"author": "닉a"}]
+    rows = build_member_candidates(posts, photos, min_freq=99)
+    by_nick = {r["닉네임"]: r for r in rows if r["닉네임"] and not r["실명"]}
+    assert "닉a" in by_nick and "닉b" in by_nick
+
+
+def test_candidates_blacklist_unchecked_but_present():
+    # "후기"는 블랙리스트지만 작성자/업로더로 들어오면 행은 만들고 포함=False
+    posts = [{"cat": "A", "title": "", "body": "", "author": "후기"}]
+    rows = build_member_candidates(posts, [], min_freq=99)
+    by_token = {(r["실명"] or r["닉네임"]): r for r in rows}
+    assert "후기" in by_token
+    assert by_token["후기"]["포함"] is False
+
+
+def test_candidates_merge_same_token_across_sources():
+    # 같은 토큰이 본문빈도(=실명)와 게시글 작성자(=닉네임) 둘 다 → 한 행에 둘 다 채움
+    body = "정원석 정원석 정원석"
+    posts = [{"cat": "E", "title": "", "body": body, "author": "정원석"}]
+    rows = build_member_candidates(posts, [], min_freq=3)
+    merged = [r for r in rows if r["실명"] == "정원석" and r["닉네임"] == "정원석"]
+    assert len(merged) == 1
+
+
+# ── JSON 번들 라운드트립 (no network) ────────────────────────────
+def test_bundle_round_trip(tmp_path):
+    """_dump_bundle → _load_bundle 으로 posts/photos/master 무손실 복원."""
+    import sys
+    sys.path.insert(0, "/home/user/somoim-analyzer")
+    import streamlit_app as A
+
+    posts = [{
+        "id": "p1", "author": "닉", "wid": "w1", "title": "후기",
+        "body": "정원석 이하얀", "outing_date": None,
+        "posted_at": datetime(2026, 6, 7, 12, 34, 56),
+        "cat": "E", "cat_label": "후기", "category": None,
+        "is_outing": False, "is_canceled": False,
+        "likes": 1, "comments": 0, "images": 0,
+        "needs_review": False, "review_reason": "",
+    }]
+    photos = [{
+        "id": "ph1", "author": "닉b", "wid": "w2",
+        "posted_at": datetime(2026, 6, 7, 10, 0, 0),
+        "likes": 3, "comments": 1, "has_comment": True,
+        "url_large": "x", "url_medium": "y", "url_small": "z", "url_thumb": "n",
+    }]
+    master = [{"실명": "정원석", "닉네임": "원석닉", "별칭": ["원석님"]}]
+
+    blob = A._dump_bundle(2026, None, posts, photos, master)
+    loaded = A._load_bundle(blob)
+    assert loaded["year"] == 2026 and loaded["month"] is None
+    assert len(loaded["posts"]) == 1 and len(loaded["photos"]) == 1
+    assert loaded["posts"][0]["body"] == "정원석 이하얀"
+    assert loaded["posts"][0]["posted_at"] == datetime(2026, 6, 7, 12, 34, 56)
+    assert loaded["photos"][0]["posted_at"] == datetime(2026, 6, 7, 10, 0, 0)
+    assert loaded["master"][0]["실명"] == "정원석"
+
+
+def test_bundle_load_rejects_wrong_version():
+    import sys
+    sys.path.insert(0, "/home/user/somoim-analyzer")
+    import streamlit_app as A
+    import json as _json
+    bad = _json.dumps({"version": 999, "year": 2026, "posts": [], "photos": []}).encode("utf-8")
+    try:
+        A._load_bundle(bad)
+    except ValueError as e:
+        assert "버전" in str(e)
+    else:
+        raise AssertionError("expected ValueError")

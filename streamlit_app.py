@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter, defaultdict
 from datetime import date, datetime
 
@@ -16,16 +17,27 @@ import streamlit as st
 
 from core.collector import (
     GROUP_NAME,
+    NAME_BLACKLIST,
     NON_OUTING_CATS,
     OUTING_CATS,
     annotate_review_attendees,
-    build_member_master,
+    build_member_candidates,
     collect_photos,
     collect_posts,
     match_outings_with_reviews,
-    parse_member_csv,
 )
 from core.excel_builder import build_excel
+
+BUNDLE_SCHEMA_VERSION = 1
+BASE_POST_KEYS = {
+    "id", "author", "wid", "title", "body", "outing_date", "posted_at",
+    "cat", "cat_label", "category", "is_outing", "is_canceled",
+    "likes", "comments", "images", "needs_review", "review_reason",
+}
+BASE_PHOTO_KEYS = {
+    "id", "author", "wid", "posted_at", "likes", "comments", "has_comment",
+    "url_large", "url_medium", "url_small", "url_thumb",
+}
 
 ALL_CATS = OUTING_CATS + NON_OUTING_CATS
 CAT_OPTIONS = ALL_CATS + ["(없음)"]
@@ -541,6 +553,113 @@ def collect_data(year: int, month: int | None, on_progress=None):
 
 
 # ═══════════════════════════════════════════════════════════════
+# JSON 번들 (raw + 확정 마스터를 한 파일로 저장/업로드)
+# ═══════════════════════════════════════════════════════════════
+
+def _dump_bundle(year: int, month: int | None, posts: list[dict],
+                  photos: list[dict], master_records: list[dict]) -> bytes:
+    """raw posts/photos + 확정 마스터 records → JSON bytes.
+    annotate/match 결과 키는 저장 안 함(로드 시 마스터로 재계산). posted_at만 ISO 변환.
+    """
+    def _ser_post(p: dict) -> dict:
+        out = {k: p[k] for k in BASE_POST_KEYS if k in p}
+        out["posted_at"] = out["posted_at"].isoformat()
+        return out
+
+    def _ser_photo(p: dict) -> dict:
+        out = {k: p[k] for k in BASE_PHOTO_KEYS if k in p}
+        out["posted_at"] = out["posted_at"].isoformat()
+        return out
+
+    bundle = {
+        "version": BUNDLE_SCHEMA_VERSION,
+        "year": int(year),
+        "month": month,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "post_count": len(posts),
+        "photo_count": len(photos),
+        "posts": [_ser_post(p) for p in posts],
+        "photos": [_ser_photo(p) for p in photos],
+        "master": list(master_records or []),
+    }
+    return json.dumps(bundle, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _load_bundle(data: bytes) -> dict:
+    """JSON bytes → bundle dict. posted_at ISO → datetime. 검증 실패 시 ValueError."""
+    obj = json.loads(data.decode("utf-8"))
+    if not isinstance(obj, dict):
+        raise ValueError("최상위가 객체가 아닙니다")
+    if obj.get("version") != BUNDLE_SCHEMA_VERSION:
+        raise ValueError(f"지원하지 않는 번들 버전: {obj.get('version')} (지원={BUNDLE_SCHEMA_VERSION})")
+    for k in ("year", "posts", "photos"):
+        if k not in obj:
+            raise ValueError(f"필수 키 누락: {k}")
+    posts = []
+    for p in obj["posts"]:
+        if "posted_at" in p and isinstance(p["posted_at"], str):
+            p["posted_at"] = datetime.fromisoformat(p["posted_at"])
+        posts.append(p)
+    photos = []
+    for p in obj["photos"]:
+        if "posted_at" in p and isinstance(p["posted_at"], str):
+            p["posted_at"] = datetime.fromisoformat(p["posted_at"])
+        photos.append(p)
+    return {
+        "year": obj["year"],
+        "month": obj.get("month"),
+        "posts": posts,
+        "photos": photos,
+        "master": obj.get("master") or [],
+    }
+
+
+def _set_data(year: int, month: int | None, posts: list[dict],
+              photos: list[dict], master_uploaded: list[dict] | None = None) -> None:
+    """수집/업로드 양쪽에서 호출. session_state['data'] 설정 + 후속 단계 키 클리어."""
+    st.session_state["data"] = (int(year), month, posts, photos, master_uploaded or [])
+    for k in ("master", "result"):
+        st.session_state.pop(k, None)
+
+
+def _apply_master_edits(edited: pd.DataFrame) -> tuple[set[str], dict[str, str],
+                                                        dict[str, str], list[dict]]:
+    """마스터 editor 결과 → (names, nick_to_real, real_to_nick, records).
+    빈 행과 포함=False 행은 스킵. 블랙리스트 토큰은 names에서 제거.
+    records는 번들 저장용(JSON 친화 list[dict])."""
+    names: set[str] = set()
+    n2r: dict[str, str] = {}
+    r2n: dict[str, str] = {}
+    records: list[dict] = []
+    if edited is None or edited.empty:
+        return names, n2r, r2n, records
+    for _, row in edited.iterrows():
+        if not bool(row.get("포함", False)):
+            continue
+        real = str(row.get("실명") or "").strip()
+        nick = str(row.get("닉네임") or "").strip()
+        alias_raw = str(row.get("별칭") or "").strip()
+        aliases = [a.strip() for a in alias_raw.split(";") if a.strip()]
+        if not real and not nick:
+            continue
+        if real:
+            names.add(real)
+        if nick:
+            names.add(nick)
+        for a in aliases:
+            names.add(a)
+        if real and nick:
+            n2r[nick] = real
+            r2n[real] = nick
+        if real:
+            for a in aliases:
+                n2r.setdefault(a, real)
+        records.append({"실명": real, "닉네임": nick, "별칭": aliases})
+    names.difference_update(NAME_BLACKLIST)
+    return names, n2r, r2n, records
+
+
+# ═══════════════════════════════════════════════════════════════
 # 렌더링
 # ═══════════════════════════════════════════════════════════════
 
@@ -557,6 +676,77 @@ def render_basis_box(posts: list[dict], photos: list[dict], period_label: str) -
         "- **취소(펑)**: 제목에 `(펑)`/`[펑]` 포함 · **출사 카테고리**: 인물(1:1인물·1:1인물출사 포함)·인물&풍경·풍경·GN / 활동: 보정·문화",
         icon="ℹ️",
     )
+
+
+def render_master(year: int, month: int | None, posts: list[dict],
+                   photos: list[dict], master_uploaded: list[dict]) -> None:
+    """Stage 1: 멤버 마스터 확정. 자동 후보 + 업로드 master 사전 채움 → 사용자 보정 → 확정."""
+    st.divider()
+    st.subheader("① 멤버 마스터 확정")
+    st.caption(
+        "후기 본문에는 **실명**이, 게시글 작성자/사진 업로더에는 **닉네임**이 나옵니다. "
+        "자동 후보를 검토·보정한 뒤 **마스터 확정**을 누르면 그 마스터로 참석자를 추출합니다. "
+        "행 추가/삭제 가능, **포함** 체크를 해제하면 제외됩니다."
+    )
+
+    candidates = build_member_candidates(posts, photos)
+
+    # 업로드된 마스터로 사전 채움/추가 (같은 토큰은 병합, 신규는 맨 위 추가)
+    if master_uploaded:
+        token_to_idx: dict[str, int] = {}
+        for i, r in enumerate(candidates):
+            for tok in (r["실명"], r["닉네임"]):
+                if tok:
+                    token_to_idx.setdefault(tok, i)
+        for m in master_uploaded:
+            real = str(m.get("실명") or "").strip()
+            nick = str(m.get("닉네임") or "").strip()
+            aliases = m.get("별칭") or []
+            if isinstance(aliases, str):
+                aliases = [a.strip() for a in aliases.split(";") if a.strip()]
+            alias_str = ";".join(aliases)
+            idx = token_to_idx.get(real) if real else token_to_idx.get(nick)
+            if idx is not None:
+                if real:
+                    candidates[idx]["실명"] = real
+                if nick:
+                    candidates[idx]["닉네임"] = nick
+                if alias_str:
+                    candidates[idx]["별칭"] = alias_str
+                candidates[idx]["포함"] = True
+            else:
+                candidates.insert(0, {"실명": real, "닉네임": nick,
+                                       "별칭": alias_str, "포함": True})
+
+    df = pd.DataFrame(candidates, columns=["실명", "닉네임", "별칭", "포함"])
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("후보 수", len(df))
+    c2.metric("자동 포함", int(df["포함"].sum()) if not df.empty else 0)
+    c3.metric("게시글 / 사진", f"{len(posts)} / {len(photos)}")
+
+    edited = st.data_editor(
+        df,
+        column_config={
+            "실명":   st.column_config.TextColumn("실명", width="medium",
+                       help="후기 본문에 등장하는 이름(주로 한글 2~4자)"),
+            "닉네임": st.column_config.TextColumn("닉네임", width="medium",
+                       help="게시글 작성자/사진 업로더 닉네임"),
+            "별칭":   st.column_config.TextColumn("별칭 (;구분)", width="medium",
+                       help="; 로 구분해 여러 별칭 입력 가능"),
+            "포함":   st.column_config.CheckboxColumn("포함", width="small", default=True),
+        },
+        hide_index=True, width="stretch", num_rows="dynamic",
+        key=f"master_editor_{year}_{month}",
+    )
+
+    if st.button("✅ 마스터 확정", type="primary"):
+        names, n2r, r2n, records = _apply_master_edits(edited)
+        annotate_review_attendees(posts, names, n2r)
+        st.session_state["master"] = {
+            "names": names, "n2r": n2r, "r2n": r2n, "records": records,
+        }
+        st.rerun()
 
 
 def render_triage(year: int, month: int | None, raw_posts: list[dict],
@@ -661,14 +851,7 @@ def render_results(year: int, month: int | None, posts: list[dict],
     for col, (label, val) in zip(st.columns(len(kpis)), kpis.items()):
         col.metric(label, val)
 
-    fname_period = f"{year}" + (f"_{month:02d}" if month else "")
-    st.download_button(
-        "📥 엑셀 다운로드 (원본 + 인사이트 11개 시트)",
-        data=xlsx,
-        file_name=f"다감노_{fname_period}_분석.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
+    st.caption("📥 **엑셀·JSON 번들 다운로드는 왼쪽 사이드바**의 *다운로드* 섹션에서.")
 
     tabs = st.tabs(
         ["📊 개요", "📌 출사", "👥 참석", "📷 사진", "🎨 테마사진", "🏷️ 카테고리", "👤 사용자", "📋 데이터"]
@@ -1005,75 +1188,110 @@ def _tab_data(posts: list[dict], photos: list[dict]) -> None:
 # 메인 UI
 # ═══════════════════════════════════════════════════════════════
 
-def render_member_master_sidebar() -> tuple[set[str], dict[str, str], dict[str, str]]:
-    """사이드바: 멤버 명단 CSV 업로드 (실명, 닉네임[, 별칭;...]).
-
-    후기 본문은 실명, 게시글 작성자는 닉네임이라 두 컬럼을 함께 받는다.
-    파일이 없으면 빈 매핑을 반환(자동 마스터로 graceful degrade).
-    """
+def render_sidebar() -> None:
+    """사이드바 컨트롤 패널: 데이터 소스(API/번들 업로드) + 다운로드 + 처음으로."""
     with st.sidebar:
-        st.subheader("👥 멤버 명단 (선택)")
-        st.caption(
-            "**실명,닉네임[,별칭;...]** 형식 CSV/TXT를 올리면 후기 참석자 추출 정확도가 올라갑니다. "
-            "후기 본문은 실명, 게시글 작성자는 닉네임이라 두 컬럼이 필요합니다. 없어도 자동 구축됩니다."
+        st.subheader("📥 데이터 소스")
+        source = st.radio(
+            "입력 방법", ["API 수집", "JSON 번들 업로드"],
+            horizontal=True, key="data_source", label_visibility="collapsed",
         )
-        f = st.file_uploader("멤버 명단 (csv/txt)", type=["csv", "txt"], key="member_csv")
-        if f is None:
-            return set(), {}, {}
-        try:
-            text = f.getvalue().decode("utf-8")
-        except UnicodeDecodeError:
-            text = f.getvalue().decode("cp949", errors="ignore")
-        names, n2r, r2n = parse_member_csv(text)
-        st.success(f"멤버 {len(names)}개 토큰 로드 · 실명 {len(r2n)}명")
-        return names, n2r, r2n
+
+        if source == "API 수집":
+            current_year = datetime.now().year
+            year = st.selectbox("년도", list(range(current_year, current_year - 6, -1)),
+                                 key="api_year")
+            month: int | None = None
+            if st.checkbox("월 단위 분석", key="api_month_on"):
+                month = st.selectbox("월", list(range(1, 13)), key="api_month")
+            if st.button("분석 시작", type="primary", width="stretch"):
+                progress_bar = st.progress(0.0, text="시작 준비 중…")
+                with st.status("데이터 수집 중…", expanded=True) as status:
+                    def on_progress(msg: str, pct: float) -> None:
+                        progress_bar.progress(min(max(pct, 0.0), 1.0), text=msg)
+                        st.write(msg)
+                    try:
+                        posts, photos = collect_data(int(year), month, on_progress=on_progress)
+                    except Exception as e:  # noqa: BLE001
+                        status.update(label="수집 실패", state="error")
+                        st.error("수집 중 오류가 발생했습니다. (somoim API/네트워크 확인)")
+                        st.exception(e)
+                        st.stop()
+                    progress_bar.progress(1.0, text="완료")
+                    status.update(label=f"수집 완료 · 게시글 {len(posts)} / 사진 {len(photos)}",
+                                  state="complete")
+                _set_data(year, month, posts, photos, master_uploaded=None)
+                st.rerun()
+        else:
+            st.caption("이전 세션에서 다운로드한 **JSON 번들**을 올리면 API 호출 없이 즉시 분석합니다.")
+            f = st.file_uploader("번들 파일 (.json)", type=["json"], key="bundle_upload")
+            if f is not None and st.button("📥 불러오기", type="primary", width="stretch"):
+                try:
+                    bundle = _load_bundle(f.getvalue())
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"번들 파일 오류: {e}")
+                else:
+                    _set_data(bundle["year"], bundle["month"],
+                              bundle["posts"], bundle["photos"],
+                              master_uploaded=bundle.get("master") or None)
+                    st.success(f"번들 로드 · 게시글 {len(bundle['posts'])} / 사진 {len(bundle['photos'])} "
+                               f"· 마스터 {len(bundle.get('master') or [])}명")
+                    st.rerun()
+
+        if "result" in st.session_state:
+            year_r, month_r, posts_r, photos_r, xlsx_r, _names = st.session_state["result"]
+            records = st.session_state.get("master", {}).get("records", [])
+            tag = f"{year_r}" + (f"_{month_r:02d}" if month_r else "")
+            st.divider()
+            st.subheader("💾 다운로드")
+            st.download_button(
+                "📦 JSON 번들 (.json)",
+                data=_dump_bundle(year_r, month_r, posts_r, photos_r, records),
+                file_name=f"다감노_{tag}_번들.json",
+                mime="application/json", width="stretch",
+            )
+            st.caption("다음 세션에 이 번들을 업로드하면 API 호출 없이 즉시 분석.")
+            st.download_button(
+                "📊 엑셀 (.xlsx)",
+                data=xlsx_r,
+                file_name=f"다감노_{tag}_분석.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch",
+            )
+            st.caption("원본 + 인사이트 11개 시트.")
+
+        if "data" in st.session_state:
+            st.divider()
+            if st.button("🔄 처음으로", width="stretch"):
+                for k in ("data", "master", "result", "_collect_cache",
+                          "api_year", "api_month", "api_month_on", "bundle_upload"):
+                    st.session_state.pop(k, None)
+                st.rerun()
 
 
 def main() -> None:
     st.set_page_config(page_title="다감노 분석", page_icon="📸", layout="wide")
     st.title("📸 다감노 분석")
-    st.caption(f"{GROUP_NAME} 게시글·사진을 수집해 인사이트와 통계 엑셀을 생성합니다.")
+    st.caption(f"{GROUP_NAME} 게시글·사진을 수집·검토하고 통계 엑셀을 생성합니다.")
 
-    csv_names, csv_n2r, _csv_r2n = render_member_master_sidebar()
+    render_sidebar()
 
-    st.subheader("① 수집")
-    current_year = datetime.now().year
-    c_year, c_month = st.columns([1, 2])
-    with c_year:
-        year = st.selectbox("년도", list(range(current_year, current_year - 6, -1)))
-    with c_month:
-        month = None
-        if st.checkbox("월 단위 분석"):
-            month = st.selectbox("월", list(range(1, 13)))
+    if "data" not in st.session_state:
+        st.info(
+            "👈 사이드바에서 **API 수집**으로 데이터를 모으거나, "
+            "이전에 다운로드한 **JSON 번들**을 업로드해 주세요."
+        )
+        return
 
-    if st.button("분석 시작", type="primary"):
-        progress_bar = st.progress(0.0, text="시작 준비 중…")
-        with st.status("데이터 수집 중…", expanded=True) as status:
-            def on_progress(msg: str, pct: float) -> None:
-                progress_bar.progress(min(max(pct, 0.0), 1.0), text=msg)
-                st.write(msg)
-
-            try:
-                posts, photos = collect_data(int(year), month, on_progress=on_progress)
-            except Exception as e:  # noqa: BLE001
-                status.update(label="수집 실패", state="error")
-                st.error("수집 중 오류가 발생했습니다. (somoim API 응답/네트워크 확인)")
-                st.exception(e)
-                st.stop()
-
-            progress_bar.progress(1.0, text="완료")
-            status.update(label=f"수집 완료 · 게시글 {len(posts)} / 사진 {len(photos)}", state="complete")
-
-        master = build_member_master(posts, photos, extra_names=csv_names)
-        annotate_review_attendees(posts, master, csv_n2r)
-        st.session_state["raw"] = (int(year), month, posts, photos, master)
-        st.session_state.pop("result", None)
-
-    if "raw" in st.session_state:
-        render_triage(*st.session_state["raw"])
+    year, month, posts, photos, master_uploaded = st.session_state["data"]
 
     if "result" in st.session_state:
         render_results(*st.session_state["result"])
+    elif "master" in st.session_state:
+        names = st.session_state["master"]["names"]
+        render_triage(year, month, posts, photos, names)
+    else:
+        render_master(year, month, posts, photos, master_uploaded)
 
 
 if __name__ == "__main__":
