@@ -24,7 +24,7 @@ from openpyxl.formatting.rule import DataBarRule
 from openpyxl.chart import BarChart, Reference
 from openpyxl.chart.series import SeriesLabel
 
-from .collector import GROUP_NAME, OUTING_CATS, NON_OUTING_CATS  # noqa: F401
+from .collector import GROUP_NAME, OUTING_CATS, NON_OUTING_CATS, find_duplicate_member_names  # noqa: F401
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -122,6 +122,7 @@ def build_excel(
     members: Optional[list[dict]] = None,
     banned: Optional[set[str]] = None,
     resolution: Optional[dict[str, str]] = None,
+    join_aliases: Optional[dict[str, str]] = None,
 ) -> bytes:
     """
     수집 데이터로부터 엑셀 파일(bytes) 생성.
@@ -186,6 +187,8 @@ def build_excel(
         _build_sheet_banned(wb, banned)
     if resolution is not None:
         _build_sheet_resolution(wb, resolution)
+    if join_aliases is not None:
+        _build_sheet_join_aliases(wb, join_aliases)
 
     buf = BytesIO()
     wb.save(buf)
@@ -202,6 +205,7 @@ def save_excel(
     members: Optional[list[dict]] = None,
     banned: Optional[set[str]] = None,
     resolution: Optional[dict[str, str]] = None,
+    join_aliases: Optional[dict[str, str]] = None,
 ) -> str:
     """엑셀을 파일로 저장. 경로 미지정시 기본 이름 사용."""
     if path is None:
@@ -209,7 +213,8 @@ def save_excel(
         path = f"다감노_{period}_분석.xlsx"
     data = build_excel(posts, photos, year, month,
                        master_records=master_records,
-                       members=members, banned=banned, resolution=resolution)
+                       members=members, banned=banned, resolution=resolution,
+                       join_aliases=join_aliases)
     with open(path, "wb") as f:
         f.write(data)
     return path
@@ -310,6 +315,15 @@ def _build_sheet_resolution(wb: Workbook, resolution: dict[str, str]) -> None:
         ws.append([str(name), str(target)])
 
 
+def _build_sheet_join_aliases(wb: Workbook, join_aliases: dict[str, str]) -> None:
+    """가입인사 자동 추출 매핑(실명→닉네임) 저장."""
+    ws = wb.create_sheet("_가입인사매핑")
+    ws.sheet_state = "hidden"
+    ws.append(["실명", "닉네임"])
+    for real, nick in (join_aliases or {}).items():
+        ws.append([str(real), str(nick)])
+
+
 def _build_sheet_member_overview(
     wb: Workbook, members: list[dict],
     posts: list[dict], photos: list[dict], posts_A: list[dict],
@@ -392,6 +406,7 @@ def _build_sheet_member_overview(
     rows.sort(key=lambda x: (status_order.get(x[8], 9),
                               -(x[5] + x[6] + x[7])))
 
+    duplicates = find_duplicate_member_names(members)
     for r in rows:
         ws.append(list(r))
         last_row = ws.max_row
@@ -404,8 +419,13 @@ def _build_sheet_member_overview(
             cell = ws.cell(row=last_row, column=c)
             if cell.value:
                 cell.number_format = "yyyy-mm-dd"
+        if r[0] in duplicates:
+            nick_cell = ws.cell(row=last_row, column=1)
+            nick_cell.value = f"⚠️ {r[0]}"
+            nick_cell.fill = _fill(C["ACCENT_YLW"])
+            nick_cell.font = Font(name="Arial", size=10, bold=True, color=C["ACCENT_RED"])
 
-    _set_col_widths(ws, {"A": 14, "B": 8, "C": 12, "D": 12, "E": 10,
+    _set_col_widths(ws, {"A": 16, "B": 8, "C": 12, "D": 12, "E": 10,
                           "F": 8, "G": 8, "H": 8, "I": 10})
 
 
@@ -452,10 +472,12 @@ def load_excel_bundle(data: bytes) -> dict:
     members = _read_members(wb["_멤버"]) if "_멤버" in wb.sheetnames else []
     banned = _read_banned(wb["_탈퇴멤버"]) if "_탈퇴멤버" in wb.sheetnames else set()
     resolution = _read_resolution(wb["_이름매핑"]) if "_이름매핑" in wb.sheetnames else {}
+    join_aliases = (_read_join_aliases(wb["_가입인사매핑"])
+                    if "_가입인사매핑" in wb.sheetnames else {})
 
     return {"year": year, "month": month, "posts": posts, "photos": photos,
             "master": master, "members": members, "banned": banned,
-            "resolution": resolution}
+            "resolution": resolution, "join_aliases": join_aliases}
 
 
 def _read_meta(ws) -> dict:
@@ -558,6 +580,21 @@ def _read_resolution(ws) -> dict[str, str]:
         target = str(row[1]) if len(row) > 1 and row[1] not in (None, "") else ""
         if target:
             out[name] = target
+    return out
+
+
+def _read_join_aliases(ws) -> dict[str, str]:
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return {}
+    out: dict[str, str] = {}
+    for row in rows[1:]:
+        if not row or row[0] in (None, ""):
+            continue
+        real = str(row[0])
+        nick = str(row[1]) if len(row) > 1 and row[1] not in (None, "") else ""
+        if nick:
+            out[real] = nick
     return out
 
 
