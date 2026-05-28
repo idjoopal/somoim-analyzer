@@ -204,12 +204,10 @@ def test_candidates_merge_same_token_across_sources():
     assert len(merged) == 1
 
 
-# ── JSON 번들 라운드트립 (no network) ────────────────────────────
-def test_bundle_round_trip(tmp_path):
-    """_dump_bundle → _load_bundle 으로 posts/photos/master 무손실 복원."""
-    import sys
-    sys.path.insert(0, "/home/user/somoim-analyzer")
-    import streamlit_app as A
+# ── 엑셀 번들 라운드트립 (no network) ────────────────────────────
+def test_excel_round_trip(tmp_path):
+    """build_excel(master_records=...) → load_excel_bundle 으로 posts/photos/master 무손실 복원."""
+    from core.excel_builder import build_excel, load_excel_bundle
 
     posts = [{
         "id": "p1", "author": "닉", "wid": "w1", "title": "후기",
@@ -228,25 +226,55 @@ def test_bundle_round_trip(tmp_path):
     }]
     master = [{"실명": "정원석", "닉네임": "원석닉", "별칭": ["원석님"]}]
 
-    blob = A._dump_bundle(2026, None, posts, photos, master)
-    loaded = A._load_bundle(blob)
+    blob = build_excel(posts, photos, 2026, None, master_records=master)
+    loaded = load_excel_bundle(blob)
     assert loaded["year"] == 2026 and loaded["month"] is None
     assert len(loaded["posts"]) == 1 and len(loaded["photos"]) == 1
     assert loaded["posts"][0]["body"] == "정원석 이하얀"
     assert loaded["posts"][0]["posted_at"] == datetime(2026, 6, 7, 12, 34, 56)
+    assert loaded["posts"][0]["is_outing"] is False
     assert loaded["photos"][0]["posted_at"] == datetime(2026, 6, 7, 10, 0, 0)
+    assert loaded["photos"][0]["has_comment"] is True
     assert loaded["master"][0]["실명"] == "정원석"
+    assert loaded["master"][0]["별칭"] == ["원석님"]
 
 
-def test_bundle_load_rejects_wrong_version():
-    import sys
-    sys.path.insert(0, "/home/user/somoim-analyzer")
-    import streamlit_app as A
-    import json as _json
-    bad = _json.dumps({"version": 999, "year": 2026, "posts": [], "photos": []}).encode("utf-8")
+def test_excel_load_rejects_wrong_version(tmp_path):
+    """엑셀 _메타 시트의 schema_version이 다르면 ValueError."""
+    from io import BytesIO
+    from openpyxl import Workbook, load_workbook
+    from core.excel_builder import build_excel, load_excel_bundle
+
+    blob = build_excel([], [], 2026, None, master_records=[])
+    wb = load_workbook(BytesIO(blob))
+    ws = wb["_메타"]
+    for row in ws.iter_rows(min_row=2):
+        if row[0].value == "schema_version":
+            row[1].value = 999
+            break
+    buf = BytesIO()
+    wb.save(buf)
     try:
-        A._load_bundle(bad)
+        load_excel_bundle(buf.getvalue())
     except ValueError as e:
         assert "버전" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_excel_load_rejects_missing_meta(tmp_path):
+    """_메타 시트가 없는 일반 엑셀은 거부."""
+    from io import BytesIO
+    from openpyxl import Workbook
+    from core.excel_builder import load_excel_bundle
+
+    wb = Workbook()
+    wb.active.append(["random", "data"])
+    buf = BytesIO()
+    wb.save(buf)
+    try:
+        load_excel_bundle(buf.getvalue())
+    except ValueError as e:
+        assert "원본 데이터" in str(e)
     else:
         raise AssertionError("expected ValueError")

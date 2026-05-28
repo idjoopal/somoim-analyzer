@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import json
 from collections import Counter, defaultdict
 from datetime import date, datetime
 
@@ -26,18 +25,7 @@ from core.collector import (
     collect_posts,
     match_outings_with_reviews,
 )
-from core.excel_builder import build_excel
-
-BUNDLE_SCHEMA_VERSION = 1
-BASE_POST_KEYS = {
-    "id", "author", "wid", "title", "body", "outing_date", "posted_at",
-    "cat", "cat_label", "category", "is_outing", "is_canceled",
-    "likes", "comments", "images", "needs_review", "review_reason",
-}
-BASE_PHOTO_KEYS = {
-    "id", "author", "wid", "posted_at", "likes", "comments", "has_comment",
-    "url_large", "url_medium", "url_small", "url_thumb",
-}
+from core.excel_builder import build_excel, load_excel_bundle
 
 ALL_CATS = OUTING_CATS + NON_OUTING_CATS
 CAT_OPTIONS = ALL_CATS + ["(없음)"]
@@ -553,66 +541,8 @@ def collect_data(year: int, month: int | None, on_progress=None):
 
 
 # ═══════════════════════════════════════════════════════════════
-# JSON 번들 (raw + 확정 마스터를 한 파일로 저장/업로드)
+# 데이터 세팅 (수집·엑셀 업로드 양쪽에서 호출)
 # ═══════════════════════════════════════════════════════════════
-
-def _dump_bundle(year: int, month: int | None, posts: list[dict],
-                  photos: list[dict], master_records: list[dict]) -> bytes:
-    """raw posts/photos + 확정 마스터 records → JSON bytes.
-    annotate/match 결과 키는 저장 안 함(로드 시 마스터로 재계산). posted_at만 ISO 변환.
-    """
-    def _ser_post(p: dict) -> dict:
-        out = {k: p[k] for k in BASE_POST_KEYS if k in p}
-        out["posted_at"] = out["posted_at"].isoformat()
-        return out
-
-    def _ser_photo(p: dict) -> dict:
-        out = {k: p[k] for k in BASE_PHOTO_KEYS if k in p}
-        out["posted_at"] = out["posted_at"].isoformat()
-        return out
-
-    bundle = {
-        "version": BUNDLE_SCHEMA_VERSION,
-        "year": int(year),
-        "month": month,
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
-        "post_count": len(posts),
-        "photo_count": len(photos),
-        "posts": [_ser_post(p) for p in posts],
-        "photos": [_ser_photo(p) for p in photos],
-        "master": list(master_records or []),
-    }
-    return json.dumps(bundle, ensure_ascii=False, indent=2).encode("utf-8")
-
-
-def _load_bundle(data: bytes) -> dict:
-    """JSON bytes → bundle dict. posted_at ISO → datetime. 검증 실패 시 ValueError."""
-    obj = json.loads(data.decode("utf-8"))
-    if not isinstance(obj, dict):
-        raise ValueError("최상위가 객체가 아닙니다")
-    if obj.get("version") != BUNDLE_SCHEMA_VERSION:
-        raise ValueError(f"지원하지 않는 번들 버전: {obj.get('version')} (지원={BUNDLE_SCHEMA_VERSION})")
-    for k in ("year", "posts", "photos"):
-        if k not in obj:
-            raise ValueError(f"필수 키 누락: {k}")
-    posts = []
-    for p in obj["posts"]:
-        if "posted_at" in p and isinstance(p["posted_at"], str):
-            p["posted_at"] = datetime.fromisoformat(p["posted_at"])
-        posts.append(p)
-    photos = []
-    for p in obj["photos"]:
-        if "posted_at" in p and isinstance(p["posted_at"], str):
-            p["posted_at"] = datetime.fromisoformat(p["posted_at"])
-        photos.append(p)
-    return {
-        "year": obj["year"],
-        "month": obj.get("month"),
-        "posts": posts,
-        "photos": photos,
-        "master": obj.get("master") or [],
-    }
-
 
 def _set_data(year: int, month: int | None, posts: list[dict],
               photos: list[dict], master_uploaded: list[dict] | None = None) -> None:
@@ -829,7 +759,9 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict],
         final_posts = apply_triage(raw_posts, cat_a_sorted, edited, year, month)
         apply_attendees_edits(final_posts, reviews_sorted, edited_att)
         match_outings_with_reviews(final_posts)
-        xlsx = build_excel(final_posts, photos, year, month)
+        master_records = st.session_state.get("master", {}).get("records", [])
+        xlsx = build_excel(final_posts, photos, year, month,
+                           master_records=master_records)
         st.session_state["result"] = (year, month, final_posts, photos, xlsx, master)
 
 
@@ -1189,11 +1121,11 @@ def _tab_data(posts: list[dict], photos: list[dict]) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 def render_sidebar() -> None:
-    """사이드바 컨트롤 패널: 데이터 소스(API/번들 업로드) + 다운로드 + 처음으로."""
+    """사이드바 컨트롤 패널: 데이터 소스(API/엑셀 업로드) + 엑셀 다운로드 + 처음으로."""
     with st.sidebar:
         st.subheader("📥 데이터 소스")
         source = st.radio(
-            "입력 방법", ["API 수집", "JSON 번들 업로드"],
+            "입력 방법", ["API 수집", "엑셀 업로드"],
             horizontal=True, key="data_source", label_visibility="collapsed",
         )
 
@@ -1223,48 +1155,41 @@ def render_sidebar() -> None:
                 _set_data(year, month, posts, photos, master_uploaded=None)
                 st.rerun()
         else:
-            st.caption("이전 세션에서 다운로드한 **JSON 번들**을 올리면 API 호출 없이 즉시 분석합니다.")
-            f = st.file_uploader("번들 파일 (.json)", type=["json"], key="bundle_upload")
+            st.caption("이전에 받은 **분석 엑셀**을 올리면 API 호출 없이 즉시 분석합니다.")
+            f = st.file_uploader("엑셀 파일 (.xlsx)", type=["xlsx"], key="excel_upload")
             if f is not None and st.button("📥 불러오기", type="primary", width="stretch"):
                 try:
-                    bundle = _load_bundle(f.getvalue())
+                    bundle = load_excel_bundle(f.getvalue())
                 except Exception as e:  # noqa: BLE001
-                    st.error(f"번들 파일 오류: {e}")
+                    st.error(f"엑셀 파일 오류: {e}")
                 else:
                     _set_data(bundle["year"], bundle["month"],
                               bundle["posts"], bundle["photos"],
                               master_uploaded=bundle.get("master") or None)
-                    st.success(f"번들 로드 · 게시글 {len(bundle['posts'])} / 사진 {len(bundle['photos'])} "
+                    st.success(f"엑셀 로드 · 게시글 {len(bundle['posts'])} / 사진 {len(bundle['photos'])} "
                                f"· 마스터 {len(bundle.get('master') or [])}명")
                     st.rerun()
 
         if "result" in st.session_state:
-            year_r, month_r, posts_r, photos_r, xlsx_r, _names = st.session_state["result"]
-            records = st.session_state.get("master", {}).get("records", [])
+            _year_r, month_r, _posts_r, _photos_r, xlsx_r, _names = st.session_state["result"]
+            year_r = st.session_state["result"][0]
             tag = f"{year_r}" + (f"_{month_r:02d}" if month_r else "")
             st.divider()
             st.subheader("💾 다운로드")
             st.download_button(
-                "📦 JSON 번들 (.json)",
-                data=_dump_bundle(year_r, month_r, posts_r, photos_r, records),
-                file_name=f"다감노_{tag}_번들.json",
-                mime="application/json", width="stretch",
-            )
-            st.caption("다음 세션에 이 번들을 업로드하면 API 호출 없이 즉시 분석.")
-            st.download_button(
-                "📊 엑셀 (.xlsx)",
+                "📥 엑셀 (인사이트 + 원본)",
                 data=xlsx_r,
                 file_name=f"다감노_{tag}_분석.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 width="stretch",
             )
-            st.caption("원본 + 인사이트 11개 시트.")
+            st.caption("이 엑셀을 다음에 그대로 업로드하면 API 호출 없이 같은 분석을 다시 볼 수 있어요.")
 
         if "data" in st.session_state:
             st.divider()
             if st.button("🔄 처음으로", width="stretch"):
                 for k in ("data", "master", "result", "_collect_cache",
-                          "api_year", "api_month", "api_month_on", "bundle_upload"):
+                          "api_year", "api_month", "api_month_on", "excel_upload"):
                     st.session_state.pop(k, None)
                 st.rerun()
 
@@ -1279,7 +1204,7 @@ def main() -> None:
     if "data" not in st.session_state:
         st.info(
             "👈 사이드바에서 **API 수집**으로 데이터를 모으거나, "
-            "이전에 다운로드한 **JSON 번들**을 업로드해 주세요."
+            "이전에 다운로드한 **분석 엑셀**을 업로드해 주세요."
         )
         return
 

@@ -28,6 +28,30 @@ from .collector import GROUP_NAME, OUTING_CATS, NON_OUTING_CATS  # noqa: F401
 
 
 # ═══════════════════════════════════════════════════════════════
+# 엑셀 = 결과 + 원본 (다음 세션 재사용)
+# ═══════════════════════════════════════════════════════════════
+#
+# 11개 가시 시트 뒤에 4개 숨김 시트를 둬서, 이 엑셀 하나만으로
+# (인사이트 다시 보기) + (원본 데이터 재분석)이 가능하게 한다.
+# 숨김 시트는 Excel에서 시트 탭 우클릭 → 숨기기 취소로 노출 가능.
+
+EXCEL_SCHEMA_VERSION = 1
+
+BASE_POST_KEYS: list[str] = [
+    "id", "author", "wid", "title", "body", "outing_date", "posted_at",
+    "cat", "cat_label", "category", "is_outing", "is_canceled",
+    "likes", "comments", "images", "needs_review", "review_reason",
+]
+BASE_PHOTO_KEYS: list[str] = [
+    "id", "author", "wid", "posted_at", "likes", "comments", "has_comment",
+    "url_large", "url_medium", "url_small", "url_thumb",
+]
+_BOOL_POST_KEYS = {"is_outing", "is_canceled", "needs_review"}
+_BOOL_PHOTO_KEYS = {"has_comment"}
+_CELL_MAX_LEN = 32000  # 엑셀 셀당 32,767자 한도 안전 여유
+
+
+# ═══════════════════════════════════════════════════════════════
 # 스타일
 # ═══════════════════════════════════════════════════════════════
 
@@ -89,9 +113,12 @@ def build_excel(
     photos: list[dict],
     year: int,
     month: Optional[int] = None,
+    master_records: Optional[list[dict]] = None,
 ) -> bytes:
     """
     수집 데이터로부터 엑셀 파일(bytes) 생성.
+
+    가시 시트 11개 + 숨김 시트 3~4개(원본 + 마스터 임베드 — 재업로드 시 API 호출 없이 재분석).
 
     시트 구성:
     1. 📊 대시보드
@@ -105,6 +132,7 @@ def build_excel(
     9. 🎯 출사별 참석자       — annotate_review_attendees + match_outings_with_reviews 거친 경우
     10. 👥 멤버별 참석
     11. 📅 월별 참석 매트릭스
+    (숨김) _메타, _원본_게시글, _원본_사진, _멤버마스터(master_records 있을 때만)
     """
     period_label = f"{year}년" + (f" {month}월" if month else "")
 
@@ -137,6 +165,12 @@ def build_excel(
     _build_sheet_member_attendance(wb, posts_A)
     _build_sheet_monthly_matrix(wb, posts_A)
 
+    _build_sheet_meta(wb, year, month)
+    _build_sheet_raw_posts(wb, posts)
+    _build_sheet_raw_photos(wb, photos)
+    if master_records is not None:
+        _build_sheet_master(wb, master_records)
+
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -148,15 +182,173 @@ def save_excel(
     year: int,
     month: Optional[int] = None,
     path: Optional[str] = None,
+    master_records: Optional[list[dict]] = None,
 ) -> str:
     """엑셀을 파일로 저장. 경로 미지정시 기본 이름 사용."""
     if path is None:
         period = f"{year}" + (f"_{month:02d}" if month else "")
         path = f"다감노_{period}_분석.xlsx"
-    data = build_excel(posts, photos, year, month)
+    data = build_excel(posts, photos, year, month, master_records=master_records)
     with open(path, "wb") as f:
         f.write(data)
     return path
+
+
+# ═══════════════════════════════════════════════════════════════
+# 숨김 시트 — 원본 데이터 + 마스터 임베드
+# ═══════════════════════════════════════════════════════════════
+
+def _truncate(s: str, limit: int = _CELL_MAX_LEN) -> str:
+    return s if len(s) <= limit else s[:limit]
+
+
+def _to_cell(value, key: str = "") -> object:
+    """원본 dict 값을 엑셀 셀에 쓰기 좋은 형태로 정규화."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float, datetime, date)):
+        return value
+    if isinstance(value, str):
+        return _truncate(value) if key == "body" else value
+    return str(value)
+
+
+def _build_sheet_meta(wb: Workbook, year: int, month: Optional[int]) -> None:
+    ws = wb.create_sheet("_메타")
+    ws.sheet_state = "hidden"
+    ws.append(["key", "value"])
+    rows = [
+        ("schema_version", EXCEL_SCHEMA_VERSION),
+        ("year", int(year)),
+        ("month", "" if month is None else int(month)),
+        ("saved_at", datetime.now().isoformat(timespec="seconds")),
+    ]
+    for k, v in rows:
+        ws.append([k, v])
+
+
+def _build_sheet_raw_posts(wb: Workbook, posts: list[dict]) -> None:
+    ws = wb.create_sheet("_원본_게시글")
+    ws.sheet_state = "hidden"
+    ws.append(BASE_POST_KEYS)
+    for p in posts:
+        ws.append([_to_cell(p.get(k), k) for k in BASE_POST_KEYS])
+
+
+def _build_sheet_raw_photos(wb: Workbook, photos: list[dict]) -> None:
+    ws = wb.create_sheet("_원본_사진")
+    ws.sheet_state = "hidden"
+    ws.append(BASE_PHOTO_KEYS)
+    for ph in photos:
+        ws.append([_to_cell(ph.get(k), k) for k in BASE_PHOTO_KEYS])
+
+
+def _build_sheet_master(wb: Workbook, master_records: list[dict]) -> None:
+    ws = wb.create_sheet("_멤버마스터")
+    ws.sheet_state = "hidden"
+    ws.append(["실명", "닉네임", "별칭"])
+    for r in master_records or []:
+        aliases = r.get("별칭") or []
+        if isinstance(aliases, str):
+            alias_str = aliases
+        else:
+            alias_str = ";".join(str(a) for a in aliases if a)
+        ws.append([
+            str(r.get("실명") or ""),
+            str(r.get("닉네임") or ""),
+            alias_str,
+        ])
+
+
+# ═══════════════════════════════════════════════════════════════
+# 엑셀 → 원본 데이터 복원 (재업로드)
+# ═══════════════════════════════════════════════════════════════
+
+def load_excel_bundle(data: bytes) -> dict:
+    """엑셀 bytes에서 숨김 시트의 원본 데이터·마스터를 복원.
+
+    Returns:
+        {"year": int, "month": int|None, "posts": list[dict],
+         "photos": list[dict], "master": list[dict]}
+    Raises:
+        ValueError — 메타 시트 없음/버전 불일치/필수 시트 누락.
+    """
+    from openpyxl import load_workbook
+    wb = load_workbook(BytesIO(data), data_only=True)
+
+    for name in ("_메타", "_원본_게시글", "_원본_사진"):
+        if name not in wb.sheetnames:
+            raise ValueError(f"이 엑셀에는 원본 데이터({name})가 포함돼 있지 않습니다.")
+
+    meta = _read_meta(wb["_메타"])
+    if meta.get("schema_version") != EXCEL_SCHEMA_VERSION:
+        raise ValueError(
+            f"지원하지 않는 엑셀 버전: {meta.get('schema_version')} "
+            f"(지원={EXCEL_SCHEMA_VERSION})"
+        )
+    year = int(meta["year"])
+    month_val = meta.get("month")
+    month: Optional[int] = int(month_val) if month_val not in (None, "", 0) else None
+
+    posts = _read_raw(wb["_원본_게시글"], BASE_POST_KEYS, _BOOL_POST_KEYS)
+    photos = _read_raw(wb["_원본_사진"], BASE_PHOTO_KEYS, _BOOL_PHOTO_KEYS)
+    master = _read_master(wb["_멤버마스터"]) if "_멤버마스터" in wb.sheetnames else []
+
+    return {"year": year, "month": month, "posts": posts,
+            "photos": photos, "master": master}
+
+
+def _read_meta(ws) -> dict:
+    out: dict = {}
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return out
+    for row in rows[1:]:  # 헤더 스킵
+        if not row or row[0] in (None, ""):
+            continue
+        out[str(row[0])] = row[1] if len(row) > 1 else None
+    return out
+
+
+def _read_raw(ws, keys: list[str], bool_keys: set[str]) -> list[dict]:
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return []
+    header = [str(c) if c is not None else "" for c in rows[0]]
+    out: list[dict] = []
+    for row in rows[1:]:
+        if not row or all(c is None for c in row):
+            continue
+        rec: dict = {}
+        for i, k in enumerate(header):
+            v = row[i] if i < len(row) else None
+            if k in bool_keys:
+                v = bool(v)
+            elif k == "review_reason" and v is None:
+                v = ""
+            rec[k] = v
+        for k in keys:
+            rec.setdefault(k, "" if k == "review_reason" else None)
+        out.append(rec)
+    return out
+
+
+def _read_master(ws) -> list[dict]:
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return []
+    out: list[dict] = []
+    for row in rows[1:]:
+        if not row or all(c in (None, "") for c in row):
+            continue
+        real = str(row[0]) if len(row) > 0 and row[0] not in (None, "") else ""
+        nick = str(row[1]) if len(row) > 1 and row[1] not in (None, "") else ""
+        alias_raw = str(row[2]) if len(row) > 2 and row[2] not in (None, "") else ""
+        aliases = [a.strip() for a in alias_raw.split(";") if a.strip()]
+        out.append({"실명": real, "닉네임": nick, "별칭": aliases})
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════
