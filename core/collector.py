@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import time
 import requests
+from collections import Counter
 from datetime import datetime, date
 from typing import Callable, Optional
 
@@ -235,7 +236,7 @@ def collect_posts(
 
     Returns:
         list of dict with keys:
-            id, author, wid, title, outing_date(str|None),
+            id, author, wid, title, body(str), outing_date(str|None),
             posted_at(datetime), cat, cat_label, category,
             is_outing, is_canceled, likes, comments, images,
             needs_review(bool), review_reason(str)
@@ -283,6 +284,7 @@ def collect_posts(
             "author":      p.get("wn", ""),
             "wid":         p.get("wid", ""),
             "title":       p["at"],
+            "body":        p.get("c", ""),
             "outing_date": outing_date,
             "posted_at":   dt,
             "cat":         cat,
@@ -355,6 +357,275 @@ def collect_photos(
 
     _emit(progress, f"사진 필터 후 {len(photos)}개", 1.0)
     return photos
+
+
+# ═══════════════════════════════════════════════════════════════
+# 후기 본문 기반 참석자 추적
+# ═══════════════════════════════════════════════════════════════
+#
+# 소모임 댓글 내용은 비공개라 가져올 수 없지만, 후기글 본문(`body`)에
+# 참석자 명단이 적혀 있어 이를 파싱해 "어떤 출사에 누가 참석했나"를 만든다.
+# 핵심 전제(실측): 후기 본문의 이름은 '실명', 게시글 작성자명은 '닉네임'이라
+# 이름공간이 다르다 → 멤버 마스터는 실명↔닉네임 매핑을 함께 보유한다.
+
+# 본문에서 사람 이름으로 오인되는 일반 명사/카테고리어 (추출 제외)
+NAME_BLACKLIST: set[str] = {
+    "정모", "정보", "후기", "사진", "출사", "촬영", "참여", "참석", "참가",
+    "오늘", "내일", "어제", "이번", "다음", "지난", "다같이", "모두", "다들",
+    "감사", "수고", "고생", "준비", "진행", "마무리", "종료", "시작",
+    "그리고", "그래서", "하지만", "정도", "조금", "많이", "정말", "너무",
+    "모임장", "운영진", "신입", "회원", "멤버", "여러분", "님들",
+    # 정규화 카테고리어 (제목/본문에 태그가 그대로 들어온 경우) — GN은 영문이라 NAME_RX 미해당
+    "인물", "인물&풍경", "풍경", "보정", "문화",
+}
+
+NAME_RX = re.compile(r"[가-힣]{2,4}")
+
+REVIEW_LOOKBACK_DAYS    = 90    # 후기 제목의 MM.DD를 과거로 해석할 최대 범위
+MATCH_MAX_DAYS_EXACT    = 7     # 후기 출사일이 파싱된 경우 매칭 허용 거리
+MATCH_MAX_DAYS_FALLBACK = 45    # 작성일 근접 fallback 허용 거리
+CAT_MATCH_BONUS         = 100   # 카테고리 일치 시 점수 감점(우선)
+AUTHOR_MATCH_BONUS      = 5     # 작성자 일치 시 점수 감점
+
+
+def parse_member_csv(text: str) -> tuple[set[str], dict[str, str], dict[str, str]]:
+    """멤버 명단 CSV/TXT 파싱.
+
+    형식(헤더 줄 선택): 각 줄 `실명,닉네임[,별칭;별칭...]`. 한 컬럼만 있으면 실명으로 간주.
+
+    Returns:
+        (member_names, nick_to_real, real_to_nick)
+        - member_names: 실명+닉네임+별칭 집합 (본문 추출 매칭용)
+        - nick_to_real: 닉네임/별칭 → 실명
+        - real_to_nick: 실명 → 닉네임 (표시용)
+    """
+    member_names: set[str] = set()
+    nick_to_real: dict[str, str] = {}
+    real_to_nick: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [c.strip() for c in line.split(",")]
+        real = parts[0] if parts else ""
+        if not real or real.lower() in ("실명", "이름", "name", "성명"):  # 헤더 스킵
+            continue
+        member_names.add(real)
+        nick = parts[1] if len(parts) > 1 else ""
+        if nick:
+            nick_to_real[nick] = real
+            real_to_nick[real] = nick
+            member_names.add(nick)
+        if len(parts) > 2 and parts[2]:
+            for alias in parts[2].split(";"):
+                alias = alias.strip()
+                if alias:
+                    member_names.add(alias)
+                    nick_to_real.setdefault(alias, real)
+    member_names.difference_update(NAME_BLACKLIST)
+    return member_names, nick_to_real, real_to_nick
+
+
+def build_member_master(
+    posts: list[dict],
+    photos: list[dict],
+    min_freq: int = 3,
+    extra_names: Optional[set[str]] = None,
+) -> set[str]:
+    """멤버 마스터(실명 추정 집합) 구축 — 후기 본문 추출 매칭용.
+
+    소스:
+    - 후기 본문에서 min_freq회 이상 등장하는 한글 토큰 (실명 후보)
+    - extra_names (CSV의 실명·닉네임·별칭)
+
+    NOTE: 게시글 작성자·사진 업로더는 '닉네임'이라 실명 본문엔 거의 안 나오므로
+    추출 매칭 집합에는 넣지 않는다(식별자 매핑은 parse_member_csv가 담당). photos는
+    시그니처 호환·향후 확장을 위해 받되 현재 빈도 집계엔 쓰지 않는다.
+    """
+    name_freq: Counter = Counter()
+    for p in posts:
+        if p.get("cat") != "E":
+            continue
+        body, title = p.get("body", ""), p.get("title", "")
+        cleaned = body.replace(title, " ") if title else body
+        for n in NAME_RX.findall(cleaned):
+            if n not in NAME_BLACKLIST:
+                name_freq[n] += 1
+    master = {n for n, c in name_freq.items() if c >= min_freq}
+    if extra_names:
+        master.update(extra_names)
+    master.difference_update(NAME_BLACKLIST)
+    return master
+
+
+def extract_attendees(body: str, title: str, member_names: set[str]) -> list[str]:
+    """후기 본문에서 마스터 매칭된 이름 추출 (등장 순서 유지, 중복 제거)."""
+    if not body:
+        return []
+    cleaned = body.replace(title, " ") if title else body
+    out = [n for n in NAME_RX.findall(cleaned)
+           if n in member_names and n not in NAME_BLACKLIST]
+    return list(dict.fromkeys(out))
+
+
+def parse_review_outing_date(
+    title: str, content: str, posted_dt: datetime
+) -> Optional[date]:
+    """후기 제목/내용에서 '본 출사'의 날짜 추출.
+
+    후기는 출사 이후에 작성되므로 infer_outing_date(미래 지향)와 반대로,
+    MM.DD를 작성일 이전의 가장 최근(≤ posted, ≤ REVIEW_LOOKBACK_DAYS) 날짜로 해석한다.
+    명시 연도(출사진행날짜 / 제목 YYYY.MM.DD)는 그대로 신뢰. 기존 날짜 정규식 재사용.
+    """
+    posted_date = posted_dt.date()
+
+    m = re.search(r"출사진행날짜\s*[:\-]\s*" + DATE_PATTERN_WITH_YEAR, content or "")
+    if m:
+        try:
+            return date(2000 + int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+
+    t = CANCEL_RX.sub("", title or "")
+    t = re.sub(r"[<>《》]", " ", t)
+
+    m = re.search(DATE_PATTERN_WITH_YEAR, t)
+    if m:
+        try:
+            return date(2000 + int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+
+    md = None
+    for pat in DATE_PATTERNS_NO_YEAR:
+        m = re.search(pat, t)
+        if m:
+            try:
+                mo, day = int(m.group(1)), int(m.group(2))
+                if 1 <= mo <= 12 and 1 <= day <= 31:
+                    md = (mo, day)
+                    break
+            except ValueError:
+                continue
+    if not md:
+        return None
+
+    mo, day = md
+    for off in (0, -1):
+        try:
+            cand = date(posted_date.year + off, mo, day)
+        except ValueError:
+            continue
+        if cand <= posted_date and (posted_date - cand).days <= REVIEW_LOOKBACK_DAYS:
+            return cand
+    return None
+
+
+def annotate_review_attendees(
+    posts: list[dict],
+    member_names: set[str],
+    nick_to_real: Optional[dict[str, str]] = None,
+) -> tuple[list[dict], Counter]:
+    """cat=E 후기에 참석자 정보를 부착(in-place).
+
+    부착 키: attendees_raw(원본 매칭 토큰), attendees(실명 정규화·중복 제거),
+    attendees_needs_review/attendees_review_reason(자가검증), review_outing_date,
+    matched_outing_id(초기 None — match 단계에서 채움).
+
+    자가검증: 작성자(닉네임)를 nick_to_real로 실명 변환 후 명단 포함 여부 확인.
+    매핑이 없으면 '명단 비었음'만으로 판정.
+
+    Returns: (posts, unknown_freq) — 마스터에 없는 본문 토큰의 빈도(명단 보강 참고용).
+    """
+    nick_to_real = nick_to_real or {}
+    unknown_freq: Counter = Counter()
+
+    for p in posts:
+        if p.get("cat") != "E":
+            continue
+        title = p.get("title", "")
+        body = p.get("body", "")
+        author = p.get("author", "")
+
+        raw = extract_attendees(body, title, member_names)
+        canon = list(dict.fromkeys(nick_to_real.get(n, n) for n in raw))
+
+        needs, reason = False, ""
+        if not canon:
+            needs, reason = True, "본문에서 이름을 찾지 못함"
+        elif nick_to_real:
+            author_real = nick_to_real.get(author, author)
+            if author_real not in canon:
+                needs, reason = True, f"작성자({author})가 명단에 없음"
+
+        p["attendees_raw"] = raw
+        p["attendees"] = canon
+        p["attendees_needs_review"] = needs
+        p["attendees_review_reason"] = reason
+        d = parse_review_outing_date(title, body, p["posted_at"])
+        p["review_outing_date"] = d.isoformat() if d else None
+        p["matched_outing_id"] = None
+
+        cleaned = body.replace(title, " ") if title else body
+        for n in NAME_RX.findall(cleaned):
+            if n not in member_names and n not in NAME_BLACKLIST:
+                unknown_freq[n] += 1
+
+    return posts, unknown_freq
+
+
+def match_outings_with_reviews(posts: list[dict]) -> list[dict]:
+    """출사 공지(cat=A)와 후기(cat=E)를 출사일·카테고리로 매칭(in-place).
+
+    공지: matched_review_id, attendees(매칭 후기의 참석자), actually_held.
+    후기: matched_outing_id.
+    매칭 점수(작을수록 우선) = 날짜거리 − 카테고리일치보너스 − 작성자일치보너스.
+    후기 출사일이 파싱되면 outing_date와 근접(±EXACT) 매칭, 아니면 작성일 근접(±FALLBACK).
+    """
+    notices = [p for p in posts if p.get("cat") == "A" and p.get("outing_date")]
+    reviews = [p for p in posts if p.get("cat") == "E"]
+
+    for n in notices:
+        n["matched_review_id"] = None
+        n["attendees"] = []
+        n["actually_held"] = False
+    for r in reviews:
+        r.setdefault("matched_outing_id", None)
+
+    def best_match(r: dict):
+        rod = r.get("review_outing_date")
+        r_date = date.fromisoformat(rod) if rod else r["posted_at"].date()
+        r_cat = r.get("category")
+        limit = MATCH_MAX_DAYS_EXACT if rod else MATCH_MAX_DAYS_FALLBACK
+        best, best_score, best_dist = None, float("inf"), None
+        for n in notices:
+            if n["matched_review_id"]:
+                continue
+            dist = abs((r_date - date.fromisoformat(n["outing_date"])).days)
+            if dist > limit:
+                continue
+            score = dist
+            if n.get("category") and r_cat and n["category"] == r_cat:
+                score -= CAT_MATCH_BONUS
+            if n.get("author") and n["author"] == r.get("author"):
+                score -= AUTHOR_MATCH_BONUS
+            if score < best_score:
+                best, best_score, best_dist = n, score, dist
+        return best, best_dist
+
+    # 가장 가까운 후기부터 공지를 선점 → 먼 후기가 가로채는 것 방지
+    order = sorted(
+        reviews,
+        key=lambda r: (best_match(r)[1] if best_match(r)[1] is not None else 10**9),
+    )
+    for r in order:
+        n, _ = best_match(r)
+        if n is not None:
+            n["matched_review_id"] = r["id"]
+            n["attendees"] = list(r.get("attendees", []))
+            n["actually_held"] = True
+            r["matched_outing_id"] = n["id"]
+    return posts
 
 
 # ═══════════════════════════════════════════════════════════════
