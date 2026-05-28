@@ -797,7 +797,7 @@ JOIN_NAME_RX = re.compile(r"(?:이름|성함|본명)\s*[:：\-]\s*([가-힣]{2,4
 
 def collect_join_greetings(
     progress: ProgressFn = None,
-    active_mns: Optional[set[str]] = None,
+    active_members: Optional[list[dict]] = None,
     min_joined_at: Optional[datetime] = None,
 ) -> list[dict]:
     """cat=J(가입인사) 글 수집.
@@ -806,24 +806,31 @@ def collect_join_greetings(
     클라이언트에서 거르는 것보다 훨씬 빠르다.
 
     Args:
-        active_mns: 활성 멤버 닉네임 집합. 지정하면 author가 이 집합에 속한 글만
-            keep하고, 모든 활성 멤버의 가입인사를 1건씩 확보하면 조기 종료한다.
-            (탈퇴 멤버 가입인사까지 거슬러 올라가지 않아 수집 시간을 크게 줄임.)
+        active_members: 활성 멤버 dict 리스트(`mid`, `mn` 포함). 지정하면 게시글의
+            `wid`(작성자 user id)가 활성 멤버 `mid`에 속한 글만 keep한다. 닉네임 일치가
+            아니라 user id로 거르므로 동명이인이나 닉네임 변경(과거→현재) 케이스에서
+            엉뚱한 글을 끌어오지 않는다. 활성 멤버 전원의 가입인사를 확보하면 조기 종료.
         min_joined_at: 활성 멤버의 가장 이른 가입 시각. 지정하면 페이지의 가장
-            오래된 글이 이 시각보다 이전일 때 종료(안전망).
+            오래된 글이 이 시각보다 이전일 때 종료(안전망 — 가입인사 안 쓴 멤버 있을 때).
     """
     _emit(progress, "가입인사 수집 시작…", 0.0)
 
-    seen_authors: set[str] = set()
+    mid_to_mn: dict[str, str] = {
+        m["mid"]: m.get("mn", "")
+        for m in (active_members or [])
+        if m.get("mid")
+    }
+    active_mids: set[str] = set(mid_to_mn)
+    seen_mids: set[str] = set()
     cutoff = min_joined_at - timedelta(days=7) if min_joined_at else None
 
     def stop(all_items: list[dict], oldest_dt: datetime) -> bool:
-        if active_mns is not None:
+        if active_mids:
             for it in all_items:
-                a = it.get("wn", "")
-                if a in active_mns:
-                    seen_authors.add(a)
-            if seen_authors >= active_mns:
+                wid = it.get("wid", "")
+                if wid in active_mids:
+                    seen_mids.add(wid)
+            if seen_mids >= active_mids:
                 return True
         if cutoff is not None and oldest_dt < cutoff:
             return True
@@ -839,15 +846,19 @@ def collect_join_greetings(
     for p in raw:
         if p.get("cat") != "J":
             continue
-        author = p.get("wn", "")
-        if active_mns is not None and author not in active_mns:
+        wid = p.get("wid", "")
+        if active_mids and wid not in active_mids:
             continue
+        # author는 현재 닉네임을 우선(닉네임 변경 케이스 보정), 없으면 작성 시점 wn
+        author = mid_to_mn.get(wid) or p.get("wn", "")
         out.append({
-            "id":        p["id"],
-            "author":    author,
-            "title":     p.get("at", ""),
-            "body":      p.get("c", ""),
-            "posted_at": _post_dt(p),
+            "id":             p["id"],
+            "wid":            wid,
+            "author":         author,
+            "author_at_post": p.get("wn", ""),
+            "title":          p.get("at", ""),
+            "body":           p.get("c", ""),
+            "posted_at":      _post_dt(p),
         })
     _emit(progress, f"가입인사 {len(out)}개 추출", 1.0)
     return out

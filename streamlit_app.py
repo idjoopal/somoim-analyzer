@@ -1406,7 +1406,7 @@ def render_sidebar() -> None:
                         min_joined = min(joined_dates) if joined_dates else None
                         joins = collect_join_greetings(
                             progress=on_progress,
-                            active_mns=active_mns,
+                            active_members=members,
                             min_joined_at=min_joined,
                         )
                         join_aliases = parse_join_name_aliases(joins, active_mns)
