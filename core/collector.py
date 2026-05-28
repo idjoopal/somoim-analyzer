@@ -16,7 +16,7 @@ import re
 import time
 import requests
 from collections import Counter
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Callable, Optional
 
 
@@ -168,14 +168,23 @@ def _fetch_paginated(
     target_year: int,
     progress: ProgressFn = None,
     progress_label: str = "수집",
+    extra_payload: Optional[dict] = None,
+    should_stop: Optional[Callable[[list[dict], datetime], bool]] = None,
 ) -> list[dict]:
-    """공통 페이지네이션 수집기. 대상 연도-1까지 도달하면 중단."""
+    """공통 페이지네이션 수집기. 대상 연도-1까지 도달하면 중단.
+
+    extra_payload: API 호출에 추가할 페이로드(예: `{"cat": "J"}`)로 서버 측 필터링 활용.
+    should_stop: 각 페이지 누적 후 호출하는 조기 종료 콜백 — `(all_items, oldest_dt) -> bool`.
+    """
     all_items: list[dict] = []
     s_t = None
     stop_year = target_year - 1
+    base_payload: dict = {"gid": GROUP_ID, "wql": 20}
+    if extra_payload:
+        base_payload.update(extra_payload)
 
     for page in range(1, 200):
-        payload: dict = {"gid": GROUP_ID, "wql": 20}
+        payload = dict(base_payload)
         if s_t is not None:
             payload["s_t"] = s_t
 
@@ -197,7 +206,11 @@ def _fetch_paginated(
         # 대상 연도 이전이면 중단
         oldest = items[-1]
         oldest_ts = oldest["ot"] if oldest.get("w_t") == 2000000000 else oldest["w_t"]
-        if _ts_to_dt(oldest_ts).year < stop_year:
+        oldest_dt = _ts_to_dt(oldest_ts)
+        if oldest_dt.year < stop_year:
+            break
+
+        if should_stop is not None and should_stop(all_items, oldest_dt):
             break
 
         if data.get("eof") == "Y" or len(items) < 20:
@@ -782,24 +795,70 @@ def find_duplicate_member_names(members: list[dict]) -> set[str]:
 JOIN_NAME_RX = re.compile(r"(?:이름|성함|본명)\s*[:：\-]\s*([가-힣]{2,4})(?![가-힣])")
 
 
-def collect_join_greetings(progress: ProgressFn = None) -> list[dict]:
-    """그룹 시작부터 전체 cat=J(가입인사) 글 수집.
+def collect_join_greetings(
+    progress: ProgressFn = None,
+    active_members: Optional[list[dict]] = None,
+    min_joined_at: Optional[datetime] = None,
+) -> list[dict]:
+    """cat=J(가입인사) 글 수집.
 
-    `_fetch_paginated`에 target_year=1을 넘기면 stop_year=0이 되어 200페이지 한도
-    혹은 eof까지 끝까지 긁는다. 결과에서 cat="J"만 골라 반환.
+    서버에 `{"cat": "J"}`를 함께 보내 가입인사만 받아오므로 게시글 전체를 긁고
+    클라이언트에서 거르는 것보다 훨씬 빠르다.
+
+    Args:
+        active_members: 활성 멤버 dict 리스트(`mid`, `mn` 포함). 지정하면 게시글의
+            `wid`(작성자 user id)가 활성 멤버 `mid`에 속한 글만 keep한다. 닉네임 일치가
+            아니라 user id로 거르므로 동명이인이나 닉네임 변경(과거→현재) 케이스에서
+            엉뚱한 글을 끌어오지 않는다. 활성 멤버 전원의 가입인사를 확보하면 조기 종료.
+        min_joined_at: 활성 멤버의 가장 이른 가입 시각. 지정하면 페이지의 가장
+            오래된 글이 이 시각보다 이전일 때 종료(안전망 — 가입인사 안 쓴 멤버 있을 때).
     """
     _emit(progress, "가입인사 수집 시작…", 0.0)
-    raw = _fetch_paginated("/api/articles", "cs", 1, progress, "가입인사")
+
+    mid_to_mn: dict[str, str] = {
+        m["mid"]: m.get("mn", "")
+        for m in (active_members or [])
+        if m.get("mid")
+    }
+    active_mids: set[str] = set(mid_to_mn)
+    seen_mids: set[str] = set()
+    cutoff = min_joined_at - timedelta(days=7) if min_joined_at else None
+
+    def stop(all_items: list[dict], oldest_dt: datetime) -> bool:
+        if active_mids:
+            for it in all_items:
+                wid = it.get("wid", "")
+                if wid in active_mids:
+                    seen_mids.add(wid)
+            if seen_mids >= active_mids:
+                return True
+        if cutoff is not None and oldest_dt < cutoff:
+            return True
+        return False
+
+    raw = _fetch_paginated(
+        "/api/articles", "cs", 1, progress, "가입인사",
+        extra_payload={"cat": "J"},
+        should_stop=stop,
+    )
+
     out: list[dict] = []
     for p in raw:
         if p.get("cat") != "J":
             continue
+        wid = p.get("wid", "")
+        if active_mids and wid not in active_mids:
+            continue
+        # author는 현재 닉네임을 우선(닉네임 변경 케이스 보정), 없으면 작성 시점 wn
+        author = mid_to_mn.get(wid) or p.get("wn", "")
         out.append({
-            "id":        p["id"],
-            "author":    p.get("wn", ""),
-            "title":     p.get("at", ""),
-            "body":      p.get("c", ""),
-            "posted_at": _post_dt(p),
+            "id":             p["id"],
+            "wid":            wid,
+            "author":         author,
+            "author_at_post": p.get("wn", ""),
+            "title":          p.get("at", ""),
+            "body":           p.get("c", ""),
+            "posted_at":      _post_dt(p),
         })
     _emit(progress, f"가입인사 {len(out)}개 추출", 1.0)
     return out

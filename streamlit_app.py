@@ -85,8 +85,14 @@ def monthly_table(posts: list[dict], photos: list[dict]) -> dict[str, list[int]]
 
 
 def top_posters(posts: list[dict], n: int = 10) -> list[dict]:
+    """작성자별 게시 활동 랭킹. 활성 멤버(is_active)만 집계.
+
+    탈퇴 멤버는 통계에서 제외 — 단, 매칭/참석 집계는 별도 함수에서 원본을 그대로 본다.
+    """
     agg: dict[str, dict] = {}
     for p in posts:
+        if not p.get("is_active", True):
+            continue
         s = agg.setdefault(p["author"], {
             "작성자": p["author"], "게시글": 0, "공지": 0, "취소": 0, "후기": 0, "좋아요": 0,
         })
@@ -115,9 +121,12 @@ def category_counts(posts: list[dict]) -> list[dict]:
 
 
 def outing_user_ranking(posts: list[dict]) -> list[dict]:
+    """공지(cat=A) 작성자 랭킹. 활성 멤버만 집계."""
     agg: dict[str, dict] = {}
     for p in posts:
         if p["cat"] != "A":
+            continue
+        if not p.get("is_active", True):
             continue
         s = agg.setdefault(p["author"], {"작성자": p["author"], "진행": 0, "취소": 0})
         s["취소" if p["is_canceled"] else "진행"] += 1
@@ -136,8 +145,11 @@ def cancel_ranking(posts: list[dict], min_notices: int = 3) -> list[dict]:
 
 
 def photo_user_ranking(photos: list[dict]) -> list[dict]:
+    """사진 업로더 랭킹. 활성 멤버만 집계."""
     agg: dict[str, dict] = {}
     for p in photos:
+        if not p.get("is_active", True):
+            continue
         s = agg.setdefault(p["author"], {
             "작성자": p["author"], "사진수": 0, "테마예상": 0, "좋아요": 0, "댓글": 0,
         })
@@ -155,9 +167,11 @@ def photo_user_ranking(photos: list[dict]) -> list[dict]:
 
 
 def theme_matrix(photos: list[dict]):
-    """테마사진(댓글>0) 작성자×월 매트릭스."""
+    """테마사진(댓글>0) 작성자×월 매트릭스. 활성 멤버만 집계."""
     user_month: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     for p in photos:
+        if not p.get("is_active", True):
+            continue
         if p["has_comment"]:
             user_month[p["author"]][p["posted_at"].month] += 1
     authors = sorted(
@@ -552,6 +566,20 @@ def collect_data(year: int, month: int | None, on_progress=None):
 # 데이터 세팅 (수집·엑셀 업로드 양쪽에서 호출)
 # ═══════════════════════════════════════════════════════════════
 
+def _mark_active(items: list[dict], active_mids: set[str] | None) -> None:
+    """각 item에 `is_active`를 in-place로 마킹 — 작성자(wid)가 활성 멤버(mid)인지.
+
+    active_mids가 비어 있으면 모두 True로 두어 멤버 정보 없는 환경(예: 멤버 없이
+    재로드한 엑셀)에서도 랭킹·집계가 빈 화면이 되지 않도록 한다(필터 무력화).
+    """
+    if not active_mids:
+        for it in items:
+            it["is_active"] = True
+        return
+    for it in items:
+        it["is_active"] = it.get("wid", "") in active_mids
+
+
 def _set_data(year: int, month: int | None, posts: list[dict], photos: list[dict],
               members: list[dict] | None = None,
               banned: set[str] | None = None,
@@ -561,6 +589,9 @@ def _set_data(year: int, month: int | None, posts: list[dict], photos: list[dict
 
     data 튜플: (year, month, posts, photos, members, banned, resolution, join_aliases)
     """
+    active_mids = {m["mid"] for m in (members or []) if m.get("mid")}
+    _mark_active(posts, active_mids)
+    _mark_active(photos, active_mids)
     st.session_state["data"] = (
         int(year), month, posts, photos,
         members or [], set(banned or set()), dict(resolution or {}),
@@ -618,7 +649,6 @@ def render_basis_box(posts: list[dict], photos: list[dict], period_label: str) -
 
 OPT_SKIP  = "(선택 안 함)"
 OPT_LEFT  = "🚪 탈퇴 멤버 (추적 안 함)"
-OPT_NOISE = "❌ 이름 아님 (노이즈)"
 
 
 def render_resolution(year: int, month: int | None, posts: list[dict],
@@ -687,8 +717,9 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
 
     st.info(
         "후기에 적혔지만 **활성 멤버 명단과 정확히 일치하지 않는** 이름입니다. "
-        "각 이름을 **① 마스터 닉네임으로 매핑**(닉네임 변형/오타), "
-        "**② 탈퇴 멤버**(추적 안 함), **③ 이름 아님**(노이즈) 중 하나로 지정하세요. "
+        "각 이름을 **① 마스터 닉네임으로 매핑**(닉네임 변형/오타) 또는 "
+        "**② 탈퇴 멤버**(추적 안 함)로 지정하세요. "
+        "이름이 아닌 단어(노이즈)는 **이름 ❌** 체크박스로 빠르게 제외할 수 있습니다. "
         "🪪 가입인사 본문에서 자동 추출된 매핑은 미리 채워져 있으니 그대로 두면 적용됩니다. "
         "한 번 지정한 매핑은 같은 엑셀을 올리거나 매핑 CSV로 재사용됩니다.",
         icon="🧭",
@@ -709,16 +740,15 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
         return
 
     master_sorted = sorted(master_names)
-    options = [OPT_SKIP, OPT_LEFT, OPT_NOISE] + master_sorted
+    options = [OPT_SKIP, OPT_LEFT] + master_sorted
 
     rows = []
     for name, cnt in unresolved_freq.most_common():
         current = user_res.get(name)
         auto = join_aliases.get(name)
+        is_noise = current == NOT_A_NAME
         if current == LEFT_MEMBER:
             default = OPT_LEFT
-        elif current == NOT_A_NAME:
-            default = OPT_NOISE
         elif current in master_names:
             default = current
         elif auto in master_names:
@@ -736,6 +766,7 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
             "이름": name,
             "빈도": int(cnt),
             "참고": " · ".join(notes),
+            "이름 ❌": is_noise,
             "처리": default,
         })
 
@@ -745,11 +776,16 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
             "이름": st.column_config.TextColumn("이름", disabled=True),
             "빈도": st.column_config.NumberColumn("빈도", disabled=True, width="small"),
             "참고": st.column_config.TextColumn("참고", disabled=True, width="medium"),
+            "이름 ❌": st.column_config.CheckboxColumn(
+                "이름 ❌", width="small",
+                help="체크하면 이름이 아닌 것(노이즈)으로 즉시 처리 — 드롭다운 선택보다 우선합니다.",
+            ),
             "처리": st.column_config.SelectboxColumn(
                 "처리", options=options, required=True, width="medium",
                 help="마스터 닉네임으로 매핑하려면 위 옵션 뒤에서 선택. ⚠️ 표시는 동명이인.",
             ),
         },
+        column_order=["이름", "빈도", "참고", "이름 ❌", "처리"],
         hide_index=True, width="stretch", num_rows="fixed",
         key=f"resolution_editor_{year}_{month}",
     )
@@ -759,13 +795,15 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
         for _, row in edited.iterrows():
             name = str(row.get("이름") or "")
             choice = str(row.get("처리") or OPT_SKIP)
+            noise_flag = bool(row.get("이름 ❌"))
             auto = join_aliases.get(name)
-            if choice == OPT_SKIP:
+            # 체크박스가 켜져 있으면 드롭다운 선택보다 우선 → 노이즈로 확정
+            if noise_flag:
+                new_user_res[name] = NOT_A_NAME
+            elif choice == OPT_SKIP:
                 new_user_res.pop(name, None)
             elif choice == OPT_LEFT:
                 new_user_res[name] = LEFT_MEMBER
-            elif choice == OPT_NOISE:
-                new_user_res[name] = NOT_A_NAME
             elif choice == auto:
                 # 사용자가 자동 매핑 기본값을 그대로 유지 — user_res에 기록 불필요
                 new_user_res.pop(name, None)
@@ -1402,7 +1440,13 @@ def render_sidebar() -> None:
                         members, _ = collect_members()
                         banned = collect_banned_names()
                         active_mns = {m["mn"] for m in members if m.get("mn")}
-                        joins = collect_join_greetings(progress=on_progress)
+                        joined_dates = [m["joined_at"] for m in members if m.get("joined_at")]
+                        min_joined = min(joined_dates) if joined_dates else None
+                        joins = collect_join_greetings(
+                            progress=on_progress,
+                            active_members=members,
+                            min_joined_at=min_joined,
+                        )
                         join_aliases = parse_join_name_aliases(joins, active_mns)
                     except Exception as e:  # noqa: BLE001
                         status.update(label="수집 실패", state="error")
