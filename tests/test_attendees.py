@@ -2,6 +2,9 @@
 
 실행: 레포 루트에서 `python -m pytest tests/ -q`
 """
+import sys
+sys.path.insert(0, "/home/user/somoim-analyzer")
+
 from datetime import datetime, date
 
 from core.collector import (
@@ -278,3 +281,88 @@ def test_excel_load_rejects_missing_meta(tmp_path):
         assert "원본 데이터" in str(e)
     else:
         raise AssertionError("expected ValueError")
+
+
+# ── v2: extract_raw_names / resolve_names / annotate_attendees ──
+from core.collector import (
+    LEFT_MEMBER, NOT_A_NAME,
+    extract_raw_names, resolve_names, annotate_attendees, collect_all_unresolved,
+)
+
+
+def test_extract_raw_names_basic():
+    raw = extract_raw_names("정원석 이하얀 김민수 후기", "후기")
+    assert raw == ["정원석", "이하얀", "김민수"]  # "후기"는 블랙리스트 + 제목 strip
+
+
+def test_extract_raw_names_english():
+    raw = extract_raw_names("Daniel SUN 엄태진 함께", "")
+    assert "Daniel" in raw and "SUN" in raw and "엄태진" in raw
+
+
+def test_extract_raw_names_blacklist_english():
+    raw = extract_raw_names("the and 엄태진 with", "")
+    # "the","and","with"는 영문 블랙리스트로 제외
+    assert raw == ["엄태진"]
+
+
+def test_resolve_master_match():
+    confirmed, unresolved = resolve_names(["엄태진", "승구"], {"승구", "엄태진"}, {})
+    assert confirmed == ["엄태진", "승구"]
+    assert unresolved == []
+
+
+def test_resolve_nickname_mapping():
+    confirmed, unresolved = resolve_names(["음승구"], {"승구"}, {"음승구": "승구"})
+    assert confirmed == ["승구"]
+    assert unresolved == []
+
+
+def test_resolve_left_and_noise():
+    confirmed, unresolved = resolve_names(
+        ["엄태진", "민민기", "습니다"], {"엄태진"},
+        {"민민기": LEFT_MEMBER, "습니다": NOT_A_NAME},
+    )
+    assert confirmed == ["엄태진"]
+    assert unresolved == []
+
+
+def test_resolve_unresolved():
+    confirmed, unresolved = resolve_names(["엄태진", "처음본이름"], {"엄태진"}, {})
+    assert confirmed == ["엄태진"]
+    assert unresolved == ["처음본이름"]
+
+
+def test_annotate_attendees_and_unresolved_counter():
+    posts = [{
+        "cat": "E", "title": "후기", "body": "정원석 이하얀 음승구 처음본이름",
+        "author": "닉", "posted_at": datetime(2026, 6, 7),
+    }]
+    annotate_attendees(posts, {"정원석", "이하얀", "승구"}, {"음승구": "승구"})
+    # 정규식이 한글 2~4자 → '처음본이름'(5자)은 토큰화 시 '처음본이'로 잘림
+    assert posts[0]["attendees"] == ["정원석", "이하얀", "승구"]
+    assert "처음본이" in posts[0]["unresolved_names"]
+    cnt = collect_all_unresolved(posts)
+    assert cnt["처음본이"] >= 1
+
+
+def test_excel_round_trip_with_members_and_resolution():
+    from core.excel_builder import build_excel, load_excel_bundle
+    members = [{
+        "mid": "m1", "mn": "이이현", "is_admin": True,
+        "joined_at": datetime(2020, 1, 1, 0, 0, 0),
+        "last_visit": datetime(2026, 5, 28, 12, 0, 0),
+        "os": "iOS", "push": True,
+    }]
+    banned = {"민민기", "이종민"}
+    resolution = {"음승구": "승구", "민민기": LEFT_MEMBER, "습니다": NOT_A_NAME}
+    blob = build_excel([], [], 2026, None,
+                       members=members, banned=banned, resolution=resolution)
+    loaded = load_excel_bundle(blob)
+    assert len(loaded["members"]) == 1
+    assert loaded["members"][0]["mn"] == "이이현"
+    assert loaded["members"][0]["is_admin"] is True
+    assert isinstance(loaded["members"][0]["joined_at"], datetime)
+    assert loaded["banned"] == banned
+    assert loaded["resolution"]["음승구"] == "승구"
+    assert loaded["resolution"]["민민기"] == LEFT_MEMBER

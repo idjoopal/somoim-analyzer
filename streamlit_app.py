@@ -16,11 +16,15 @@ import streamlit as st
 
 from core.collector import (
     GROUP_NAME,
+    LEFT_MEMBER,
     NAME_BLACKLIST,
     NON_OUTING_CATS,
+    NOT_A_NAME,
     OUTING_CATS,
-    annotate_review_attendees,
-    build_member_candidates,
+    annotate_attendees,
+    collect_all_unresolved,
+    collect_banned_names,
+    collect_members,
     collect_photos,
     collect_posts,
     match_outings_with_reviews,
@@ -410,8 +414,9 @@ def build_attendees_editor_df(reviews_sorted: list[dict]) -> pd.DataFrame:
     rows = []
     for p in reviews_sorted:
         body = p.get("body", "") or ""
+        unresolved = p.get("unresolved_names") or []
         rows.append({
-            "검토": p.get("attendees_review_reason") or "",
+            "검토": f"미해소 {len(unresolved)}명" if unresolved else "",
             "작성일": p["posted_at"].date(),
             "작성자": p["author"],
             "제목": p["title"],
@@ -442,7 +447,7 @@ def apply_attendees_edits(
         text = str(raw) if pd.notna(raw) else ""
         attendees = [n.strip() for n in text.split(",") if n.strip()]
         target["attendees"] = attendees  # 새 리스트 (in-place mutate 금지)
-        target["attendees_needs_review"] = False
+        target["unresolved_names"] = []   # 사용자가 직접 명시 → 미해소 없음
     return final_posts
 
 
@@ -544,49 +549,47 @@ def collect_data(year: int, month: int | None, on_progress=None):
 # 데이터 세팅 (수집·엑셀 업로드 양쪽에서 호출)
 # ═══════════════════════════════════════════════════════════════
 
-def _set_data(year: int, month: int | None, posts: list[dict],
-              photos: list[dict], master_uploaded: list[dict] | None = None) -> None:
-    """수집/업로드 양쪽에서 호출. session_state['data'] 설정 + 후속 단계 키 클리어."""
-    st.session_state["data"] = (int(year), month, posts, photos, master_uploaded or [])
+def _set_data(year: int, month: int | None, posts: list[dict], photos: list[dict],
+              members: list[dict] | None = None,
+              banned: set[str] | None = None,
+              resolution: dict[str, str] | None = None) -> None:
+    """수집/업로드 양쪽에서 호출. session_state['data'] 설정 + 후속 단계 키 클리어.
+
+    data 튜플: (year, month, posts, photos, members, banned, resolution)
+    """
+    st.session_state["data"] = (
+        int(year), month, posts, photos,
+        members or [], set(banned or set()), dict(resolution or {}),
+    )
     for k in ("master", "result"):
         st.session_state.pop(k, None)
 
 
-def _apply_master_edits(edited: pd.DataFrame) -> tuple[set[str], dict[str, str],
-                                                        dict[str, str], list[dict]]:
-    """마스터 editor 결과 → (names, nick_to_real, real_to_nick, records).
-    빈 행과 포함=False 행은 스킵. 블랙리스트 토큰은 names에서 제거.
-    records는 번들 저장용(JSON 친화 list[dict])."""
-    names: set[str] = set()
-    n2r: dict[str, str] = {}
-    r2n: dict[str, str] = {}
-    records: list[dict] = []
-    if edited is None or edited.empty:
-        return names, n2r, r2n, records
-    for _, row in edited.iterrows():
-        if not bool(row.get("포함", False)):
+def _parse_resolution_csv(text: str) -> dict[str, str]:
+    """매핑 CSV(`이름,처리`) → resolution dict. 첫 행이 헤더이면 스킵."""
+    out: dict[str, str] = {}
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return out
+    start = 1 if "이름" in lines[0] and "처리" in lines[0] else 0
+    for line in lines[start:]:
+        if "," not in line:
             continue
-        real = str(row.get("실명") or "").strip()
-        nick = str(row.get("닉네임") or "").strip()
-        alias_raw = str(row.get("별칭") or "").strip()
-        aliases = [a.strip() for a in alias_raw.split(";") if a.strip()]
-        if not real and not nick:
-            continue
-        if real:
-            names.add(real)
-        if nick:
-            names.add(nick)
-        for a in aliases:
-            names.add(a)
-        if real and nick:
-            n2r[nick] = real
-            r2n[real] = nick
-        if real:
-            for a in aliases:
-                n2r.setdefault(a, real)
-        records.append({"실명": real, "닉네임": nick, "별칭": aliases})
-    names.difference_update(NAME_BLACKLIST)
-    return names, n2r, r2n, records
+        k, v = line.split(",", 1)
+        k, v = k.strip(), v.strip()
+        if k and v:
+            out[k] = v
+    return out
+
+
+def _resolution_to_csv(resolution: dict[str, str]) -> bytes:
+    """resolution dict → CSV bytes(utf-8-sig)."""
+    lines = ["이름,처리"]
+    for k, v in resolution.items():
+        if "," in k or "," in v:
+            continue  # 콤마 포함 토큰은 한 번 건너뜀(매우 드묾)
+        lines.append(f"{k},{v}")
+    return ("\n".join(lines) + "\n").encode("utf-8-sig")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -608,79 +611,122 @@ def render_basis_box(posts: list[dict], photos: list[dict], period_label: str) -
     )
 
 
-def render_master(year: int, month: int | None, posts: list[dict],
-                   photos: list[dict], master_uploaded: list[dict]) -> None:
-    """Stage 1: 멤버 마스터 확정. 자동 후보 + 업로드 master 사전 채움 → 사용자 보정 → 확정."""
+OPT_SKIP  = "(선택 안 함)"
+OPT_LEFT  = "🚪 탈퇴 멤버 (추적 안 함)"
+OPT_NOISE = "❌ 이름 아님 (노이즈)"
+
+
+def render_resolution(year: int, month: int | None, posts: list[dict],
+                       photos: list[dict], members: list[dict],
+                       banned: set[str], resolution_in: dict[str, str]) -> None:
+    """Stage 1: 미매칭 이름 해소.
+
+    마스터(`master_names`) = 활성 멤버 `mn`. 후기 본문에서 추출한 토큰 중
+    마스터에 정확히 일치하지 않는 이름을 사용자가 드롭다운 3택(마스터 닉네임 /
+    탈퇴 / 노이즈)으로 해소. 매핑은 누적 재사용.
+    """
     st.divider()
-    st.subheader("① 멤버 마스터 확정")
-    st.caption(
-        "후기 본문에는 **실명**이, 게시글 작성자/사진 업로더에는 **닉네임**이 나옵니다. "
-        "자동 후보를 검토·보정한 뒤 **마스터 확정**을 누르면 그 마스터로 참석자를 추출합니다. "
-        "행 추가/삭제 가능, **포함** 체크를 해제하면 제외됩니다."
-    )
+    st.subheader("① 미매칭 이름 정리")
 
-    candidates = build_member_candidates(posts, photos)
+    master_names: set[str] = {m["mn"] for m in members if m.get("mn")}
+    if not master_names:
+        st.error(
+            "활성 멤버 명단이 없습니다. 이전 버전 엑셀을 업로드하셨다면 "
+            "**🔄 처음으로** 후 **API 수집**으로 한 번 더 받아주세요."
+        )
+        return
 
-    # 업로드된 마스터로 사전 채움/추가 (같은 토큰은 병합, 신규는 맨 위 추가)
-    if master_uploaded:
-        token_to_idx: dict[str, int] = {}
-        for i, r in enumerate(candidates):
-            for tok in (r["실명"], r["닉네임"]):
-                if tok:
-                    token_to_idx.setdefault(tok, i)
-        for m in master_uploaded:
-            real = str(m.get("실명") or "").strip()
-            nick = str(m.get("닉네임") or "").strip()
-            aliases = m.get("별칭") or []
-            if isinstance(aliases, str):
-                aliases = [a.strip() for a in aliases.split(";") if a.strip()]
-            alias_str = ";".join(aliases)
-            idx = token_to_idx.get(real) if real else token_to_idx.get(nick)
-            if idx is not None:
-                if real:
-                    candidates[idx]["실명"] = real
-                if nick:
-                    candidates[idx]["닉네임"] = nick
-                if alias_str:
-                    candidates[idx]["별칭"] = alias_str
-                candidates[idx]["포함"] = True
-            else:
-                candidates.insert(0, {"실명": real, "닉네임": nick,
-                                       "별칭": alias_str, "포함": True})
-
-    df = pd.DataFrame(candidates, columns=["실명", "닉네임", "별칭", "포함"])
+    # 매핑 보정 후 다시 매기기 위해 우선 항상 in-place 재주석
+    annotate_attendees(posts, master_names, dict(resolution_in or {}))
+    unresolved_freq = collect_all_unresolved(posts)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("후보 수", len(df))
-    c2.metric("자동 포함", int(df["포함"].sum()) if not df.empty else 0)
-    c3.metric("게시글 / 사진", f"{len(posts)} / {len(photos)}")
+    c1.metric("활성 멤버", len(master_names))
+    c2.metric("미해소 이름", len(unresolved_freq))
+    c3.metric("기존 매핑", len(resolution_in or {}))
 
-    edited = st.data_editor(
-        df,
-        column_config={
-            "실명":   st.column_config.TextColumn("실명", width="medium",
-                       help="후기 본문에 등장하는 이름(주로 한글 2~4자)"),
-            "닉네임": st.column_config.TextColumn("닉네임", width="medium",
-                       help="게시글 작성자/사진 업로더 닉네임"),
-            "별칭":   st.column_config.TextColumn("별칭 (;구분)", width="medium",
-                       help="; 로 구분해 여러 별칭 입력 가능"),
-            "포함":   st.column_config.CheckboxColumn("포함", width="small", default=True),
-        },
-        hide_index=True, width="stretch", num_rows="dynamic",
-        key=f"master_editor_{year}_{month}",
+    st.info(
+        "후기에 적혔지만 **활성 멤버 명단과 정확히 일치하지 않는** 이름입니다. "
+        "각 이름을 직접 **① 마스터 닉네임으로 매핑**(닉네임 변형/오타), "
+        "**② 탈퇴 멤버**(추적 안 함), **③ 이름 아님**(노이즈) 중 하나로 지정하세요. "
+        "**자동 추론·제안은 하지 않습니다** — 빈도 높은 순으로 정렬했어요. "
+        "한 번 지정하면 다음에 같은 엑셀을 올리거나 매핑 CSV를 들고 오면 그대로 재사용됩니다.",
+        icon="🧭",
     )
 
-    if st.button("✅ 마스터 확정", type="primary"):
-        names, n2r, r2n, records = _apply_master_edits(edited)
-        annotate_review_attendees(posts, names, n2r)
+    if not unresolved_freq:
+        st.success("모든 이름이 마스터와 매칭됐어요. 다음 단계로 진행하세요.")
+        if st.button("✅ 다음 단계로", type="primary"):
+            st.session_state["master"] = {
+                "names": master_names,
+                "members": members,
+                "banned": banned,
+                "resolution": dict(resolution_in or {}),
+            }
+            st.rerun()
+        return
+
+    master_sorted = sorted(master_names)
+    options = [OPT_SKIP, OPT_LEFT, OPT_NOISE] + master_sorted
+
+    rows = []
+    for name, cnt in unresolved_freq.most_common():
+        current = (resolution_in or {}).get(name)
+        if current == LEFT_MEMBER:
+            default = OPT_LEFT
+        elif current == NOT_A_NAME:
+            default = OPT_NOISE
+        elif current in master_names:
+            default = current
+        else:
+            default = OPT_SKIP
+        rows.append({
+            "이름": name,
+            "빈도": int(cnt),
+            "참고": "탈퇴명단에 있음" if name in (banned or set()) else "",
+            "처리": default,
+        })
+
+    edited = st.data_editor(
+        pd.DataFrame(rows),
+        column_config={
+            "이름": st.column_config.TextColumn("이름", disabled=True),
+            "빈도": st.column_config.NumberColumn("빈도", disabled=True, width="small"),
+            "참고": st.column_config.TextColumn("참고", disabled=True, width="small"),
+            "처리": st.column_config.SelectboxColumn(
+                "처리", options=options, required=True, width="medium",
+                help="마스터 닉네임으로 매핑하려면 위 옵션 뒤에서 선택",
+            ),
+        },
+        hide_index=True, width="stretch", num_rows="fixed",
+        key=f"resolution_editor_{year}_{month}",
+    )
+
+    if st.button("✅ 이 매핑으로 분석 진행", type="primary"):
+        new_resolution = dict(resolution_in or {})
+        for _, row in edited.iterrows():
+            name = str(row.get("이름") or "")
+            choice = str(row.get("처리") or OPT_SKIP)
+            if choice == OPT_SKIP:
+                new_resolution.pop(name, None)
+            elif choice == OPT_LEFT:
+                new_resolution[name] = LEFT_MEMBER
+            elif choice == OPT_NOISE:
+                new_resolution[name] = NOT_A_NAME
+            else:
+                new_resolution[name] = choice
+        annotate_attendees(posts, master_names, new_resolution)
         st.session_state["master"] = {
-            "names": names, "n2r": n2r, "r2n": r2n, "records": records,
+            "names": master_names,
+            "members": members,
+            "banned": banned,
+            "resolution": new_resolution,
         }
         st.rerun()
 
 
 def render_triage(year: int, month: int | None, raw_posts: list[dict],
-                   photos: list[dict], master: set[str]) -> None:
+                   photos: list[dict], master: dict) -> None:
     st.divider()
     st.subheader("② 분류 · 참석자 검토")
     cat_a = [p for p in raw_posts if p["cat"] == "A"]
@@ -689,18 +735,18 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict],
 
     reviews = [p for p in raw_posts if p["cat"] == "E"]
     reviews_sorted = sorted(
-        reviews, key=lambda p: (not p["attendees_needs_review"], p["posted_at"]),
+        reviews, key=lambda p: (not p.get("unresolved_names"), p["posted_at"]),
     )
-    n_att_review = sum(1 for p in reviews if p["attendees_needs_review"])
+    n_att_review = sum(1 for p in reviews if not p.get("attendees"))
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("출사 공지", len(cat_a))
     c2.metric("⚠️ 분류 검토", n_review)
     c3.metric("후기", len(reviews))
-    c4.metric("⚠️ 참석자 검토", n_att_review)
+    c4.metric("참석자 0명", n_att_review)
     st.caption(
         "**분류 검토**: 자동 분류가 애매한 공지(출사일 추론 실패·카테고리 미상)의 카테고리·출사일·진행/취소를 보정. 출사일을 비우면 분석 제외. "
-        "**참석자 검토**: 후기 본문에서 자동 추출한 참석자 명단을 확인·보정(쉼표 구분). "
+        "**참석자 보정**: ①에서 미해소한 이름이 있거나 자동 추출이 부족한 후기를 직접 수정(쉼표 구분). "
         "아래 버튼을 누르면 그 보정 분류로 인사이트·엑셀이 생성됩니다."
     )
 
@@ -746,7 +792,7 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict],
     )
     if reviews:
         if n_att_review > 0:
-            st.warning(f"참석자 검토 필요 {n_att_review}건이 표 위쪽에 있습니다. (본인이 명단에 없거나 본문에서 이름 못 찾음)")
+            st.warning(f"참석자가 비어 있는 후기 {n_att_review}건이 표 위쪽에 있습니다.")
             edited_att = st.data_editor(att_df, **att_kwargs)
         else:
             with st.expander("참석자 직접 보정 (선택)", expanded=False):
@@ -759,10 +805,13 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict],
         final_posts = apply_triage(raw_posts, cat_a_sorted, edited, year, month)
         apply_attendees_edits(final_posts, reviews_sorted, edited_att)
         match_outings_with_reviews(final_posts)
-        master_records = st.session_state.get("master", {}).get("records", [])
+        members = master.get("members", []) if isinstance(master, dict) else []
+        banned = master.get("banned", set()) if isinstance(master, dict) else set()
+        resolution = master.get("resolution", {}) if isinstance(master, dict) else {}
         xlsx = build_excel(final_posts, photos, year, month,
-                           master_records=master_records)
-        st.session_state["result"] = (year, month, final_posts, photos, xlsx, master)
+                           members=members, banned=banned, resolution=resolution)
+        st.session_state["result"] = (year, month, final_posts, photos, xlsx,
+                                       master, members, resolution)
 
 
 def _ranking_df(rows: list[dict], count_col: str) -> pd.DataFrame:
@@ -773,7 +822,9 @@ def _ranking_df(rows: list[dict], count_col: str) -> pd.DataFrame:
 
 
 def render_results(year: int, month: int | None, posts: list[dict],
-                   photos: list[dict], xlsx: bytes, master: set[str]) -> None:
+                   photos: list[dict], xlsx: bytes, master: dict,
+                   members: list[dict] | None = None,
+                   resolution: dict[str, str] | None = None) -> None:
     period = f"{year}년" + (f" {month}월" if month else " 전체")
     st.divider()
     st.subheader(f"③ {period} 인사이트")
@@ -783,10 +834,13 @@ def render_results(year: int, month: int | None, posts: list[dict],
     for col, (label, val) in zip(st.columns(len(kpis)), kpis.items()):
         col.metric(label, val)
 
-    st.caption("📥 **엑셀·JSON 번들 다운로드는 왼쪽 사이드바**의 *다운로드* 섹션에서.")
+    st.caption("📥 **엑셀 다운로드는 왼쪽 사이드바**의 *다운로드* 섹션에서.")
+
+    master_names = master.get("names") if isinstance(master, dict) else (master or set())
 
     tabs = st.tabs(
-        ["📊 개요", "📌 출사", "👥 참석", "📷 사진", "🎨 테마사진", "🏷️ 카테고리", "👤 사용자", "📋 데이터"]
+        ["📊 개요", "📌 출사", "👥 참석", "📷 사진", "🎨 테마사진",
+         "🏷️ 카테고리", "👤 사용자", "🧑‍🤝‍🧑 멤버", "📋 데이터"]
     )
 
     with tabs[0]:
@@ -794,7 +848,7 @@ def render_results(year: int, month: int | None, posts: list[dict],
     with tabs[1]:
         _tab_outings(posts)
     with tabs[2]:
-        _tab_attendance(posts, master)
+        _tab_attendance(posts, master_names or set())
     with tabs[3]:
         _tab_photos(photos)
     with tabs[4]:
@@ -804,6 +858,8 @@ def render_results(year: int, month: int | None, posts: list[dict],
     with tabs[6]:
         _tab_users(posts, photos)
     with tabs[7]:
+        _tab_members(members or [], posts, photos)
+    with tabs[8]:
         _tab_data(posts, photos)
 
 
@@ -1090,6 +1146,62 @@ def _tab_users(posts: list[dict], photos: list[dict]) -> None:
         st.info("데이터가 없습니다.")
 
 
+def _tab_members(members: list[dict], posts: list[dict], photos: list[dict]) -> None:
+    """🧑‍🤝‍🧑 활성 멤버 현황 — 유령/휴면 분류, 신규 가입 추이."""
+    if not members:
+        st.info("멤버 정보가 없습니다. 사이드바의 **API 수집**으로 받아오면 이 탭이 채워집니다.")
+        return
+
+    cur_year = datetime.now().year
+    posts_A = [p for p in posts if p.get("cat") == "A"]
+    active_authors = ({p.get("author", "") for p in posts}
+                       | {p.get("author", "") for p in photos})
+    attended = Counter()
+    for a in posts_A:
+        for n in a.get("attendees", []) or []:
+            attended[n] += 1
+
+    admins = sum(1 for m in members if m.get("is_admin"))
+    ios = sum(1 for m in members if (m.get("os") or "") == "iOS")
+    ghosts = [m for m in members
+              if m["mn"] and m["mn"] not in active_authors
+              and attended.get(m["mn"], 0) == 0]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("활성 멤버", len(members))
+    c2.metric("운영진", admins)
+    c3.metric("iOS / Android", f"{ios} / {len(members) - ios}")
+    c4.metric("유령 멤버", len(ghosts))
+    st.caption(
+        "**유령 멤버**: 가입했지만 게시글·사진·참석 0건 — 마지막 방문일로 휴면 여부 추정. "
+        "닉네임이 같은 활동 흔적은 매칭."
+    )
+
+    st.markdown(f"#### 유령 멤버 ({len(ghosts)}명)")
+    if ghosts:
+        gdf = pd.DataFrame([{
+            "닉네임": m["mn"],
+            "가입일": m["joined_at"].strftime("%Y-%m-%d") if m.get("joined_at") else "-",
+            "마지막 방문": m["last_visit"].strftime("%Y-%m-%d") if m.get("last_visit") else "-",
+            "OS": m.get("os") or "",
+            "운영진": "Y" if m.get("is_admin") else "",
+        } for m in sorted(ghosts,
+                           key=lambda x: x.get("last_visit") or datetime.min)])
+        st.dataframe(gdf, hide_index=True, width="stretch", height=320)
+    else:
+        st.caption("유령 멤버가 없습니다.")
+
+    st.markdown(f"#### {cur_year}년 월별 신규 가입")
+    join_month = [0] * 12
+    for m in members:
+        joined = m.get("joined_at")
+        if joined and joined.year == cur_year:
+            join_month[joined.month - 1] += 1
+    jdf = pd.DataFrame({"신규 가입": join_month},
+                        index=[f"{i+1}월" for i in range(12)])
+    st.bar_chart(jdf, height=240)
+
+
 def _tab_data(posts: list[dict], photos: list[dict]) -> None:
     st.caption("수집·보정된 원본 데이터 전체입니다. 표 우측 상단에서 검색·정렬, 아래 버튼으로 CSV 저장이 가능합니다.")
 
@@ -1121,7 +1233,7 @@ def _tab_data(posts: list[dict], photos: list[dict]) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 def render_sidebar() -> None:
-    """사이드바 컨트롤 패널: 데이터 소스(API/엑셀 업로드) + 엑셀 다운로드 + 처음으로."""
+    """사이드바: 데이터 소스(API/엑셀 업로드) + 매핑 CSV + 엑셀 다운로드 + 처음으로."""
     with st.sidebar:
         st.subheader("📥 데이터 소스")
         source = st.radio(
@@ -1144,15 +1256,19 @@ def render_sidebar() -> None:
                         st.write(msg)
                     try:
                         posts, photos = collect_data(int(year), month, on_progress=on_progress)
+                        on_progress("멤버 목록 수집…", 0.95)
+                        members, _ = collect_members()
+                        banned = collect_banned_names()
                     except Exception as e:  # noqa: BLE001
                         status.update(label="수집 실패", state="error")
                         st.error("수집 중 오류가 발생했습니다. (somoim API/네트워크 확인)")
                         st.exception(e)
                         st.stop()
                     progress_bar.progress(1.0, text="완료")
-                    status.update(label=f"수집 완료 · 게시글 {len(posts)} / 사진 {len(photos)}",
+                    status.update(label=f"수집 완료 · 게시글 {len(posts)} / 사진 {len(photos)} / 멤버 {len(members)}",
                                   state="complete")
-                _set_data(year, month, posts, photos, master_uploaded=None)
+                _set_data(year, month, posts, photos,
+                           members=members, banned=banned, resolution=None)
                 st.rerun()
         else:
             st.caption("이전에 받은 **분석 엑셀**을 올리면 API 호출 없이 즉시 분석합니다.")
@@ -1165,14 +1281,52 @@ def render_sidebar() -> None:
                 else:
                     _set_data(bundle["year"], bundle["month"],
                               bundle["posts"], bundle["photos"],
-                              master_uploaded=bundle.get("master") or None)
-                    st.success(f"엑셀 로드 · 게시글 {len(bundle['posts'])} / 사진 {len(bundle['photos'])} "
-                               f"· 마스터 {len(bundle.get('master') or [])}명")
+                              members=bundle.get("members") or [],
+                              banned=bundle.get("banned") or set(),
+                              resolution=bundle.get("resolution") or {})
+                    st.success(
+                        f"엑셀 로드 · 게시글 {len(bundle['posts'])} / 사진 {len(bundle['photos'])} "
+                        f"· 멤버 {len(bundle.get('members') or [])} · 매핑 {len(bundle.get('resolution') or {})}"
+                    )
+                    st.rerun()
+
+        # ── 이름 매핑 CSV (어느 단계에서나 노출) ──
+        if "data" in st.session_state:
+            year_d, month_d, _p, _ph, _m, _b, res_uploaded = st.session_state["data"]
+            current_res = (st.session_state.get("master", {}).get("resolution")
+                           if isinstance(st.session_state.get("master"), dict) else None)
+            export_res = current_res if current_res else res_uploaded
+            st.divider()
+            st.subheader("🧭 이름 매핑")
+            if export_res:
+                tag = f"{year_d}" + (f"_{month_d:02d}" if month_d else "")
+                st.download_button(
+                    "⬇️ 매핑 CSV 저장",
+                    data=_resolution_to_csv(export_res),
+                    file_name=f"다감노_{tag}_이름매핑.csv",
+                    mime="text/csv", width="stretch",
+                )
+            else:
+                st.caption("아직 저장된 매핑이 없습니다. ① 단계에서 매핑을 지정한 뒤 받아오세요.")
+            up_csv = st.file_uploader("⬆️ 매핑 CSV 불러오기", type=["csv"],
+                                       key="resolution_csv_upload")
+            if up_csv is not None and st.button("매핑 적용", width="stretch"):
+                try:
+                    loaded = _parse_resolution_csv(up_csv.getvalue().decode("utf-8-sig"))
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"CSV 형식 오류: {e}")
+                else:
+                    # 업로드 매핑은 data 튜플에 보존하고 master/result 클리어해서 Stage 1로 재진입
+                    yr, mo, posts, photos, members, banned, _ = st.session_state["data"]
+                    _set_data(yr, mo, posts, photos,
+                              members=members, banned=banned, resolution=loaded)
+                    st.success(f"{len(loaded)}개 매핑 적용 — 다시 ①부터 진행하세요.")
                     st.rerun()
 
         if "result" in st.session_state:
-            _year_r, month_r, _posts_r, _photos_r, xlsx_r, _names = st.session_state["result"]
             year_r = st.session_state["result"][0]
+            month_r = st.session_state["result"][1]
+            xlsx_r = st.session_state["result"][4]
             tag = f"{year_r}" + (f"_{month_r:02d}" if month_r else "")
             st.divider()
             st.subheader("💾 다운로드")
@@ -1189,7 +1343,8 @@ def render_sidebar() -> None:
             st.divider()
             if st.button("🔄 처음으로", width="stretch"):
                 for k in ("data", "master", "result", "_collect_cache",
-                          "api_year", "api_month", "api_month_on", "excel_upload"):
+                          "api_year", "api_month", "api_month_on", "excel_upload",
+                          "resolution_csv_upload"):
                     st.session_state.pop(k, None)
                 st.rerun()
 
@@ -1208,15 +1363,15 @@ def main() -> None:
         )
         return
 
-    year, month, posts, photos, master_uploaded = st.session_state["data"]
+    year, month, posts, photos, members, banned, resolution_uploaded = st.session_state["data"]
 
     if "result" in st.session_state:
         render_results(*st.session_state["result"])
     elif "master" in st.session_state:
-        names = st.session_state["master"]["names"]
-        render_triage(year, month, posts, photos, names)
+        render_triage(year, month, posts, photos, st.session_state["master"])
     else:
-        render_master(year, month, posts, photos, master_uploaded)
+        render_resolution(year, month, posts, photos, members,
+                           banned, resolution_uploaded)
 
 
 if __name__ == "__main__":

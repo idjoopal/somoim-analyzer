@@ -375,11 +375,24 @@ NAME_BLACKLIST: set[str] = {
     "감사", "수고", "고생", "준비", "진행", "마무리", "종료", "시작",
     "그리고", "그래서", "하지만", "정도", "조금", "많이", "정말", "너무",
     "모임장", "운영진", "신입", "회원", "멤버", "여러분", "님들",
-    # 정규화 카테고리어 (제목/본문에 태그가 그대로 들어온 경우) — GN은 영문이라 NAME_RX 미해당
+    "습니다", "니다", "있습", "있었", "있는", "없는", "했습", "됩니다",
+    # 정규화 카테고리어 (제목/본문에 태그가 그대로 들어온 경우)
     "인물", "인물&풍경", "풍경", "보정", "문화",
+    # 영문 일반 단어 (영어 닉네임 정규식 확장 후 노이즈)
+    "the", "and", "for", "with", "you", "are", "this", "that", "have",
+    "The", "And", "For", "With", "You", "Are", "This", "That", "Have",
+    "https", "http", "www", "com", "kr", "net", "org",
 }
 
-NAME_RX = re.compile(r"[가-힣]{2,4}")
+NAME_RX = re.compile(r"[가-힣]{2,4}|[A-Za-z]{2,10}")
+
+# 이름 해소 매핑(name_resolution)의 특수값.
+# 후기에서 추출된 이름이 마스터에 없을 때 사용자가 드롭다운으로 지정한 처리:
+#   - LEFT_MEMBER: 탈퇴/차단 멤버 → 추적하지 않음
+#   - NOT_A_NAME:  이름 아님(노이즈) → 추적하지 않음
+#   - 그 외 문자열: 그 마스터 닉네임으로 정규화(예: "음승구" → "승구")
+LEFT_MEMBER = "__LEFT__"
+NOT_A_NAME  = "__NOISE__"
 
 REVIEW_LOOKBACK_DAYS    = 90    # 후기 제목의 MM.DD를 과거로 해석할 최대 범위
 MATCH_MAX_DAYS_EXACT    = 7     # 후기 출사일이 파싱된 경우 매칭 허용 거리
@@ -686,6 +699,148 @@ def match_outings_with_reviews(posts: list[dict]) -> list[dict]:
             n["actually_held"] = True
             r["matched_outing_id"] = n["id"]
     return posts
+
+
+# ═══════════════════════════════════════════════════════════════
+# 멤버 API + 이름 해소 (v2)
+# ═══════════════════════════════════════════════════════════════
+#
+# /api/group에서 활성 멤버 목록을 가져와 마스터(=`mn` 집합)로 사용.
+# 후기에서 추출했지만 마스터에 정확히 일치하지 않는 이름은
+# 사용자가 드롭다운으로 LEFT_MEMBER/NOT_A_NAME/마스터닉네임 중 하나로
+# 해소(resolution dict). 자동 추론 없음.
+
+_OS_LABEL = {"i1": "iOS", "a1": "Android"}
+
+
+def collect_members(
+    progress: ProgressFn = None,
+    active_only: bool = True,
+) -> tuple[list[dict], set[str]]:
+    """/api/group에서 멤버 목록 수집.
+
+    Args:
+        active_only: True면 ban=N(활성)만 반환.
+
+    Returns:
+        (members, master_names)
+            members: dict 리스트 — keys: mid, mn, is_admin, joined_at,
+                     last_visit, os, push
+            master_names: 활성 멤버 `mn` 집합 (본문 추출 매칭용)
+    """
+    _emit(progress, "멤버 목록 수집 중…", 0.0)
+    r = requests.post(BASE_URL + "/api/group",
+                      headers=HEADERS, json={"gid": GROUP_ID}, timeout=10)
+    r.raise_for_status()
+    raw = r.json().get("m", []) or []
+
+    members: list[dict] = []
+    for m in raw:
+        if active_only and m.get("ban") != "N":
+            continue
+        members.append({
+            "mid":        m.get("mid", ""),
+            "mn":         m.get("mn", ""),
+            "is_admin":   m.get("i_m") == "Y",
+            "joined_at":  _ts_to_dt(m["j_t"]) if m.get("j_t") else None,
+            "last_visit": _ts_to_dt(m["v_t"]) if m.get("v_t") else None,
+            "os":         _OS_LABEL.get(m.get("os", ""), m.get("os", "") or ""),
+            "push":       m.get("push") == "Y",
+        })
+    master = {m["mn"] for m in members if m["mn"]}
+    _emit(progress, f"활성 멤버 {len(members)}명", 1.0)
+    return members, master
+
+
+def collect_banned_names() -> set[str]:
+    """탈퇴/차단(ban=Y) 멤버 닉네임 집합. 미매칭 해소 표의 '참고' 정보용
+    (자동 선택 X — 사용자가 직접 드롭다운으로 지정)."""
+    r = requests.post(BASE_URL + "/api/group",
+                      headers=HEADERS, json={"gid": GROUP_ID}, timeout=10)
+    r.raise_for_status()
+    return {m["mn"] for m in r.json().get("m", []) or []
+            if m.get("ban") == "Y" and m.get("mn")}
+
+
+def extract_raw_names(body: str, title: str) -> list[str]:
+    """후기 본문에서 이름 후보를 추출(마스터 필터 X, 블랙리스트만 제외).
+
+    `extract_attendees`와 달리 마스터 매칭 전 단계의 모든 토큰을 반환해
+    `resolve_names`가 다음 단계에서 마스터/해소맵/미해소로 분류한다.
+    """
+    if not body:
+        return []
+    cleaned = body.replace(title, " ") if title else body
+    out = [n for n in NAME_RX.findall(cleaned) if n not in NAME_BLACKLIST]
+    return list(dict.fromkeys(out))
+
+
+def resolve_names(
+    raw_names: list[str],
+    master: set[str],
+    resolution: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """추출된 이름을 마스터/해소맵으로 정규화.
+
+    Returns:
+        (confirmed, unresolved)
+            confirmed: 최종 참석자(마스터 닉네임으로 정규화, 순서 유지·중복 제거)
+            unresolved: 마스터에도, resolution에도 없는 미해소 이름
+    """
+    confirmed: list[str] = []
+    unresolved: list[str] = []
+    for name in raw_names:
+        if name in master:
+            confirmed.append(name)
+        elif name in resolution:
+            target = resolution[name]
+            if target in (LEFT_MEMBER, NOT_A_NAME):
+                continue
+            confirmed.append(target)
+        else:
+            unresolved.append(name)
+    return list(dict.fromkeys(confirmed)), list(dict.fromkeys(unresolved))
+
+
+def annotate_attendees(
+    posts: list[dict],
+    master: set[str],
+    resolution: Optional[dict[str, str]] = None,
+) -> list[dict]:
+    """cat=E 후기에 참석자 정보를 부착(in-place).
+
+    부착 키:
+      - attendees_raw:    extract_raw_names 결과(원본 토큰)
+      - attendees:        resolve_names의 confirmed(마스터 닉네임 정규화)
+      - unresolved_names: 마스터·resolution 어디에도 없는 미해소 이름
+      - review_outing_date: 후기 제목/본문에서 추정한 출사일(있을 때)
+      - matched_outing_id: None (match_outings_with_reviews에서 채움)
+    """
+    resolution = resolution or {}
+    for p in posts:
+        if p.get("cat") != "E":
+            continue
+        title = p.get("title", "")
+        body = p.get("body", "")
+        raw = extract_raw_names(body, title)
+        confirmed, unresolved = resolve_names(raw, master, resolution)
+        p["attendees_raw"] = raw
+        p["attendees"] = confirmed
+        p["unresolved_names"] = unresolved
+        d = parse_review_outing_date(title, body, p["posted_at"])
+        p["review_outing_date"] = d.isoformat() if d else None
+        p["matched_outing_id"] = None
+    return posts
+
+
+def collect_all_unresolved(posts: list[dict]) -> Counter:
+    """모든 후기의 unresolved_names 빈도 집계 (드롭다운 정렬용)."""
+    c: Counter = Counter()
+    for p in posts:
+        if p.get("cat") == "E":
+            for n in p.get("unresolved_names", []):
+                c[n] += 1
+    return c
 
 
 # ═══════════════════════════════════════════════════════════════
