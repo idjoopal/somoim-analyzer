@@ -649,7 +649,6 @@ def render_basis_box(posts: list[dict], photos: list[dict], period_label: str) -
 
 OPT_SKIP  = "(선택 안 함)"
 OPT_LEFT  = "🚪 탈퇴 멤버 (추적 안 함)"
-OPT_NOISE = "❌ 이름 아님 (노이즈)"
 
 
 def render_resolution(year: int, month: int | None, posts: list[dict],
@@ -718,8 +717,9 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
 
     st.info(
         "후기에 적혔지만 **활성 멤버 명단과 정확히 일치하지 않는** 이름입니다. "
-        "각 이름을 **① 마스터 닉네임으로 매핑**(닉네임 변형/오타), "
-        "**② 탈퇴 멤버**(추적 안 함), **③ 이름 아님**(노이즈) 중 하나로 지정하세요. "
+        "각 이름을 **① 마스터 닉네임으로 매핑**(닉네임 변형/오타) 또는 "
+        "**② 탈퇴 멤버**(추적 안 함)로 지정하세요. "
+        "이름이 아닌 단어(노이즈)는 **이름 ❌** 체크박스로 빠르게 제외할 수 있습니다. "
         "🪪 가입인사 본문에서 자동 추출된 매핑은 미리 채워져 있으니 그대로 두면 적용됩니다. "
         "한 번 지정한 매핑은 같은 엑셀을 올리거나 매핑 CSV로 재사용됩니다.",
         icon="🧭",
@@ -740,7 +740,7 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
         return
 
     master_sorted = sorted(master_names)
-    options = [OPT_SKIP, OPT_LEFT, OPT_NOISE] + master_sorted
+    options = [OPT_SKIP, OPT_LEFT] + master_sorted
 
     rows = []
     for name, cnt in unresolved_freq.most_common():
@@ -749,8 +749,6 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
         is_noise = current == NOT_A_NAME
         if current == LEFT_MEMBER:
             default = OPT_LEFT
-        elif current == NOT_A_NAME:
-            default = OPT_NOISE
         elif current in master_names:
             default = current
         elif auto in master_names:
@@ -768,7 +766,7 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
             "이름": name,
             "빈도": int(cnt),
             "참고": " · ".join(notes),
-            "❌": is_noise,
+            "이름 ❌": is_noise,
             "처리": default,
         })
 
@@ -778,16 +776,16 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
             "이름": st.column_config.TextColumn("이름", disabled=True),
             "빈도": st.column_config.NumberColumn("빈도", disabled=True, width="small"),
             "참고": st.column_config.TextColumn("참고", disabled=True, width="medium"),
-            "❌": st.column_config.CheckboxColumn(
-                "❌ 노이즈", width="small",
-                help="체크하면 '이름 아님(노이즈)'로 즉시 처리 — 드롭다운 선택보다 우선합니다.",
+            "이름 ❌": st.column_config.CheckboxColumn(
+                "이름 ❌", width="small",
+                help="체크하면 이름이 아닌 것(노이즈)으로 즉시 처리 — 드롭다운 선택보다 우선합니다.",
             ),
             "처리": st.column_config.SelectboxColumn(
                 "처리", options=options, required=True, width="medium",
                 help="마스터 닉네임으로 매핑하려면 위 옵션 뒤에서 선택. ⚠️ 표시는 동명이인.",
             ),
         },
-        column_order=["이름", "빈도", "참고", "❌", "처리"],
+        column_order=["이름", "빈도", "참고", "이름 ❌", "처리"],
         hide_index=True, width="stretch", num_rows="fixed",
         key=f"resolution_editor_{year}_{month}",
     )
@@ -797,7 +795,7 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
         for _, row in edited.iterrows():
             name = str(row.get("이름") or "")
             choice = str(row.get("처리") or OPT_SKIP)
-            noise_flag = bool(row.get("❌"))
+            noise_flag = bool(row.get("이름 ❌"))
             auto = join_aliases.get(name)
             # 체크박스가 켜져 있으면 드롭다운 선택보다 우선 → 노이즈로 확정
             if noise_flag:
@@ -806,8 +804,6 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
                 new_user_res.pop(name, None)
             elif choice == OPT_LEFT:
                 new_user_res[name] = LEFT_MEMBER
-            elif choice == OPT_NOISE:
-                new_user_res[name] = NOT_A_NAME
             elif choice == auto:
                 # 사용자가 자동 매핑 기본값을 그대로 유지 — user_res에 기록 불필요
                 new_user_res.pop(name, None)
