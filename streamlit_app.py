@@ -356,20 +356,28 @@ def member_first_seen(posts: list[dict]) -> tuple[dict[str, str], dict[str, str]
 
 
 def attendees_table(posts: list[dict]) -> list[dict]:
+    """출사별 참석자 표. 취소(펑) 출사는 제외하고, 매칭된 후기 제목과 함께 보여
+    매칭이 제대로 됐는지 사용자가 검증할 수 있게 한다. 후기가 없는 출사는 상태
+    컬럼으로 강조해 누락을 인지시킨다.
+    """
+    review_by_id = {p["id"]: p for p in posts if p.get("cat") == "E"}
     rows = []
     for p in sorted(
-        (p for p in posts if p.get("cat") == "A"),
+        (p for p in posts if p.get("cat") == "A" and not p.get("is_canceled")),
         key=lambda x: x.get("outing_date") or "0000", reverse=True,
     ):
         att = p.get("attendees", [])
+        matched_id = p.get("matched_review_id")
+        review = review_by_id.get(matched_id) if matched_id else None
         rows.append({
             "출사일": p.get("outing_date") or "-",
             "카테고리": p.get("category") or "-",
+            "상태": "✓ 매칭" if review else "⚠️ 후기 없음",
             "공지자": p["author"],
             "참석자수": len(att),
             "참석자": ", ".join(att) if att else "—",
-            "매칭": "✓" if p.get("matched_review_id") else "—",
-            "제목": p["title"],
+            "공지 제목": p["title"],
+            "후기 제목": review["title"] if review else "—",
         })
     return rows
 
@@ -1157,9 +1165,21 @@ def _tab_attendance(posts: list[dict], master: set[str]) -> None:
         st.caption("매칭된 출사가 아직 없어 매트릭스를 표시할 수 없습니다.")
 
     st.markdown("#### 출사별 참석자")
+    st.caption("취소(펑) 출사는 제외. 공지 제목과 매칭된 후기 제목을 함께 표시해 "
+                "매칭 정확도를 검증할 수 있습니다. **⚠️ 후기 없음** 행은 후기가 "
+                "작성되지 않은 출사입니다.")
     rows = attendees_table(posts)
     if rows:
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=400)
+        n_missing = sum(1 for r in rows if r["상태"].startswith("⚠️"))
+        if n_missing:
+            st.warning(f"후기가 작성되지 않은 출사 {n_missing}건 — 표에서 ⚠️로 표시됩니다.")
+        df = pd.DataFrame(rows)
+        styled = df.style.apply(
+            lambda row: ["background-color: #fff4e5" if row["상태"].startswith("⚠️") else ""
+                          for _ in row],
+            axis=1,
+        )
+        st.dataframe(styled, hide_index=True, width="stretch", height=400)
 
     orph = orphan_reviews(posts)
     if orph:
