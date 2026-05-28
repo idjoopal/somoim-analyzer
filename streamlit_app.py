@@ -746,6 +746,7 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
     for name, cnt in unresolved_freq.most_common():
         current = user_res.get(name)
         auto = join_aliases.get(name)
+        is_noise = current == NOT_A_NAME
         if current == LEFT_MEMBER:
             default = OPT_LEFT
         elif current == NOT_A_NAME:
@@ -767,6 +768,7 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
             "이름": name,
             "빈도": int(cnt),
             "참고": " · ".join(notes),
+            "❌": is_noise,
             "처리": default,
         })
 
@@ -776,11 +778,16 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
             "이름": st.column_config.TextColumn("이름", disabled=True),
             "빈도": st.column_config.NumberColumn("빈도", disabled=True, width="small"),
             "참고": st.column_config.TextColumn("참고", disabled=True, width="medium"),
+            "❌": st.column_config.CheckboxColumn(
+                "❌ 노이즈", width="small",
+                help="체크하면 '이름 아님(노이즈)'로 즉시 처리 — 드롭다운 선택보다 우선합니다.",
+            ),
             "처리": st.column_config.SelectboxColumn(
                 "처리", options=options, required=True, width="medium",
                 help="마스터 닉네임으로 매핑하려면 위 옵션 뒤에서 선택. ⚠️ 표시는 동명이인.",
             ),
         },
+        column_order=["이름", "빈도", "참고", "❌", "처리"],
         hide_index=True, width="stretch", num_rows="fixed",
         key=f"resolution_editor_{year}_{month}",
     )
@@ -790,8 +797,12 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
         for _, row in edited.iterrows():
             name = str(row.get("이름") or "")
             choice = str(row.get("처리") or OPT_SKIP)
+            noise_flag = bool(row.get("❌"))
             auto = join_aliases.get(name)
-            if choice == OPT_SKIP:
+            # 체크박스가 켜져 있으면 드롭다운 선택보다 우선 → 노이즈로 확정
+            if noise_flag:
+                new_user_res[name] = NOT_A_NAME
+            elif choice == OPT_SKIP:
                 new_user_res.pop(name, None)
             elif choice == OPT_LEFT:
                 new_user_res[name] = LEFT_MEMBER
