@@ -85,8 +85,14 @@ def monthly_table(posts: list[dict], photos: list[dict]) -> dict[str, list[int]]
 
 
 def top_posters(posts: list[dict], n: int = 10) -> list[dict]:
+    """작성자별 게시 활동 랭킹. 활성 멤버(is_active)만 집계.
+
+    탈퇴 멤버는 통계에서 제외 — 단, 매칭/참석 집계는 별도 함수에서 원본을 그대로 본다.
+    """
     agg: dict[str, dict] = {}
     for p in posts:
+        if not p.get("is_active", True):
+            continue
         s = agg.setdefault(p["author"], {
             "작성자": p["author"], "게시글": 0, "공지": 0, "취소": 0, "후기": 0, "좋아요": 0,
         })
@@ -115,9 +121,12 @@ def category_counts(posts: list[dict]) -> list[dict]:
 
 
 def outing_user_ranking(posts: list[dict]) -> list[dict]:
+    """공지(cat=A) 작성자 랭킹. 활성 멤버만 집계."""
     agg: dict[str, dict] = {}
     for p in posts:
         if p["cat"] != "A":
+            continue
+        if not p.get("is_active", True):
             continue
         s = agg.setdefault(p["author"], {"작성자": p["author"], "진행": 0, "취소": 0})
         s["취소" if p["is_canceled"] else "진행"] += 1
@@ -136,8 +145,11 @@ def cancel_ranking(posts: list[dict], min_notices: int = 3) -> list[dict]:
 
 
 def photo_user_ranking(photos: list[dict]) -> list[dict]:
+    """사진 업로더 랭킹. 활성 멤버만 집계."""
     agg: dict[str, dict] = {}
     for p in photos:
+        if not p.get("is_active", True):
+            continue
         s = agg.setdefault(p["author"], {
             "작성자": p["author"], "사진수": 0, "테마예상": 0, "좋아요": 0, "댓글": 0,
         })
@@ -155,9 +167,11 @@ def photo_user_ranking(photos: list[dict]) -> list[dict]:
 
 
 def theme_matrix(photos: list[dict]):
-    """테마사진(댓글>0) 작성자×월 매트릭스."""
+    """테마사진(댓글>0) 작성자×월 매트릭스. 활성 멤버만 집계."""
     user_month: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     for p in photos:
+        if not p.get("is_active", True):
+            continue
         if p["has_comment"]:
             user_month[p["author"]][p["posted_at"].month] += 1
     authors = sorted(
@@ -552,6 +566,20 @@ def collect_data(year: int, month: int | None, on_progress=None):
 # 데이터 세팅 (수집·엑셀 업로드 양쪽에서 호출)
 # ═══════════════════════════════════════════════════════════════
 
+def _mark_active(items: list[dict], active_mids: set[str] | None) -> None:
+    """각 item에 `is_active`를 in-place로 마킹 — 작성자(wid)가 활성 멤버(mid)인지.
+
+    active_mids가 비어 있으면 모두 True로 두어 멤버 정보 없는 환경(예: 멤버 없이
+    재로드한 엑셀)에서도 랭킹·집계가 빈 화면이 되지 않도록 한다(필터 무력화).
+    """
+    if not active_mids:
+        for it in items:
+            it["is_active"] = True
+        return
+    for it in items:
+        it["is_active"] = it.get("wid", "") in active_mids
+
+
 def _set_data(year: int, month: int | None, posts: list[dict], photos: list[dict],
               members: list[dict] | None = None,
               banned: set[str] | None = None,
@@ -561,6 +589,9 @@ def _set_data(year: int, month: int | None, posts: list[dict], photos: list[dict
 
     data 튜플: (year, month, posts, photos, members, banned, resolution, join_aliases)
     """
+    active_mids = {m["mid"] for m in (members or []) if m.get("mid")}
+    _mark_active(posts, active_mids)
+    _mark_active(photos, active_mids)
     st.session_state["data"] = (
         int(year), month, posts, photos,
         members or [], set(banned or set()), dict(resolution or {}),
