@@ -102,6 +102,9 @@ def build_excel(
     6. 🎨 월별 테마 매트릭스
     7. 👤 사진 통계
     8. 💡 인사이트
+    9. 🎯 출사별 참석자       — annotate_review_attendees + match_outings_with_reviews 거친 경우
+    10. 👥 멤버별 참석
+    11. 📅 월별 참석 매트릭스
     """
     period_label = f"{year}년" + (f" {month}월" if month else "")
 
@@ -130,6 +133,9 @@ def build_excel(
                           user_month, mon_user_count, sorted_authors,
                           photo_stats, sorted_photo_users,
                           period_label)
+    _build_sheet_outing_attendees(wb, posts_A)
+    _build_sheet_member_attendance(wb, posts_A)
+    _build_sheet_monthly_matrix(wb, posts_A)
 
     buf = BytesIO()
     wb.save(buf)
@@ -680,3 +686,190 @@ def _build_sheet_insights(wb, posts, posts_A, posts_E, posts_active, posts_cance
         pct = s["A_취소"]/n*100
         hl = "bad" if pct >= 50 else ("warn" if pct >= 25 else None)
         r = row(f"{author}", f"{pct:.1f}% ({s['A_취소']}/{n})", "", r, hl)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 후기 본문 기반 참석 시트 (PR3)
+# ═══════════════════════════════════════════════════════════════
+# 모든 헬퍼는 attendees/actually_held/matched_review_id 키가 없을 때도(KeyError 없이)
+# 빈 결과를 내야 한다 — save_excel을 annotate 없이 호출하는 코드경로 보존.
+
+def _build_sheet_outing_attendees(wb, posts_A):
+    ws = wb.create_sheet("🎯 출사별 참석자")
+    ws.sheet_view.showGridLines = False
+    _title_band(ws, "🎯 출사별 참석자 — 후기 본문 기반", 7, height=32, size=13)
+
+    hdrs = ["출사날짜", "카테고리", "공지자", "제목", "참석자수", "매칭", "참석자 명단"]
+    ws.append(hdrs)
+    _style_header_row(ws, 2, 1, len(hdrs), bg=C["HDR_MID"])
+    ws.row_dimensions[2].height = 22
+    ws.freeze_panes = "A3"
+
+    for p in sorted(posts_A, key=lambda x: x.get("outing_date") or "0000", reverse=True):
+        att = p.get("attendees", []) or []
+        matched = "✓" if p.get("matched_review_id") else "—"
+        r = ws.max_row + 1
+        ws.append([
+            p.get("outing_date") or "-",
+            p.get("category") or "-",
+            p.get("author", ""),
+            p.get("title", ""),
+            len(att),
+            matched,
+            ", ".join(att) if att else "—",
+        ])
+        if p.get("is_canceled"):
+            bg = C["CANCEL"]
+        elif p.get("actually_held"):
+            bg = C["OUTING"]
+        else:
+            bg = C["GRAY_LIGHT"]
+        for c in range(1, len(hdrs) + 1):
+            cell = ws.cell(r, c)
+            cell.font = _body_font()
+            cell.fill = _fill(bg)
+            cell.border = _thin_border()
+            cell.alignment = _left() if c in (4, 7) else _center()
+        ws.row_dimensions[r].height = 18
+
+    _set_col_widths(ws, {"A": 12, "B": 11, "C": 11, "D": 36, "E": 8, "F": 6, "G": 50})
+
+
+def _build_sheet_member_attendance(wb, posts_A):
+    ws = wb.create_sheet("👥 멤버별 참석")
+    ws.sheet_view.showGridLines = False
+    _title_band(ws, "👥 멤버별 참석 통계 (정규화 카테고리 동적 컬럼)", 11, height=32, size=13)
+
+    cats = list(OUTING_CATS) + list(NON_OUTING_CATS)
+    hdrs = ["순위", "멤버", "총 참석"] + cats + ["첫 등장", "최근 등장"]
+    ws.append(hdrs)
+    _style_header_row(ws, 2, 1, len(hdrs), bg=C["HDR_MID"])
+    ws.row_dimensions[2].height = 24
+    ws.freeze_panes = "C3"
+
+    from collections import Counter, defaultdict
+    attend: Counter = Counter()
+    cat_pref: dict = defaultdict(Counter)
+    first: dict = {}
+    last: dict = {}
+    held = sorted(
+        (p for p in posts_A if p.get("actually_held") and p.get("outing_date")),
+        key=lambda x: x["outing_date"],
+    )
+    for n in held:
+        cat = n.get("category")
+        for name in n.get("attendees", []):
+            attend[name] += 1
+            if cat:
+                cat_pref[name][cat] += 1
+            first.setdefault(name, n["outing_date"])
+            last[name] = n["outing_date"]
+
+    ranked = attend.most_common()
+    max_total = ranked[0][1] if ranked else 0
+    for rank, (name, total) in enumerate(ranked, 1):
+        r = ws.max_row + 1
+        cat_counts = [cat_pref[name].get(c, 0) for c in cats]
+        ws.append([rank, name, total] + cat_counts + [first.get(name, "-"), last.get(name, "-")])
+        bg = C["GRAY_LIGHT"] if rank % 2 == 0 else C["WHITE"]
+        for c in range(1, len(hdrs) + 1):
+            cell = ws.cell(r, c)
+            cell.font = _body_font(bold=(c == 2))
+            cell.alignment = _left() if c == 2 else _center()
+            cell.border = _thin_border()
+            cell.fill = _fill(bg)
+        ws.row_dimensions[r].height = 20
+
+    if ranked:
+        last_row = 2 + len(ranked)
+        ws.conditional_formatting.add(
+            f"C3:C{last_row}",
+            DataBarRule(start_type="min", end_type="max", color="2E75B6", showValue=True),
+        )
+
+    widths = {"A": 5, "B": 11, "C": 8}
+    for i, _c in enumerate(cats):
+        widths[get_column_letter(4 + i)] = 11
+    widths[get_column_letter(4 + len(cats))] = 12      # 첫 등장
+    widths[get_column_letter(5 + len(cats))] = 12      # 최근 등장
+    _set_col_widths(ws, widths)
+
+
+def _build_sheet_monthly_matrix(wb, posts_A):
+    ws = wb.create_sheet("📅 월별 참석 매트릭스")
+    ws.sheet_view.showGridLines = False
+    _title_band(ws, "📅 월별 참석 매트릭스 — 멤버 × 월", 15, height=32, size=13)
+
+    ws.merge_cells("A2:O2")
+    ws["A2"] = "▣ : 해당 월 출사 후기에서 참석자로 매칭됨"
+    ws["A2"].font = Font(name="Arial", size=10, italic=True, color="666666")
+    ws["A2"].alignment = _left()
+    ws.row_dimensions[2].height = 22
+
+    from collections import defaultdict
+    mm: dict = defaultdict(lambda: defaultdict(int))
+    total_per_month: dict = defaultdict(int)
+    for n in posts_A:
+        if not n.get("actually_held") or not n.get("outing_date"):
+            continue
+        m = date.fromisoformat(n["outing_date"]).month
+        for name in n.get("attendees", []):
+            mm[name][m] += 1
+            total_per_month[m] += 1
+
+    sorted_members = sorted(
+        mm.keys(),
+        key=lambda a: (-len([m for m in mm[a] if mm[a][m] > 0]),
+                       -sum(mm[a].values())),
+    )
+
+    header_row = 4
+    ws.cell(header_row, 1).value = "멤버"
+    ws.cell(header_row, 2).value = "참석월수"
+    for i, m in enumerate(range(1, 13)):
+        ws.cell(header_row, 3 + i).value = f"{m}월"
+    ws.cell(header_row, 15).value = "합계"
+    _style_header_row(ws, header_row, 1, 15)
+    ws.row_dimensions[header_row].height = 22
+    ws.freeze_panes = "C5"
+
+    for member in sorted_members:
+        r = ws.max_row + 1
+        months = mm[member]
+        pm = sum(1 for m in months if months[m] > 0)
+        total = sum(months.values())
+        ws.append([member, pm] + [months.get(m, 0) for m in range(1, 13)] + [total])
+        bg = C["GRAY_LIGHT"] if r % 2 == 0 else C["WHITE"]
+        for c in range(1, 16):
+            cell = ws.cell(r, c)
+            cell.font = _body_font(bold=(c == 1))
+            cell.alignment = _left() if c == 1 else _center()
+            cell.border = _thin_border()
+            cell.fill = _fill(bg)
+            if 3 <= c <= 14 and isinstance(cell.value, int) and cell.value > 0:
+                cell.fill = _fill(C["OUTING"])
+                cell.font = Font(name="Arial", size=10, bold=True, color=C["ACCENT_GRN"])
+                cell.value = f"▣ {cell.value}"
+        ws.row_dimensions[r].height = 20
+
+    # 월별 합계 행
+    if sorted_members:
+        r = ws.max_row + 1
+        ws.cell(r, 1).value = "월별 참석 연인원"
+        ws.cell(r, 2).value = "—"
+        for i, m in enumerate(range(1, 13)):
+            ws.cell(r, 3 + i).value = total_per_month.get(m, 0)
+        ws.cell(r, 15).value = sum(total_per_month.values())
+        for c in range(1, 16):
+            cell = ws.cell(r, c)
+            cell.font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+            cell.fill = _fill(C["ACCENT_GRN"])
+            cell.alignment = _center()
+            cell.border = _thin_border()
+        ws.row_dimensions[r].height = 22
+
+    widths = {"A": 12, "B": 9}
+    for i in range(12):
+        widths[get_column_letter(3 + i)] = 8
+    widths["O"] = 9
+    _set_col_widths(ws, widths)

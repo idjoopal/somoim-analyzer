@@ -12,7 +12,7 @@
   - 📷 **사진** — 업로드 순위, 월별 업로드, 인기 사진 갤러리
   - 🎨 **테마사진** — 월별 제출 인원 + 그 달 사진 미리보기, 매트릭스, 참여자 순위
   - 🏷️ 카테고리 · 👤 사용자 · 📋 데이터(원본 표 + CSV)
-- **엑셀 다운로드** — 원본 목록과 인사이트를 담은 8개 시트 통계 파일.
+- **엑셀 다운로드** — 원본 목록과 인사이트를 담은 11개 시트 통계 파일(출사·후기·사진 원본 + 통계·테마·인사이트 + 출사별/멤버별/월별 참석).
 
 ## 사용법
 
@@ -67,7 +67,7 @@ somoim-analyzer/
 ├── streamlit_app.py        # Streamlit 앱 (UI · 인사이트 · 분류 검토)
 ├── core/
 │   ├── collector.py        # 소모임 데이터 수집·분류
-│   └── excel_builder.py    # 8개 시트 엑셀 생성
+│   └── excel_builder.py    # 11개 시트 엑셀 생성
 ├── requirements.txt        # streamlit · pandas · altair · requests · openpyxl
 └── .streamlit/config.toml  # 테마
 ```
