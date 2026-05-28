@@ -366,3 +366,84 @@ def test_excel_round_trip_with_members_and_resolution():
     assert loaded["banned"] == banned
     assert loaded["resolution"]["음승구"] == "승구"
     assert loaded["resolution"]["민민기"] == LEFT_MEMBER
+
+
+# ── 9차: 가입인사 자동 매핑 + 동명이인 ─────────────────────────
+from core.collector import (
+    parse_join_name_aliases, find_duplicate_member_names,
+)
+
+
+def test_parse_join_name_aliases_basic():
+    posts = [{
+        "id": "j1", "author": "원석사진", "title": "가입인사",
+        "body": "안녕하세요\n이름 : 정원석\n잘부탁드립니다",
+        "posted_at": datetime(2025, 1, 1, 12, 0, 0),
+    }]
+    assert parse_join_name_aliases(posts) == {"정원석": "원석사진"}
+
+
+def test_parse_join_name_aliases_self_name_skipped():
+    # author == 본문 실명 → 매핑 의미 없음 → 제외
+    posts = [{
+        "id": "j1", "author": "정원석", "title": "",
+        "body": "이름 : 정원석",
+        "posted_at": datetime(2025, 1, 1),
+    }]
+    assert parse_join_name_aliases(posts) == {}
+
+
+def test_parse_join_name_aliases_multiple_patterns():
+    posts = [
+        {"id": "1", "author": "닉a", "body": "성함 - 김민수", "posted_at": datetime(2025, 1, 1)},
+        {"id": "2", "author": "닉b", "body": "본명 ：이하얀", "posted_at": datetime(2025, 1, 2)},
+        {"id": "3", "author": "닉c", "body": "이름:박철수\n잘 부탁", "posted_at": datetime(2025, 1, 3)},
+    ]
+    out = parse_join_name_aliases(posts)
+    assert out == {"김민수": "닉a", "이하얀": "닉b", "박철수": "닉c"}
+
+
+def test_parse_join_name_aliases_skips_when_glued_to_hangul():
+    # 정밀도 우선: '입니다'/'예요' 등 접미사가 공백 없이 붙으면 매칭 안 함 → 사용자가 보정
+    posts = [{"id": "1", "author": "닉c", "body": "이름:박철수입니다",
+              "posted_at": datetime(2025, 1, 1)}]
+    assert parse_join_name_aliases(posts) == {}
+
+
+def test_parse_join_name_aliases_latest_wins():
+    # 같은 실명이 둘 다 잡히면 더 최근 글의 author로 덮어씀
+    posts = [
+        {"id": "1", "author": "옛닉", "body": "이름 : 정원석", "posted_at": datetime(2024, 1, 1)},
+        {"id": "2", "author": "새닉", "body": "이름 : 정원석", "posted_at": datetime(2025, 6, 1)},
+    ]
+    assert parse_join_name_aliases(posts)["정원석"] == "새닉"
+
+
+def test_parse_join_name_aliases_active_only():
+    # active_mns로 필터 — 활성 멤버에 없는 닉네임의 글은 매핑 제외
+    posts = [
+        {"id": "1", "author": "탈퇴닉", "body": "이름 : 김민수", "posted_at": datetime(2024, 1, 1)},
+        {"id": "2", "author": "활성닉", "body": "이름 : 이하얀", "posted_at": datetime(2025, 1, 1)},
+    ]
+    out = parse_join_name_aliases(posts, active_mns={"활성닉"})
+    assert out == {"이하얀": "활성닉"}
+
+
+def test_find_duplicate_member_names():
+    members = [
+        {"mid": "m1", "mn": "정원석"},
+        {"mid": "m2", "mn": "정원석"},  # dup
+        {"mid": "m3", "mn": "이하얀"},
+        {"mid": "m4", "mn": "김민수"},
+        {"mid": "m5", "mn": "김민수"},  # dup
+        {"mid": "m6", "mn": ""},          # 빈 닉은 무시
+    ]
+    assert find_duplicate_member_names(members) == {"정원석", "김민수"}
+
+
+def test_excel_round_trip_with_join_aliases():
+    from core.excel_builder import build_excel, load_excel_bundle
+    aliases = {"정원석": "원석사진", "이하얀": "하얀필름"}
+    blob = build_excel([], [], 2026, None, join_aliases=aliases)
+    loaded = load_excel_bundle(blob)
+    assert loaded["join_aliases"] == aliases

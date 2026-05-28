@@ -762,6 +762,77 @@ def collect_banned_names() -> set[str]:
             if m.get("ban") == "Y" and m.get("mn")}
 
 
+def find_duplicate_member_names(members: list[dict]) -> set[str]:
+    """활성 멤버 중 동일 `mn`이 2명 이상인 닉네임 집합.
+
+    mid로는 구별 가능하지만 후기 본문에서 추출되는 이름은 닉네임 문자열뿐이라
+    이 집합에 든 닉네임은 보고서에서 둘 이상의 사람이 합쳐 표시됨 — UI에서 마킹.
+    """
+    c: Counter = Counter(m["mn"] for m in members if m.get("mn"))
+    return {mn for mn, cnt in c.items() if cnt >= 2}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 가입인사 자동 매핑 (실명 → 닉네임)
+# ═══════════════════════════════════════════════════════════════
+#
+# 가입인사 본문에 `이름 : XXX` 형식으로 실명이 적혀 있어 (닉네임=작성자명, 실명=본문)
+# 쌍을 자동 추출 → resolve_names 자동 기본값으로 사용.
+
+JOIN_NAME_RX = re.compile(r"(?:이름|성함|본명)\s*[:：\-]\s*([가-힣]{2,4})(?![가-힣])")
+
+
+def collect_join_greetings(progress: ProgressFn = None) -> list[dict]:
+    """그룹 시작부터 전체 cat=J(가입인사) 글 수집.
+
+    `_fetch_paginated`에 target_year=1을 넘기면 stop_year=0이 되어 200페이지 한도
+    혹은 eof까지 끝까지 긁는다. 결과에서 cat="J"만 골라 반환.
+    """
+    _emit(progress, "가입인사 수집 시작…", 0.0)
+    raw = _fetch_paginated("/api/articles", "cs", 1, progress, "가입인사")
+    out: list[dict] = []
+    for p in raw:
+        if p.get("cat") != "J":
+            continue
+        out.append({
+            "id":        p["id"],
+            "author":    p.get("wn", ""),
+            "title":     p.get("at", ""),
+            "body":      p.get("c", ""),
+            "posted_at": _post_dt(p),
+        })
+    _emit(progress, f"가입인사 {len(out)}개 추출", 1.0)
+    return out
+
+
+def parse_join_name_aliases(
+    join_posts: list[dict],
+    active_mns: Optional[set[str]] = None,
+) -> dict[str, str]:
+    """가입인사 본문에서 `이름 : XXX` 패턴으로 (실명 → 닉네임) 매핑 추출.
+
+    동일 실명이 여러 글에 등장하면 가장 최근 글의 작성자(닉네임)로 덮어쓴다.
+    실명==닉네임이면 의미 없으니 제외.
+
+    Args:
+        join_posts: collect_join_greetings 결과.
+        active_mns: 활성 멤버 닉네임 집합. 지정하면 닉네임이 이 집합에 있을 때만
+            매핑에 포함(닉네임 변경/탈퇴로 현재 멤버에 없는 author는 제외).
+    """
+    out: dict[str, str] = {}
+    for p in sorted(join_posts, key=lambda x: x.get("posted_at") or datetime.min):
+        body = p.get("body") or ""
+        author = p.get("author") or ""
+        if not author:
+            continue
+        if active_mns is not None and author not in active_mns:
+            continue
+        for real in JOIN_NAME_RX.findall(body):
+            if real and real != author:
+                out[real] = author
+    return out
+
+
 def extract_raw_names(body: str, title: str) -> list[str]:
     """후기 본문에서 이름 후보를 추출(마스터 필터 X, 블랙리스트만 제외).
 
