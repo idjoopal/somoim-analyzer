@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, datetime
 
 import altair as alt
@@ -18,8 +18,12 @@ from core.collector import (
     GROUP_NAME,
     NON_OUTING_CATS,
     OUTING_CATS,
+    annotate_review_attendees,
+    build_member_master,
     collect_photos,
     collect_posts,
+    match_outings_with_reviews,
+    parse_member_csv,
 )
 from core.excel_builder import build_excel
 
@@ -265,6 +269,94 @@ def period_coverage(posts: list[dict], photos: list[dict]):
     return (min(dts).date(), max(dts).date()) if dts else None
 
 
+# ── 후기 본문 기반 참석 (PR2: tab 데이터 헬퍼) ──────────────────
+
+def attendance_counts(posts: list[dict]) -> list[dict]:
+    """매칭된 출사(actually_held)의 참석자(실명) 합계."""
+    cnt: Counter = Counter()
+    for n in posts:
+        if n.get("cat") == "A" and n.get("actually_held"):
+            for name in n.get("attendees", []):
+                cnt[name] += 1
+    return [{"멤버": name, "참석횟수": c} for name, c in cnt.most_common()]
+
+
+def member_category_pref(posts: list[dict]) -> dict[str, Counter]:
+    pref: dict[str, Counter] = defaultdict(Counter)
+    for n in posts:
+        if n.get("cat") == "A" and n.get("actually_held"):
+            cat = n.get("category")
+            if cat:
+                for name in n.get("attendees", []):
+                    pref[name][cat] += 1
+    return pref
+
+
+def attendance_monthly_matrix(posts: list[dict]):
+    """(member_month dict[name->dict[month->count]], members_sorted_by_total)"""
+    mm: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for n in posts:
+        if n.get("cat") != "A" or not n.get("actually_held"):
+            continue
+        od = n.get("outing_date")
+        if not od:
+            continue
+        m = date.fromisoformat(od).month
+        for name in n.get("attendees", []):
+            mm[name][m] += 1
+    members = sorted(mm, key=lambda x: -sum(mm[x].values()))
+    return mm, members
+
+
+def real_attendance_rate(posts: list[dict]) -> dict:
+    notices = [p for p in posts if p.get("cat") == "A"]
+    held = [p for p in notices if p.get("actually_held")]
+    return {
+        "공지": len(notices),
+        "매칭": len(held),
+        "진행률": round(len(held) / len(notices) * 100, 1) if notices else 0.0,
+    }
+
+
+def member_first_seen(posts: list[dict]) -> tuple[dict[str, str], dict[str, str]]:
+    """(first_seen_iso, last_seen_iso) per 실명 — '신규 멤버 등장 시점' 산출용."""
+    held = sorted(
+        (p for p in posts
+         if p.get("cat") == "A" and p.get("actually_held") and p.get("outing_date")),
+        key=lambda x: x["outing_date"],
+    )
+    first: dict[str, str] = {}
+    last: dict[str, str] = {}
+    for n in held:
+        for name in n.get("attendees", []):
+            first.setdefault(name, n["outing_date"])
+            last[name] = n["outing_date"]
+    return first, last
+
+
+def attendees_table(posts: list[dict]) -> list[dict]:
+    rows = []
+    for p in sorted(
+        (p for p in posts if p.get("cat") == "A"),
+        key=lambda x: x.get("outing_date") or "0000", reverse=True,
+    ):
+        att = p.get("attendees", [])
+        rows.append({
+            "출사일": p.get("outing_date") or "-",
+            "카테고리": p.get("category") or "-",
+            "공지자": p["author"],
+            "참석자수": len(att),
+            "참석자": ", ".join(att) if att else "—",
+            "매칭": "✓" if p.get("matched_review_id") else "—",
+            "제목": p["title"],
+        })
+    return rows
+
+
+def orphan_reviews(posts: list[dict]) -> list[dict]:
+    return [p for p in posts if p.get("cat") == "E" and not p.get("matched_outing_id")]
+
+
 # ═══════════════════════════════════════════════════════════════
 # 분류 검토 (triage)
 # ═══════════════════════════════════════════════════════════════
@@ -311,6 +403,47 @@ def apply_triage(raw_posts: list[dict], cat_a_sorted: list[dict],
         final.append(p)
 
     return final
+
+
+def build_attendees_editor_df(reviews_sorted: list[dict]) -> pd.DataFrame:
+    """후기(cat=E) 자동 추출 참석자를 편집할 표. 참석자 컬럼만 편집 가능."""
+    rows = []
+    for p in reviews_sorted:
+        body = p.get("body", "") or ""
+        rows.append({
+            "검토": p.get("attendees_review_reason") or "",
+            "작성일": p["posted_at"].date(),
+            "작성자": p["author"],
+            "제목": p["title"],
+            "본문": (body[:140] + "…") if len(body) > 140 else body,
+            "참석자": ", ".join(p.get("attendees", [])),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["작성일"] = pd.to_datetime(df["작성일"], errors="coerce")
+    return df
+
+
+def apply_attendees_edits(
+    final_posts: list[dict], reviews_sorted: list[dict], edited_att: pd.DataFrame,
+) -> list[dict]:
+    """편집된 참석자(쉼표) 문자열을 final_posts에 id 기준으로 적용.
+    apply_triage의 dict(p) 얕은복사로 attendees 리스트가 raw와 alias이므로 항상 새 리스트를 할당한다.
+    """
+    if edited_att is None or edited_att.empty:
+        return final_posts
+    by_id = {p["id"]: p for p in final_posts if p.get("cat") == "E"}
+    for orig, (_, row) in zip(reviews_sorted, edited_att.iterrows()):
+        rid = orig["id"]
+        target = by_id.get(rid)
+        if target is None:
+            continue
+        raw = row.get("참석자")
+        text = str(raw) if pd.notna(raw) else ""
+        attendees = [n.strip() for n in text.split(",") if n.strip()]
+        target["attendees"] = attendees  # 새 리스트 (in-place mutate 금지)
+        target["attendees_needs_review"] = False
+    return final_posts
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -426,23 +559,33 @@ def render_basis_box(posts: list[dict], photos: list[dict], period_label: str) -
     )
 
 
-def render_triage(year: int, month: int | None, raw_posts: list[dict], photos: list[dict]) -> None:
+def render_triage(year: int, month: int | None, raw_posts: list[dict],
+                   photos: list[dict], master: set[str]) -> None:
     st.divider()
-    st.subheader("② 분류 검토 · 보정")
+    st.subheader("② 분류 · 참석자 검토")
     cat_a = [p for p in raw_posts if p["cat"] == "A"]
     cat_a_sorted = sorted(cat_a, key=lambda p: (not p["needs_review"], p["posted_at"]))
     n_review = sum(1 for p in cat_a if p["needs_review"])
 
-    c1, c2, c3 = st.columns(3)
+    reviews = [p for p in raw_posts if p["cat"] == "E"]
+    reviews_sorted = sorted(
+        reviews, key=lambda p: (not p["attendees_needs_review"], p["posted_at"]),
+    )
+    n_att_review = sum(1 for p in reviews if p["attendees_needs_review"])
+
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("출사 공지", len(cat_a))
-    c2.metric("⚠️ 검토 필요", n_review)
-    c3.metric("사진", len(photos))
+    c2.metric("⚠️ 분류 검토", n_review)
+    c3.metric("후기", len(reviews))
+    c4.metric("⚠️ 참석자 검토", n_att_review)
     st.caption(
-        "자동 분류가 애매한 공지(출사일 추론 실패·카테고리 미상)를 직접 보정하세요. "
-        "**카테고리·출사일·진행/취소**를 바꾼 뒤 아래 버튼을 누르면 그 분류로 인사이트·엑셀이 생성됩니다. "
-        "출사일을 비워두면 해당 공지는 분석에서 제외됩니다."
+        "**분류 검토**: 자동 분류가 애매한 공지(출사일 추론 실패·카테고리 미상)의 카테고리·출사일·진행/취소를 보정. 출사일을 비우면 분석 제외. "
+        "**참석자 검토**: 후기 본문에서 자동 추출한 참석자 명단을 확인·보정(쉼표 구분). "
+        "아래 버튼을 누르면 그 보정 분류로 인사이트·엑셀이 생성됩니다."
     )
 
+    # ── 분류 editor ────────────────────────────────────────────
+    st.markdown("##### 분류 보정 (출사 공지)")
     editor_df = build_editor_df(cat_a_sorted)
     col_config = {
         "검토": st.column_config.TextColumn("검토", disabled=True, width="small"),
@@ -465,10 +608,39 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict], photos: l
         with st.expander("분류 직접 보정 (선택) — 자동 분류 확인/수정", expanded=False):
             edited = st.data_editor(editor_df, **editor_kwargs)
 
-    if st.button("✅ 이 분류로 분석 진행", type="primary"):
+    # ── 참석자 editor ──────────────────────────────────────────
+    st.markdown("##### 참석자 보정 (후기 본문)")
+    att_df = build_attendees_editor_df(reviews_sorted)
+    att_config = {
+        "검토": st.column_config.TextColumn("검토", disabled=True, width="small"),
+        "작성일": st.column_config.DateColumn("작성일", disabled=True, format="YYYY-MM-DD"),
+        "작성자": st.column_config.TextColumn("작성자", disabled=True, width="small"),
+        "제목": st.column_config.TextColumn("제목", disabled=True, width="medium"),
+        "본문": st.column_config.TextColumn("본문(미리보기)", disabled=True, width="large"),
+        "참석자": st.column_config.TextColumn(
+            "참석자(쉼표 구분)", help="실명을 쉼표로 구분", width="large"),
+    }
+    att_kwargs = dict(
+        column_config=att_config, hide_index=True, width="stretch",
+        num_rows="fixed", key=f"att_editor_{year}_{month}",
+    )
+    if reviews:
+        if n_att_review > 0:
+            st.warning(f"참석자 검토 필요 {n_att_review}건이 표 위쪽에 있습니다. (본인이 명단에 없거나 본문에서 이름 못 찾음)")
+            edited_att = st.data_editor(att_df, **att_kwargs)
+        else:
+            with st.expander("참석자 직접 보정 (선택)", expanded=False):
+                edited_att = st.data_editor(att_df, **att_kwargs)
+    else:
+        edited_att = att_df
+        st.caption("후기글이 없어 참석자 보정 단계는 건너뜁니다.")
+
+    if st.button("✅ 이 분류·참석자로 분석 진행", type="primary"):
         final_posts = apply_triage(raw_posts, cat_a_sorted, edited, year, month)
+        apply_attendees_edits(final_posts, reviews_sorted, edited_att)
+        match_outings_with_reviews(final_posts)
         xlsx = build_excel(final_posts, photos, year, month)
-        st.session_state["result"] = (year, month, final_posts, photos, xlsx)
+        st.session_state["result"] = (year, month, final_posts, photos, xlsx, master)
 
 
 def _ranking_df(rows: list[dict], count_col: str) -> pd.DataFrame:
@@ -479,7 +651,7 @@ def _ranking_df(rows: list[dict], count_col: str) -> pd.DataFrame:
 
 
 def render_results(year: int, month: int | None, posts: list[dict],
-                   photos: list[dict], xlsx: bytes) -> None:
+                   photos: list[dict], xlsx: bytes, master: set[str]) -> None:
     period = f"{year}년" + (f" {month}월" if month else " 전체")
     st.divider()
     st.subheader(f"③ {period} 인사이트")
@@ -499,7 +671,7 @@ def render_results(year: int, month: int | None, posts: list[dict],
     )
 
     tabs = st.tabs(
-        ["📊 개요", "📌 출사", "📷 사진", "🎨 테마사진", "🏷️ 카테고리", "👤 사용자", "📋 데이터"]
+        ["📊 개요", "📌 출사", "👥 참석", "📷 사진", "🎨 테마사진", "🏷️ 카테고리", "👤 사용자", "📋 데이터"]
     )
 
     with tabs[0]:
@@ -507,14 +679,16 @@ def render_results(year: int, month: int | None, posts: list[dict],
     with tabs[1]:
         _tab_outings(posts)
     with tabs[2]:
-        _tab_photos(photos)
+        _tab_attendance(posts, master)
     with tabs[3]:
-        _tab_theme(photos)
+        _tab_photos(photos)
     with tabs[4]:
-        _tab_categories(posts)
+        _tab_theme(photos)
     with tabs[5]:
-        _tab_users(posts, photos)
+        _tab_categories(posts)
     with tabs[6]:
+        _tab_users(posts, photos)
+    with tabs[7]:
         _tab_data(posts, photos)
 
 
@@ -598,6 +772,71 @@ def _tab_outings(posts: list[dict]) -> None:
     rows = outings_table(posts)
     if rows:
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
+def _tab_attendance(posts: list[dict], master: set[str]) -> None:
+    st.info(
+        "📝 **후기 본문에 적힌 이름 명단으로 실제 참석자를 추적합니다.** "
+        "댓글이 막혀 있어도 후기는 공개이고, 본문의 실명을 멤버 마스터와 매칭합니다. "
+        "본인이 명단에 없거나 본문에서 이름을 찾지 못한 후기는 분류 검토 단계의 "
+        "**참석자 보정** 표에서 수정할 수 있습니다. (사이드바에 멤버 명단 CSV를 올리면 정확도↑)",
+        icon="👥",
+    )
+
+    rate = real_attendance_rate(posts)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("출사 공지", rate["공지"])
+    c2.metric("후기 매칭", rate["매칭"])
+    c3.metric("실제 진행률", f"{rate['진행률']}%")
+    c4.metric("멤버 마스터", f"{len(master)}명")
+
+    st.markdown("#### 멤버별 참석 횟수")
+    counts = attendance_counts(posts)
+    if counts:
+        pref = member_category_pref(posts)
+        first, last = member_first_seen(posts)
+        for r in counts:
+            top = pref[r["멤버"]].most_common(2)
+            r["선호 카테고리"] = ", ".join(f"{c}({n})" for c, n in top) or "—"
+            r["첫 등장"] = first.get(r["멤버"], "—")
+            r["최근"] = last.get(r["멤버"], "—")
+        st.dataframe(
+            _ranking_df(counts, "참석횟수"),
+            hide_index=True, width="stretch",
+            column_config={
+                "참석횟수": st.column_config.ProgressColumn(
+                    "참석횟수", min_value=0,
+                    max_value=max(r["참석횟수"] for r in counts) or 1, format="%d"),
+            },
+        )
+    else:
+        st.info("매칭된 출사가 없습니다.")
+
+    st.markdown("#### 월별 참석 매트릭스")
+    mm, members = attendance_monthly_matrix(posts)
+    if members:
+        rows = []
+        for name in members[:50]:
+            row = {"멤버": name, "합계": sum(mm[name].values())}
+            for m in range(1, 13):
+                row[f"{m}월"] = mm[name].get(m, 0)
+            rows.append(row)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    else:
+        st.caption("매칭된 출사가 아직 없어 매트릭스를 표시할 수 없습니다.")
+
+    st.markdown("#### 출사별 참석자")
+    rows = attendees_table(posts)
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=400)
+
+    orph = orphan_reviews(posts)
+    if orph:
+        with st.expander(f"⚠️ 공지와 매칭되지 않은 후기 {len(orph)}건"):
+            for r in orph[:30]:
+                d = r["posted_at"].strftime("%Y-%m-%d")
+                att = ", ".join(r.get("attendees", [])) or "—"
+                st.markdown(f"- **{d}** [{r['author']}] {r['title']} · 참석자: {att}")
 
 
 def _tab_photos(photos: list[dict]) -> None:
@@ -766,10 +1005,36 @@ def _tab_data(posts: list[dict], photos: list[dict]) -> None:
 # 메인 UI
 # ═══════════════════════════════════════════════════════════════
 
+def render_member_master_sidebar() -> tuple[set[str], dict[str, str], dict[str, str]]:
+    """사이드바: 멤버 명단 CSV 업로드 (실명, 닉네임[, 별칭;...]).
+
+    후기 본문은 실명, 게시글 작성자는 닉네임이라 두 컬럼을 함께 받는다.
+    파일이 없으면 빈 매핑을 반환(자동 마스터로 graceful degrade).
+    """
+    with st.sidebar:
+        st.subheader("👥 멤버 명단 (선택)")
+        st.caption(
+            "**실명,닉네임[,별칭;...]** 형식 CSV/TXT를 올리면 후기 참석자 추출 정확도가 올라갑니다. "
+            "후기 본문은 실명, 게시글 작성자는 닉네임이라 두 컬럼이 필요합니다. 없어도 자동 구축됩니다."
+        )
+        f = st.file_uploader("멤버 명단 (csv/txt)", type=["csv", "txt"], key="member_csv")
+        if f is None:
+            return set(), {}, {}
+        try:
+            text = f.getvalue().decode("utf-8")
+        except UnicodeDecodeError:
+            text = f.getvalue().decode("cp949", errors="ignore")
+        names, n2r, r2n = parse_member_csv(text)
+        st.success(f"멤버 {len(names)}개 토큰 로드 · 실명 {len(r2n)}명")
+        return names, n2r, r2n
+
+
 def main() -> None:
     st.set_page_config(page_title="다감노 분석", page_icon="📸", layout="wide")
     st.title("📸 다감노 분석")
     st.caption(f"{GROUP_NAME} 게시글·사진을 수집해 인사이트와 통계 엑셀을 생성합니다.")
+
+    csv_names, csv_n2r, _csv_r2n = render_member_master_sidebar()
 
     st.subheader("① 수집")
     current_year = datetime.now().year
@@ -799,7 +1064,9 @@ def main() -> None:
             progress_bar.progress(1.0, text="완료")
             status.update(label=f"수집 완료 · 게시글 {len(posts)} / 사진 {len(photos)}", state="complete")
 
-        st.session_state["raw"] = (int(year), month, posts, photos)
+        master = build_member_master(posts, photos, extra_names=csv_names)
+        annotate_review_attendees(posts, master, csv_n2r)
+        st.session_state["raw"] = (int(year), month, posts, photos, master)
         st.session_state.pop("result", None)
 
     if "raw" in st.session_state:
