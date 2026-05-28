@@ -127,9 +127,10 @@ def build_excel(
     """
     수집 데이터로부터 엑셀 파일(bytes) 생성.
 
-    가시 시트 11개 + 숨김 시트 3~4개(원본 + 마스터 임베드 — 재업로드 시 API 호출 없이 재분석).
+    가시 시트 12개(+ 멤버 정보 있으면 13개) + 숨김 시트(원본·매핑 임베드 —
+    재업로드 시 API 호출 없이 재분석).
 
-    시트 구성:
+    가시 시트 구성:
     1. 📊 대시보드
     2. 👤 게시글 통계
     3. 📌 출사 공지
@@ -137,11 +138,14 @@ def build_excel(
     5. 📷 사진
     6. 🎨 월별 테마 매트릭스
     7. 👤 사진 통계
-    8. 💡 인사이트
-    9. 🎯 출사별 참석자       — annotate_review_attendees + match_outings_with_reviews 거친 경우
-    10. 👥 멤버별 참석
-    11. 📅 월별 참석 매트릭스
-    (숨김) _메타, _원본_게시글, _원본_사진, _멤버마스터(master_records 있을 때만)
+    8. 🏷️ 카테고리
+    9. 💡 인사이트
+    10. 🎯 출사별 참석자 (+ 고아 후기 섹션)
+    11. 👥 멤버별 참석
+    12. 📅 월별 참석 매트릭스
+    13. 🧑‍🤝‍🧑 멤버 현황          — members 전달 시
+    (숨김) _메타, _원본_게시글, _원본_사진, _멤버마스터, _멤버, _탈퇴멤버,
+            _이름매핑, _가입인사매핑 — 각 인자 전달 시
     """
     period_label = f"{year}년" + (f" {month}월" if month else "")
 
@@ -164,13 +168,14 @@ def build_excel(
     _build_sheet_photos(wb, photos)
     user_month, mon_user_count, sorted_authors = _build_sheet_theme_matrix(wb, photos, photos_with_cmt)
     photo_stats, sorted_photo_users = _build_sheet_photo_stats(wb, photos)
+    _build_sheet_categories(wb, posts_A)
     _build_sheet_insights(wb, posts, posts_A, posts_E, posts_active,
                           posts_canceled, photos, photos_with_cmt,
                           user_stats, sorted_users,
                           user_month, mon_user_count, sorted_authors,
                           photo_stats, sorted_photo_users,
                           period_label)
-    _build_sheet_outing_attendees(wb, posts_A)
+    _build_sheet_outing_attendees(wb, posts_A, posts_E)
     _build_sheet_member_attendance(wb, posts_A)
     _build_sheet_monthly_matrix(wb, posts_A)
     if members:
@@ -1012,6 +1017,61 @@ def _build_sheet_photo_stats(wb, photos):
     return photo_stats, sorted_photo_users
 
 
+def _build_sheet_categories(wb, posts_A):
+    """🏷️ 카테고리 분포 — UI 🏷️ 카테고리 탭 미러. 출사 공지 제목 `[태그]` 기준."""
+    ws = wb.create_sheet("🏷️ 카테고리")
+    ws.sheet_view.showGridLines = False
+    _title_band(ws, "🏷️ 카테고리 분포 — 출사 공지 제목의 [태그] 기준", 5,
+                height=32, size=13)
+
+    all_cats = list(OUTING_CATS) + list(NON_OUTING_CATS)
+    rows: list[tuple] = []
+    for c in all_cats:
+        sub = [p for p in posts_A if p.get("category") == c]
+        if not sub:
+            continue
+        rows.append((
+            c,
+            "출사" if c in OUTING_CATS else "활동",
+            len(sub),
+            sum(1 for p in sub if not p["is_canceled"]),
+            sum(1 for p in sub if p["is_canceled"]),
+            sum(p["likes"] for p in sub),
+        ))
+    rows.sort(key=lambda x: -x[2])
+
+    hdrs = ["카테고리", "유형", "공지 수", "진행", "취소", "좋아요 합"]
+    ws.append(hdrs)
+    _style_header_row(ws, 2, 1, len(hdrs), bg=C["HDR_MID"])
+    ws.row_dimensions[2].height = 22
+    ws.freeze_panes = "A3"
+
+    for r_i, (cat, kind, cnt, ok, ng, likes) in enumerate(rows, 3):
+        ws.cell(r_i, 1).value = cat
+        ws.cell(r_i, 2).value = kind
+        ws.cell(r_i, 3).value = cnt
+        ws.cell(r_i, 4).value = ok
+        ws.cell(r_i, 5).value = ng
+        ws.cell(r_i, 6).value = likes
+        bg = C["OUTING"] if kind == "출사" else C["REVIEW"]
+        for c in range(1, len(hdrs) + 1):
+            cell = ws.cell(r_i, c)
+            cell.font = _body_font(bold=(c == 1))
+            cell.fill = _fill(bg)
+            cell.border = _thin_border()
+            cell.alignment = _left() if c == 1 else _center()
+        ws.row_dimensions[r_i].height = 20
+
+    if rows:
+        last = 2 + len(rows)
+        ws.conditional_formatting.add(
+            f"C3:C{last}",
+            DataBarRule(start_type="min", end_type="max", color="2E75B6", showValue=True),
+        )
+
+    _set_col_widths(ws, {"A": 14, "B": 7, "C": 9, "D": 8, "E": 8, "F": 12})
+
+
 def _build_sheet_insights(wb, posts, posts_A, posts_E, posts_active, posts_canceled,
                           photos, photos_with_cmt,
                           user_stats, sorted_users,
@@ -1133,45 +1193,99 @@ def _build_sheet_insights(wb, posts, posts_A, posts_E, posts_active, posts_cance
 # 모든 헬퍼는 attendees/actually_held/matched_review_id 키가 없을 때도(KeyError 없이)
 # 빈 결과를 내야 한다 — save_excel을 annotate 없이 호출하는 코드경로 보존.
 
-def _build_sheet_outing_attendees(wb, posts_A):
+def _build_sheet_outing_attendees(wb, posts_A, posts_E):
+    """🎯 출사별 참석자 — UI 👥 참석 탭의 출사별 표를 그대로 옮긴 시트.
+
+    취소 출사는 제외. 매칭된 후기의 제목을 옆에 두어 매칭 검증을 시각적으로 가능하게
+    하고, 후기가 작성되지 않은 출사는 ⚠️로 강조. 시트 하단에 '공지와 매칭되지 않은
+    후기(고아 후기)' 섹션을 별도로 둠.
+    """
     ws = wb.create_sheet("🎯 출사별 참석자")
     ws.sheet_view.showGridLines = False
-    _title_band(ws, "🎯 출사별 참석자 — 후기 본문 기반", 7, height=32, size=13)
+    _title_band(ws, "🎯 출사별 참석자 — 후기 본문 기반 (취소 출사 제외)", 8, height=32, size=13)
 
-    hdrs = ["출사날짜", "카테고리", "공지자", "제목", "참석자수", "매칭", "참석자 명단"]
+    hdrs = ["출사일", "카테고리", "상태", "공지자", "참석자수", "참석자 명단",
+            "공지 제목", "후기 제목"]
     ws.append(hdrs)
     _style_header_row(ws, 2, 1, len(hdrs), bg=C["HDR_MID"])
     ws.row_dimensions[2].height = 22
     ws.freeze_panes = "A3"
 
-    for p in sorted(posts_A, key=lambda x: x.get("outing_date") or "0000", reverse=True):
+    review_by_id = {r["id"]: r for r in posts_E}
+    visible_A = [p for p in posts_A if not p.get("is_canceled")]
+    for p in sorted(visible_A,
+                    key=lambda x: x.get("outing_date") or "0000", reverse=True):
         att = p.get("attendees", []) or []
-        matched = "✓" if p.get("matched_review_id") else "—"
+        matched_id = p.get("matched_review_id")
+        review = review_by_id.get(matched_id) if matched_id else None
+        status = "✓ 매칭" if review else "⚠️ 후기 없음"
         r = ws.max_row + 1
         ws.append([
             p.get("outing_date") or "-",
             p.get("category") or "-",
+            status,
             p.get("author", ""),
-            p.get("title", ""),
             len(att),
-            matched,
             ", ".join(att) if att else "—",
+            p.get("title", ""),
+            review["title"] if review else "—",
         ])
-        if p.get("is_canceled"):
-            bg = C["CANCEL"]
-        elif p.get("actually_held"):
-            bg = C["OUTING"]
-        else:
-            bg = C["GRAY_LIGHT"]
+        bg = C["OUTING"] if review else C["ACCENT_YLW"]
         for c in range(1, len(hdrs) + 1):
+            cell = ws.cell(r, c)
+            cell.font = _body_font(bold=(c == 3 and not review))
+            cell.fill = _fill(bg)
+            cell.border = _thin_border()
+            cell.alignment = _left() if c in (6, 7, 8) else _center()
+        ws.row_dimensions[r].height = 18
+
+    _set_col_widths(ws, {"A": 12, "B": 11, "C": 12, "D": 11, "E": 8, "F": 40,
+                          "G": 36, "H": 36})
+
+    # ── 고아 후기 섹션 ────────────────────────────────────────
+    orphans = [p for p in posts_E if not p.get("matched_outing_id")]
+    if not orphans:
+        return
+
+    gap = ws.max_row + 2
+    ws.merge_cells(start_row=gap, start_column=1, end_row=gap, end_column=len(hdrs))
+    ws.cell(gap, 1).value = (
+        f"⚠️ 공지와 매칭되지 않은 후기 {len(orphans)}건 — 출사일·카테고리 추론 실패 "
+        "또는 공지가 대상 기간 밖일 때 발생합니다."
+    )
+    ws.cell(gap, 1).font = _hdr_font(11, True)
+    ws.cell(gap, 1).fill = _fill(C["HDR_DARK"])
+    ws.cell(gap, 1).alignment = _left()
+    ws.row_dimensions[gap].height = 24
+
+    orphan_hdrs = ["작성일", "작성자", "카테고리", "추정 출사일", "참석자수",
+                    "참석자 명단", "후기 제목"]
+    hr = gap + 1
+    for i, h in enumerate(orphan_hdrs, 1):
+        ws.cell(hr, i).value = h
+    _style_header_row(ws, hr, 1, len(orphan_hdrs), bg=C["HDR_MID"])
+    ws.row_dimensions[hr].height = 22
+
+    for o in sorted(orphans, key=lambda x: x["posted_at"], reverse=True):
+        att = o.get("attendees", []) or []
+        r = ws.max_row + 1
+        ws.append([
+            o["posted_at"].strftime("%Y-%m-%d"),
+            o.get("author", ""),
+            o.get("category") or "-",
+            o.get("review_outing_date") or "—",
+            len(att),
+            ", ".join(att) if att else "—",
+            o.get("title", ""),
+        ])
+        bg = C["GRAY_LIGHT"] if r % 2 == 0 else C["WHITE"]
+        for c in range(1, len(orphan_hdrs) + 1):
             cell = ws.cell(r, c)
             cell.font = _body_font()
             cell.fill = _fill(bg)
             cell.border = _thin_border()
-            cell.alignment = _left() if c in (4, 7) else _center()
+            cell.alignment = _left() if c in (6, 7) else _center()
         ws.row_dimensions[r].height = 18
-
-    _set_col_widths(ws, {"A": 12, "B": 11, "C": 11, "D": 36, "E": 8, "F": 6, "G": 50})
 
 
 def _build_sheet_member_attendance(wb, posts_A):
