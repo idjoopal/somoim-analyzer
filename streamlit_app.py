@@ -663,7 +663,7 @@ def render_results(year: int, month: int | None, posts: list[dict],
 
     fname_period = f"{year}" + (f"_{month:02d}" if month else "")
     st.download_button(
-        "📥 엑셀 다운로드 (원본 + 인사이트 8개 시트)",
+        "📥 엑셀 다운로드 (원본 + 인사이트 11개 시트)",
         data=xlsx,
         file_name=f"다감노_{fname_period}_분석.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
