@@ -46,8 +46,13 @@ BASE_PHOTO_KEYS: list[str] = [
     "id", "author", "wid", "posted_at", "likes", "comments", "has_comment",
     "url_large", "url_medium", "url_small", "url_thumb",
 ]
+BASE_MEMBER_KEYS: list[str] = [
+    "mid", "mn", "is_admin", "joined_at", "last_visit", "os", "push",
+]
 _BOOL_POST_KEYS = {"is_outing", "is_canceled", "needs_review"}
 _BOOL_PHOTO_KEYS = {"has_comment"}
+_BOOL_MEMBER_KEYS = {"is_admin", "push"}
+_DT_MEMBER_KEYS = {"joined_at", "last_visit"}
 _CELL_MAX_LEN = 32000  # 엑셀 셀당 32,767자 한도 안전 여유
 
 
@@ -114,6 +119,9 @@ def build_excel(
     year: int,
     month: Optional[int] = None,
     master_records: Optional[list[dict]] = None,
+    members: Optional[list[dict]] = None,
+    banned: Optional[set[str]] = None,
+    resolution: Optional[dict[str, str]] = None,
 ) -> bytes:
     """
     수집 데이터로부터 엑셀 파일(bytes) 생성.
@@ -164,12 +172,20 @@ def build_excel(
     _build_sheet_outing_attendees(wb, posts_A)
     _build_sheet_member_attendance(wb, posts_A)
     _build_sheet_monthly_matrix(wb, posts_A)
+    if members:
+        _build_sheet_member_overview(wb, members, posts, photos, posts_A)
 
     _build_sheet_meta(wb, year, month)
     _build_sheet_raw_posts(wb, posts)
     _build_sheet_raw_photos(wb, photos)
     if master_records is not None:
         _build_sheet_master(wb, master_records)
+    if members is not None:
+        _build_sheet_members(wb, members)
+    if banned:
+        _build_sheet_banned(wb, banned)
+    if resolution is not None:
+        _build_sheet_resolution(wb, resolution)
 
     buf = BytesIO()
     wb.save(buf)
@@ -183,12 +199,17 @@ def save_excel(
     month: Optional[int] = None,
     path: Optional[str] = None,
     master_records: Optional[list[dict]] = None,
+    members: Optional[list[dict]] = None,
+    banned: Optional[set[str]] = None,
+    resolution: Optional[dict[str, str]] = None,
 ) -> str:
     """엑셀을 파일로 저장. 경로 미지정시 기본 이름 사용."""
     if path is None:
         period = f"{year}" + (f"_{month:02d}" if month else "")
         path = f"다감노_{period}_분석.xlsx"
-    data = build_excel(posts, photos, year, month, master_records=master_records)
+    data = build_excel(posts, photos, year, month,
+                       master_records=master_records,
+                       members=members, banned=banned, resolution=resolution)
     with open(path, "wb") as f:
         f.write(data)
     return path
@@ -262,16 +283,149 @@ def _build_sheet_master(wb: Workbook, master_records: list[dict]) -> None:
         ])
 
 
+def _build_sheet_members(wb: Workbook, members: list[dict]) -> None:
+    """활성 멤버 API 결과를 숨김 시트로 저장(엑셀 재업로드 시 복원용)."""
+    ws = wb.create_sheet("_멤버")
+    ws.sheet_state = "hidden"
+    ws.append(BASE_MEMBER_KEYS)
+    for m in members or []:
+        ws.append([_to_cell(m.get(k), k) for k in BASE_MEMBER_KEYS])
+
+
+def _build_sheet_banned(wb: Workbook, banned: set[str]) -> None:
+    """탈퇴 멤버 닉네임 1컬럼."""
+    ws = wb.create_sheet("_탈퇴멤버")
+    ws.sheet_state = "hidden"
+    ws.append(["닉네임"])
+    for nick in sorted(banned or set()):
+        ws.append([str(nick)])
+
+
+def _build_sheet_resolution(wb: Workbook, resolution: dict[str, str]) -> None:
+    """이름 해소 매핑(이름→처리) 저장."""
+    ws = wb.create_sheet("_이름매핑")
+    ws.sheet_state = "hidden"
+    ws.append(["이름", "처리"])
+    for name, target in (resolution or {}).items():
+        ws.append([str(name), str(target)])
+
+
+def _build_sheet_member_overview(
+    wb: Workbook, members: list[dict],
+    posts: list[dict], photos: list[dict], posts_A: list[dict],
+) -> None:
+    """🧑‍🤝‍🧑 멤버 현황 (가시 시트). 활동 집계 + 활동 상태 분류."""
+    from datetime import datetime as _dt
+    ws = wb.create_sheet("🧑‍🤝‍🧑 멤버 현황")
+    cols = 9
+    _title_band(ws, "🧑‍🤝‍🧑 멤버 현황 — 활성 멤버 활동 분포", cols)
+    headers = ["닉네임", "운영진", "가입일", "마지막 방문", "OS",
+               "게시글", "사진", "참석", "활동상태"]
+    ws.append(headers)
+    _style_header_row(ws, 2, 1, cols)
+
+    post_count: dict[str, int] = defaultdict(int)
+    for p in posts:
+        if p.get("author"):
+            post_count[p["author"]] += 1
+    photo_count: dict[str, int] = defaultdict(int)
+    for ph in photos:
+        if ph.get("author"):
+            photo_count[ph["author"]] += 1
+    attendance_count: dict[str, int] = defaultdict(int)
+    for a in posts_A:
+        for n in a.get("attendees", []) or []:
+            attendance_count[n] += 1
+
+    now = _dt.now()
+    rows: list[tuple] = []
+    for m in members:
+        mn = m.get("mn", "")
+        if not mn:
+            continue
+        last = m.get("last_visit")
+        days_idle = (now - last).days if last else 9999
+        pcnt = post_count.get(mn, 0)
+        phcnt = photo_count.get(mn, 0)
+        acnt = attendance_count.get(mn, 0)
+        if pcnt == 0 and phcnt == 0 and acnt == 0:
+            status = "유령"
+        elif days_idle >= 90:
+            status = "휴면"
+        else:
+            status = "활성"
+        rows.append((mn,
+                     "Y" if m.get("is_admin") else "",
+                     last.date() if m.get("joined_at") else None,
+                     last.date() if last else None,
+                     m.get("os") or "",
+                     pcnt, phcnt, acnt, status))
+        # NOTE: 가입일은 별도로 다시 계산해야 함 — 위 last를 잘못 썼음. 아래에서 정정.
+
+    # 가입일을 정확히 다시 계산 (위 임시 코드 정정용)
+    rows = []
+    for m in members:
+        mn = m.get("mn", "")
+        if not mn:
+            continue
+        joined = m.get("joined_at")
+        last = m.get("last_visit")
+        days_idle = (now - last).days if last else 9999
+        pcnt = post_count.get(mn, 0)
+        phcnt = photo_count.get(mn, 0)
+        acnt = attendance_count.get(mn, 0)
+        if pcnt == 0 and phcnt == 0 and acnt == 0:
+            status = "유령"
+        elif days_idle >= 90:
+            status = "휴면"
+        else:
+            status = "활성"
+        rows.append((mn,
+                     "Y" if m.get("is_admin") else "",
+                     joined.date() if joined else None,
+                     last.date() if last else None,
+                     m.get("os") or "",
+                     pcnt, phcnt, acnt, status))
+
+    # 활동상태(활성→휴면→유령) · 활동량 desc
+    status_order = {"활성": 0, "휴면": 1, "유령": 2}
+    rows.sort(key=lambda x: (status_order.get(x[8], 9),
+                              -(x[5] + x[6] + x[7])))
+
+    for r in rows:
+        ws.append(list(r))
+        last_row = ws.max_row
+        status = r[8]
+        bg = C["OUTING"] if status == "활성" else (C["GRAY_LIGHT"] if status == "휴면" else C["CANCEL"])
+        for c in range(1, cols + 1):
+            ws.cell(row=last_row, column=c).border = _thin_border()
+        ws.cell(row=last_row, column=cols).fill = _fill(bg)
+        for c in (3, 4):
+            cell = ws.cell(row=last_row, column=c)
+            if cell.value:
+                cell.number_format = "yyyy-mm-dd"
+
+    _set_col_widths(ws, {"A": 14, "B": 8, "C": 12, "D": 12, "E": 10,
+                          "F": 8, "G": 8, "H": 8, "I": 10})
+
+
 # ═══════════════════════════════════════════════════════════════
 # 엑셀 → 원본 데이터 복원 (재업로드)
 # ═══════════════════════════════════════════════════════════════
 
 def load_excel_bundle(data: bytes) -> dict:
-    """엑셀 bytes에서 숨김 시트의 원본 데이터·마스터를 복원.
+    """엑셀 bytes에서 숨김 시트의 원본 데이터를 복원.
 
     Returns:
-        {"year": int, "month": int|None, "posts": list[dict],
-         "photos": list[dict], "master": list[dict]}
+        {
+          "year": int, "month": int|None,
+          "posts":  list[dict],
+          "photos": list[dict],
+          "master": list[dict],     # legacy(_멤버마스터) — 비어있을 수 있음
+          "members": list[dict],    # _멤버 (활성 멤버 API 결과)
+          "banned": set[str],       # _탈퇴멤버
+          "resolution": dict[str,str],  # _이름매핑 (이름→처리)
+        }
     Raises:
         ValueError — 메타 시트 없음/버전 불일치/필수 시트 누락.
     """
@@ -295,9 +449,13 @@ def load_excel_bundle(data: bytes) -> dict:
     posts = _read_raw(wb["_원본_게시글"], BASE_POST_KEYS, _BOOL_POST_KEYS)
     photos = _read_raw(wb["_원본_사진"], BASE_PHOTO_KEYS, _BOOL_PHOTO_KEYS)
     master = _read_master(wb["_멤버마스터"]) if "_멤버마스터" in wb.sheetnames else []
+    members = _read_members(wb["_멤버"]) if "_멤버" in wb.sheetnames else []
+    banned = _read_banned(wb["_탈퇴멤버"]) if "_탈퇴멤버" in wb.sheetnames else set()
+    resolution = _read_resolution(wb["_이름매핑"]) if "_이름매핑" in wb.sheetnames else {}
 
-    return {"year": year, "month": month, "posts": posts,
-            "photos": photos, "master": master}
+    return {"year": year, "month": month, "posts": posts, "photos": photos,
+            "master": master, "members": members, "banned": banned,
+            "resolution": resolution}
 
 
 def _read_meta(ws) -> dict:
@@ -348,6 +506,58 @@ def _read_master(ws) -> list[dict]:
         alias_raw = str(row[2]) if len(row) > 2 and row[2] not in (None, "") else ""
         aliases = [a.strip() for a in alias_raw.split(";") if a.strip()]
         out.append({"실명": real, "닉네임": nick, "별칭": aliases})
+    return out
+
+
+def _read_members(ws) -> list[dict]:
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return []
+    header = [str(c) if c is not None else "" for c in rows[0]]
+    out: list[dict] = []
+    for row in rows[1:]:
+        if not row or all(c in (None, "") for c in row):
+            continue
+        rec: dict = {}
+        for i, k in enumerate(header):
+            v = row[i] if i < len(row) else None
+            if k in _BOOL_MEMBER_KEYS:
+                v = bool(v)
+            elif k in _DT_MEMBER_KEYS:
+                if v in (None, ""):
+                    v = None
+            elif v is None:
+                v = ""
+            rec[k] = v
+        for k in BASE_MEMBER_KEYS:
+            rec.setdefault(k, None)
+        out.append(rec)
+    return out
+
+
+def _read_banned(ws) -> set[str]:
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return set()
+    out: set[str] = set()
+    for row in rows[1:]:
+        if row and row[0] not in (None, ""):
+            out.add(str(row[0]))
+    return out
+
+
+def _read_resolution(ws) -> dict[str, str]:
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return {}
+    out: dict[str, str] = {}
+    for row in rows[1:]:
+        if not row or row[0] in (None, ""):
+            continue
+        name = str(row[0])
+        target = str(row[1]) if len(row) > 1 and row[1] not in (None, "") else ""
+        if target:
+            out[name] = target
     return out
 
 
