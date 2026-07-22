@@ -33,6 +33,17 @@ from core.collector import (
     parse_join_name_aliases,
 )
 from core.excel_builder import build_excel, load_excel_bundle
+from core.ledger import (
+    GithubLedgerStore,
+    LedgerError,
+    apply_attendee_overrides,
+    apply_post_overrides,
+    empty_ledger,
+    ledger_counts,
+    update_attendee_override,
+    update_name_resolutions,
+    update_post_override,
+)
 
 ALL_CATS = OUTING_CATS + NON_OUTING_CATS
 CAT_OPTIONS = ALL_CATS + ["(없음)"]
@@ -605,7 +616,7 @@ def _set_data(year: int, month: int | None, posts: list[dict], photos: list[dict
         members or [], set(banned or set()), dict(resolution or {}),
         dict(join_aliases or {}),
     )
-    for k in ("master", "result"):
+    for k in ("master", "result", "_ledger_applied"):
         st.session_state.pop(k, None)
 
 
@@ -637,6 +648,130 @@ def _resolution_to_csv(resolution: dict[str, str]) -> bytes:
 
 
 # ═══════════════════════════════════════════════════════════════
+# ☁️ 보정 원장 — GitHub 비공개 리포에 보정을 영구 저장/복원
+# ═══════════════════════════════════════════════════════════════
+#
+# secrets.toml에 아래를 넣으면 활성화된다 (없으면 기존과 동일하게 동작):
+#   [ledger]
+#   token = "github_pat_..."   # 비공개 리포 Contents read/write 권한
+#   repo  = "owner/repo"       # 실명이 저장되므로 반드시 private 리포
+#   # path = "corrections.json"
+#   # branch = "main"
+
+def _period_tag(year: int, month: int | None) -> str:
+    return f"{year}" + (f"-{month:02d}" if month else "")
+
+
+def _ledger_store() -> GithubLedgerStore | None:
+    """secrets의 [ledger] 섹션으로 저장소 구성. 미설정이면 None(기능 비활성)."""
+    try:
+        cfg = st.secrets["ledger"]
+        token, repo = cfg.get("token", ""), cfg.get("repo", "")
+        if not token or not repo:
+            return None
+        return GithubLedgerStore(
+            token=token, repo=repo,
+            path=cfg.get("path", "corrections.json"),
+            branch=cfg.get("branch", "main"),
+        )
+    except Exception:  # noqa: BLE001 — secrets 파일 자체가 없는 환경 포함
+        return None
+
+
+def _load_ledger_state(force: bool = False) -> dict:
+    """원장을 세션에 1회 로드. keys: enabled/ledger/sha/error/saved_at/repo."""
+    if not force and "_ledger" in st.session_state:
+        return st.session_state["_ledger"]
+    store = _ledger_store()
+    state = {"enabled": store is not None, "ledger": empty_ledger(),
+             "sha": None, "error": None, "saved_at": None,
+             "repo": store.repo if store else ""}
+    if store is not None:
+        try:
+            state["ledger"], state["sha"] = store.load()
+        except LedgerError as e:
+            state["error"] = str(e)
+    st.session_state["_ledger"] = state
+    return state
+
+
+def _save_ledger(message: str) -> None:
+    """세션 원장을 GitHub에 커밋. 실패해도 분석 흐름은 계속(사이드바에 오류 표시)."""
+    state = st.session_state.get("_ledger")
+    store = _ledger_store()
+    if not state or not state.get("enabled") or store is None:
+        return
+    try:
+        state["sha"] = store.save(state["ledger"], state["sha"], message)
+        state["error"] = None
+        state["saved_at"] = datetime.now().strftime("%H:%M")
+        st.toast("☁️ 보정이 저장소에 저장됐습니다.", icon="✅")
+    except LedgerError as e:
+        state["error"] = str(e)
+        st.warning(f"☁️ 보정 저장 실패 (분석은 계속됩니다): {e}")
+
+
+def _ledger_record_names(decisions: dict[str, str | None],
+                         year: int, month: int | None) -> None:
+    """① 단계 이름 해소 결정을 원장에 반영하고 변경이 있으면 커밋."""
+    state = st.session_state.get("_ledger")
+    if not state or not state.get("enabled") or not decisions:
+        return
+    if update_name_resolutions(state["ledger"], decisions):
+        _save_ledger(f"이름 매핑 보정 — {_period_tag(year, month)}")
+
+
+def _ledger_record_triage(cat_a_sorted: list[dict], edited: pd.DataFrame,
+                          reviews_sorted: list[dict], edited_att: pd.DataFrame,
+                          year: int, month: int | None) -> None:
+    """② 단계 확정 시 자동값과 달라진 행만 원장에 기록.
+
+    - 공지: 편집값이 현재값과 다르거나 검토 대상이었으면 기록(검토 확정 포함).
+      출사일을 비운 검토 공지는 excluded=True로 기록해 다음부터 묻지 않는다.
+    - 후기: 편집 참석자가 자동 추출값(_auto_attendees 기준)과 다르면 기록,
+      자동값으로 되돌아왔으면 기존 보정을 삭제(자동 추출로 복귀).
+    """
+    state = st.session_state.get("_ledger")
+    if not state or not state.get("enabled"):
+        return
+    led = state["ledger"]
+    changed = False
+
+    for orig, (_, row) in zip(cat_a_sorted, edited.iterrows()):
+        cat_val = row["카테고리"]
+        new_cat = None if cat_val == "(없음)" else cat_val
+        new_cancel = row["상태"] == "취소"
+        od = row["출사일"]
+        if pd.isna(od):
+            new_date = None
+        else:
+            new_date = (od.date() if hasattr(od, "date") else od).isoformat()
+        differs = (new_cat != orig.get("category")
+                   or new_cancel != bool(orig.get("is_canceled"))
+                   or new_date != orig.get("outing_date"))
+        if differs or orig.get("needs_review"):
+            changed |= update_post_override(led, orig["id"], {
+                "category": new_cat, "outing_date": new_date,
+                "is_canceled": new_cancel, "excluded": new_date is None,
+            })
+
+    if edited_att is not None and not edited_att.empty:
+        for orig, (_, row) in zip(reviews_sorted, edited_att.iterrows()):
+            raw = row.get("참석자")
+            text = str(raw) if pd.notna(raw) else ""
+            new_att = [n.strip() for n in text.split(",") if n.strip()]
+            auto = orig.get("_auto_attendees")
+            auto = list(auto) if auto is not None else list(orig.get("attendees", []))
+            if new_att == auto:
+                changed |= update_attendee_override(led, orig["id"], None)
+            else:
+                changed |= update_attendee_override(led, orig["id"], new_att)
+
+    if changed:
+        _save_ledger(f"분류·참석자 보정 — {_period_tag(year, month)}")
+
+
+# ═══════════════════════════════════════════════════════════════
 # 렌더링
 # ═══════════════════════════════════════════════════════════════
 
@@ -657,6 +792,41 @@ def render_basis_box(posts: list[dict], photos: list[dict], period_label: str) -
 
 OPT_SKIP  = "(선택 안 함)"
 OPT_LEFT  = "🚪 탈퇴 멤버 (추적 안 함)"
+
+
+def _apply_resolution_rows(edited_df: pd.DataFrame | None,
+                           join_aliases: dict[str, str],
+                           new_user_res: dict[str, str],
+                           decisions: dict[str, str | None]) -> None:
+    """이름 해소 editor 행들을 세션 매핑(new_user_res)과 원장 결정(decisions)에 반영.
+
+    decisions 값이 None이면 '매핑 없음'(원장에서 삭제) — (선택 안 함)이거나
+    가입인사 자동 매핑과 동일해 따로 기록할 필요가 없는 경우.
+    """
+    if edited_df is None:
+        return
+    for _, row in edited_df.iterrows():
+        name = str(row.get("이름") or "")
+        if not name:
+            continue
+        choice = str(row.get("처리") or OPT_SKIP)
+        auto = join_aliases.get(name)
+        if bool(row.get("이름 ❌")):
+            new_user_res[name] = NOT_A_NAME
+            decisions[name] = NOT_A_NAME
+        elif choice == OPT_SKIP:
+            new_user_res.pop(name, None)
+            decisions[name] = None
+        elif choice == OPT_LEFT:
+            new_user_res[name] = LEFT_MEMBER
+            decisions[name] = LEFT_MEMBER
+        elif choice == auto:
+            # 자동 매핑 기본값 그대로 유지 — 세션/원장에 기록 불필요
+            new_user_res.pop(name, None)
+            decisions[name] = None
+        else:
+            new_user_res[name] = choice
+            decisions[name] = choice
 
 
 def render_resolution(year: int, month: int | None, posts: list[dict],
@@ -733,22 +903,62 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
         icon="🧭",
     )
 
+    master_sorted = sorted(master_names)
+    options = [OPT_SKIP, OPT_LEFT] + master_sorted
+
+    # ── 기존 매핑 재보정 (원할 때 언제든 수정/삭제) ──
+    existing_edited: pd.DataFrame | None = None
+    if user_res:
+        with st.expander(f"🔁 기존 매핑 재보정 ({len(user_res)}건)"):
+            st.caption(
+                "이미 확정된 매핑입니다. 처리를 바꾸거나 **(선택 안 함)**으로 되돌리면 "
+                "매핑이 삭제되어 그 이름이 다시 미해소 목록에 나타납니다. "
+                "변경은 아래 확정 버튼을 눌러야 반영됩니다."
+            )
+            ex_rows = []
+            for name in sorted(user_res):
+                cur = user_res[name]
+                if cur == LEFT_MEMBER:
+                    default, noise = OPT_LEFT, False
+                elif cur == NOT_A_NAME:
+                    default, noise = OPT_SKIP, True
+                elif cur in master_names:
+                    default, noise = cur, False
+                else:  # 마스터에 더 이상 없는 낡은 매핑 — 확정 시 삭제됨
+                    default, noise = OPT_SKIP, False
+                ex_rows.append({"이름": name, "이름 ❌": noise, "처리": default})
+            existing_edited = st.data_editor(
+                pd.DataFrame(ex_rows),
+                column_config={
+                    "이름": st.column_config.TextColumn("이름", disabled=True),
+                    "이름 ❌": st.column_config.CheckboxColumn(
+                        "이름 ❌", width="small",
+                        help="체크하면 노이즈로 처리 — 드롭다운 선택보다 우선합니다."),
+                    "처리": st.column_config.SelectboxColumn(
+                        "처리", options=options, required=True, width="medium"),
+                },
+                hide_index=True, width="stretch", num_rows="fixed",
+                key=f"resolution_existing_{year}_{month}",
+            )
+
     if not unresolved_freq:
         st.success("모든 이름이 마스터와 매칭됐어요. 다음 단계로 진행하세요.")
         if st.button("✅ 다음 단계로", type="primary"):
+            new_user_res = dict(user_res)
+            decisions: dict[str, str | None] = {}
+            _apply_resolution_rows(existing_edited, join_aliases, new_user_res, decisions)
+            _ledger_record_names(decisions, year, month)
+            annotate_attendees(posts, master_names, {**join_aliases, **new_user_res})
             st.session_state["master"] = {
                 "names": master_names,
                 "members": members,
                 "banned": banned,
-                "resolution": user_res,
+                "resolution": new_user_res,
                 "join_aliases": join_aliases,
                 "duplicates": duplicates,
             }
             st.rerun()
         return
-
-    master_sorted = sorted(master_names)
-    options = [OPT_SKIP, OPT_LEFT] + master_sorted
 
     rows = []
     for name, cnt in unresolved_freq.most_common():
@@ -800,23 +1010,10 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
 
     if st.button("✅ 이 매핑으로 분석 진행", type="primary"):
         new_user_res = dict(user_res)
-        for _, row in edited.iterrows():
-            name = str(row.get("이름") or "")
-            choice = str(row.get("처리") or OPT_SKIP)
-            noise_flag = bool(row.get("이름 ❌"))
-            auto = join_aliases.get(name)
-            # 체크박스가 켜져 있으면 드롭다운 선택보다 우선 → 노이즈로 확정
-            if noise_flag:
-                new_user_res[name] = NOT_A_NAME
-            elif choice == OPT_SKIP:
-                new_user_res.pop(name, None)
-            elif choice == OPT_LEFT:
-                new_user_res[name] = LEFT_MEMBER
-            elif choice == auto:
-                # 사용자가 자동 매핑 기본값을 그대로 유지 — user_res에 기록 불필요
-                new_user_res.pop(name, None)
-            else:
-                new_user_res[name] = choice
+        decisions: dict[str, str | None] = {}
+        _apply_resolution_rows(existing_edited, join_aliases, new_user_res, decisions)
+        _apply_resolution_rows(edited, join_aliases, new_user_res, decisions)
+        _ledger_record_names(decisions, year, month)
         final_effective = {**join_aliases, **new_user_res}
         annotate_attendees(posts, master_names, final_effective)
         st.session_state["master"] = {
@@ -834,6 +1031,9 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict],
                    photos: list[dict], master: dict) -> None:
     st.divider()
     st.subheader("② 분류 · 참석자 검토")
+    ledger_state = st.session_state.get("_ledger") or {}
+    if ledger_state.get("enabled"):
+        apply_attendee_overrides(raw_posts, ledger_state["ledger"])
     cat_a = [p for p in raw_posts if p["cat"] == "A"]
     cat_a_sorted = sorted(cat_a, key=lambda p: (not p["needs_review"], p["posted_at"]))
     n_review = sum(1 for p in cat_a if p["needs_review"])
@@ -854,6 +1054,17 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict],
         "**참석자 보정**: ①에서 미해소한 이름이 있거나 자동 추출이 부족한 후기를 직접 수정(쉼표 구분). "
         "아래 버튼을 누르면 그 보정 분류로 인사이트·엑셀이 생성됩니다."
     )
+
+    if ledger_state.get("enabled"):
+        n_po = sum(1 for p in cat_a if p.get("ledger_applied"))
+        n_ao = sum(1 for p in reviews
+                   if str(p.get("id")) in ledger_state["ledger"].get("attendee_overrides", {}))
+        if n_po or n_ao:
+            st.info(
+                f"저장된 보정 자동 적용 — 공지 {n_po}건 · 참석자 {n_ao}건. "
+                "아래 표에서 언제든 다시 수정하면 저장소에도 반영됩니다.",
+                icon="☁️",
+            )
 
     # ── 분류 editor ────────────────────────────────────────────
     st.markdown("##### 분류 보정 (출사 공지)")
@@ -910,6 +1121,8 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict],
         st.caption("후기글이 없어 참석자 보정 단계는 건너뜁니다.")
 
     if st.button("✅ 이 분류·참석자로 분석 진행", type="primary"):
+        _ledger_record_triage(cat_a_sorted, edited, reviews_sorted, edited_att,
+                              year, month)
         final_posts = apply_triage(raw_posts, cat_a_sorted, edited, year, month)
         apply_attendees_edits(final_posts, reviews_sorted, edited_att)
         match_outings_with_reviews(final_posts)
@@ -1563,10 +1776,38 @@ def render_sidebar() -> None:
             )
             st.caption("이 엑셀을 다음에 그대로 업로드하면 API 호출 없이 같은 분석을 다시 볼 수 있어요.")
 
+        # ── ☁️ 보정 저장소 상태 ──
+        st.divider()
+        st.subheader("☁️ 보정 저장소")
+        lstate = _load_ledger_state()
+        if not lstate["enabled"]:
+            st.caption(
+                "미설정 — secrets에 `[ledger]`(token·repo)를 넣으면 이름·분류·참석자 "
+                "보정이 GitHub **비공개** 리포에 자동 저장되고, 다음 분석부터 자동 "
+                "적용됩니다. 설정법은 README 참고."
+            )
+        elif lstate["error"]:
+            st.error(f"저장소 오류: {lstate['error']}")
+            if st.button("🔌 다시 연결", width="stretch"):
+                _load_ledger_state(force=True)
+                st.rerun()
+        else:
+            cnt = ledger_counts(lstate["ledger"])
+            saved = f" · 이번 세션 저장 {lstate['saved_at']}" if lstate.get("saved_at") else ""
+            st.caption(
+                f"연결됨 (`{lstate['repo']}`) — 이름 {cnt['이름']} · "
+                f"공지 {cnt['공지']} · 참석 {cnt['참석']}{saved}"
+            )
+            if st.button("🔄 원장 다시 불러오기", width="stretch"):
+                _load_ledger_state(force=True)
+                st.session_state.pop("_ledger_applied", None)
+                st.rerun()
+
         if "data" in st.session_state:
             st.divider()
             if st.button("🔄 처음으로", width="stretch"):
                 for k in ("data", "master", "result", "_collect_cache",
+                          "_ledger_applied",
                           "api_year", "api_month", "api_month_on", "excel_upload",
                           "resolution_csv_upload"):
                     st.session_state.pop(k, None)
@@ -1589,6 +1830,16 @@ def main() -> None:
 
     year, month, posts, photos, members, banned, resolution_uploaded, join_aliases = \
         st.session_state["data"]
+
+    # ☁️ 보정 원장: 공지 보정을 1회 적용하고, 저장된 이름 매핑을 기본값으로 사용
+    # (세션에서 명시적으로 올린 엑셀/CSV 매핑이 있으면 그것이 우선)
+    ledger_state = _load_ledger_state()
+    if ledger_state["enabled"]:
+        if not st.session_state.get("_ledger_applied"):
+            apply_post_overrides(posts, ledger_state["ledger"], OUTING_CATS)
+            st.session_state["_ledger_applied"] = True
+        resolution_uploaded = {**ledger_state["ledger"]["name_resolution"],
+                               **resolution_uploaded}
 
     if "result" in st.session_state:
         render_results(*st.session_state["result"])

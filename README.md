@@ -17,6 +17,7 @@ somoim API
   ③ 10개 탭 인사이트 (Stage 3) + 한 파일짜리 엑셀
 ```
 
+- **☁️ 보정 원장(선택)** — secrets에 GitHub 비공개 리포를 지정하면 ①·②의 모든 보정이 자동 저장되고, 다음 분석부터 자동 적용됩니다(아래 [보정 영구 저장](#️-보정-영구-저장-github-원장--선택) 참고).
 - **가입인사 수집은 cat=J 서버 필터** + 활성 멤버 mid 기반 조기 종료로 그룹 시작까지 거슬러 가도 빠릅니다.
 - **활성/탈퇴 구분은 user id(`wid`↔`mid`) 기준** — 닉네임 일치가 아니라 user id로 매칭해 동명이인·닉네임 변경에도 흔들리지 않습니다.
 - **작성자 랭킹은 활성 멤버만** 집계하지만, **탈퇴 멤버가 연 출사 후기의 참석자 추적은 그대로 유지** — 활성 멤버의 참석 이력은 어디서도 잃지 않습니다.
@@ -81,7 +82,33 @@ python -m pytest tests/ -q
 **숨김 시트** — 재업로드 시 API 호출 0회로 동일 분석을 재현하기 위한 원본 데이터:
 `_메타` · `_원본_게시글` · `_원본_사진` · `_멤버마스터` · `_멤버` · `_탈퇴멤버` · `_이름매핑` · `_가입인사매핑`
 
-> 분석이 끝나면 엑셀 한 파일만 받으면 됩니다. 다음에 그 엑셀을 다시 올리면 API 호출 없이 같은 분석이 열려요. 다른 달/년 분석에는 **이름 매핑 CSV**만 들고 가면 사용자 매핑을 재사용할 수 있습니다.
+> 분석이 끝나면 엑셀 한 파일만 받으면 됩니다. 다음에 그 엑셀을 다시 올리면 API 호출 없이 같은 분석이 열려요. 다른 달/년 분석에는 **이름 매핑 CSV**만 들고 가면 사용자 매핑을 재사용할 수 있습니다. **☁️ 보정 원장을 설정했다면 이 과정조차 필요 없습니다** — 보정이 자동 저장·자동 적용됩니다.
+
+## ☁️ 보정 영구 저장 (GitHub 원장 · 선택)
+
+Streamlit Community Cloud는 서버 저장 공간이 없어, 기본적으로는 보정 결과를 엑셀/CSV로 내려받아 직접 보관해야 합니다. **보정 원장**을 설정하면 이 부담이 사라집니다:
+
+- ① 이름 해소, ② 공지 분류·참석자 편집이 **확정 버튼을 누를 때마다 GitHub 비공개 리포의 `corrections.json`에 자동 커밋**됩니다.
+- 다음 분석(같은 기간이든 새 기간이든)에서 **저장된 보정이 자동 적용** — 이미 보정한 항목은 검토 대상에 다시 나타나지 않습니다.
+- 재보정도 앱 안에서: ①의 **🔁 기존 매핑 재보정** expander, ②의 보정 표에서 언제든 수정하면 원장에 반영됩니다. 자동 추출값으로 되돌리면 해당 보정은 원장에서 삭제됩니다.
+- 커밋 이력이 곧 보정 이력이라 잘못 저장해도 리포에서 되돌릴 수 있습니다.
+- **앱 사용자는 GitHub을 볼 일이 전혀 없습니다** — 설정은 배포자가 1번만 하면 됩니다.
+
+### 설정 (배포자 1회)
+
+1. GitHub에서 **비공개(private) 리포**를 하나 만듭니다(예: `somoim-corrections`). 보정에 **실명**이 들어가므로 반드시 private이어야 합니다.
+2. [Fine-grained personal access token](https://github.com/settings/personal-access-tokens) 발급 — 대상: 그 리포 하나, 권한: **Contents Read and write**만.
+3. Streamlit Cloud → 앱 **Settings → Secrets** (로컬은 `.streamlit/secrets.toml`)에 추가:
+
+```toml
+[ledger]
+token = "github_pat_..."
+repo  = "idjoopal/somoim-corrections"
+# path = "corrections.json"   # 기본값
+# branch = "main"             # 기본값
+```
+
+설정하지 않으면 앱은 기존과 완전히 동일하게(엑셀/CSV 수동 보관 방식으로) 동작합니다. 연결 상태는 사이드바 **☁️ 보정 저장소**에서 확인할 수 있습니다.
 
 ### 코드로 직접 (선택)
 
@@ -149,9 +176,11 @@ somoim-analyzer/
 ├── core/
 │   ├── __init__.py         # 공개 API 재노출
 │   ├── collector.py        # 소모임 수집·이름 해소·참석자 매칭
-│   └── excel_builder.py    # 12~13개 가시 + 숨김 시트 엑셀 생성/복원
+│   ├── excel_builder.py    # 12~13개 가시 + 숨김 시트 엑셀 생성/복원
+│   └── ledger.py           # ☁️ 보정 원장 (GitHub 비공개 리포 영구 저장)
 ├── tests/
-│   └── test_attendees.py   # pytest 단위 테스트 (네트워크 무관)
+│   ├── test_attendees.py   # pytest 단위 테스트 (네트워크 무관)
+│   └── test_ledger.py      # 보정 원장 테스트 (GitHub API 모킹)
 ├── requirements.txt        # streamlit · pandas · altair · requests · openpyxl
 └── .streamlit/config.toml  # 테마
 ```

@@ -13,6 +13,12 @@ from .collector import (
     parse_review_outing_date, annotate_review_attendees, match_outings_with_reviews,
 )
 from .excel_builder import build_excel, save_excel, load_excel_bundle
+from .ledger import (
+    GithubLedgerStore, LedgerError,
+    empty_ledger, normalize_ledger, merge_ledgers, ledger_counts,
+    apply_post_overrides, apply_attendee_overrides,
+    update_name_resolutions, update_post_override, update_attendee_override,
+)
 
 __all__ = [
     "GROUP_ID", "GROUP_NAME",
@@ -26,4 +32,8 @@ __all__ = [
     "extract_raw_names", "resolve_names", "annotate_attendees", "collect_all_unresolved",
     "parse_review_outing_date", "annotate_review_attendees", "match_outings_with_reviews",
     "build_excel", "save_excel", "load_excel_bundle",
+    "GithubLedgerStore", "LedgerError",
+    "empty_ledger", "normalize_ledger", "merge_ledgers", "ledger_counts",
+    "apply_post_overrides", "apply_attendee_overrides",
+    "update_name_resolutions", "update_post_override", "update_attendee_override",
 ]
