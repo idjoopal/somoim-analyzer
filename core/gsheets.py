@@ -44,6 +44,10 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 # 한 번의 values 쓰기 요청에 담을 최대 바이트(구글 요청 한도보다 넉넉히 아래).
 MAX_WRITE_BYTES = 5 * 1024 * 1024
 
+# 드롭다운을 걸 행 상한. 보정 시트가 이만큼 커질 일은 없고, 범위를 명시하지 않으면
+# 나중에 붙는 행이 빠진다.
+VALIDATION_MAX_ROWS = 50_000
+
 # /spreadsheets/d/<id>/edit, /file/d/<id>/view, ?id=<id> 등 흔한 형태를 모두 받는다.
 _ID_IN_PATH = re.compile(r"/d/([A-Za-z0-9_-]{15,})")
 _ID_IN_QUERY = re.compile(r"[?&]id=([A-Za-z0-9_-]{15,})")
@@ -377,7 +381,11 @@ class SheetsClient:
             return
         self._batch(file_id, [{
             "setDataValidation": {
+                # `endRowIndex`를 비워 무한 범위에 기대면 일부 행에만 걸린다
+                # (실제로 330행부터만 드롭다운이 생기는 일이 있었다).
+                # 넉넉한 상한을 명시해 시트가 커져도 덮이게 한다.
                 "range": {"sheetId": sid, "startRowIndex": 1,
+                          "endRowIndex": VALIDATION_MAX_ROWS,
                           "startColumnIndex": col, "endColumnIndex": col + 1},
                 "rule": {
                     "condition": {"type": "ONE_OF_LIST",
@@ -387,6 +395,26 @@ class SheetsClient:
                 },
             }
         }], f"'{tab}' 드롭다운 설정")
+
+    def rename_tab(self, file_id: str, old: str, new: str) -> bool:
+        """탭 이름만 바꾼다 (내용 보존). 바꿨으면 True.
+
+        탭 이름은 파싱 키라, 상수만 고치면 앱이 빈 탭을 새로 만들고 사람이
+        채워 둔 값이 통째로 끊긴다. 그래서 **이름만** 갈아 끼운다.
+
+        `old`가 없거나 `new`가 이미 있으면 아무것도 하지 않는다 — 여러 번
+        돌려도 안전해야 한다.
+        """
+        ids = self.sheet_ids(file_id)
+        if old not in ids or new in ids:
+            return False
+        self._batch(file_id, [{
+            "updateSheetProperties": {
+                "properties": {"sheetId": ids[old], "title": new},
+                "fields": "title",
+            }
+        }], f"'{old}' → '{new}' 이름 변경")
+        return True
 
     def freeze_header(self, file_id: str, tab: str,
                       sheet_id: Optional[int] = None) -> None:

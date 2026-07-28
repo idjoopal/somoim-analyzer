@@ -673,7 +673,8 @@ def build_analysis(raw: dict, corrections: dict) -> dict:
     달라지므로 순서가 중요하다.
     """
     from core.store import (
-        apply_corrections, filter_excluded, resolution_from_corrections,
+        apply_corrections, filter_excluded, real_by_nickname,
+        real_name_resolution, resolution_from_corrections,
     )
 
     posts = [dict(p) for p in raw.get("posts") or []]
@@ -689,7 +690,11 @@ def build_analysis(raw: dict, corrections: dict) -> dict:
     _mark_active(photos, active_mids)
 
     master_names = {m["mn"] for m in members if m.get("mn")}
-    resolution = {**join_aliases, **resolution_from_corrections(corrections)}
+    # 실명 → 닉네임이 가입인사 자동 추출보다 뒤에 온다: 사람이 채운 값이 이긴다.
+    member_names = corrections.get("member_names") or {}
+    resolution = {**join_aliases,
+                  **real_name_resolution(member_names, members),
+                  **resolution_from_corrections(corrections)}
     annotate_attendees(posts, master_names, resolution)
     # 보정으로 참석자를 직접 지정한 후기는 annotate가 덮어쓰므로 다시 적용한다.
     apply_corrections(posts, {"attendees": corrections.get("attendees") or {}})
@@ -700,6 +705,7 @@ def build_analysis(raw: dict, corrections: dict) -> dict:
         "master": {"names": master_names,
                    "duplicates": find_duplicate_member_names(members)},
         "resolution": resolution,
+        "real_names": real_by_nickname(member_names, members),
         "applied": counts,
         "history": raw.get("history") or [],
     }
@@ -961,8 +967,8 @@ def _tab_attendance(posts: list[dict], master: set[str], months: list[int]) -> N
     st.info(
         "📝 **후기 본문에 적힌 이름 명단으로 실제 참석자를 추적합니다.** "
         "댓글이 막혀 있어도 후기는 공개이고, 본문의 실명을 멤버 마스터와 매칭합니다. "
-        "본인이 명단에 없거나 본문에서 이름을 찾지 못한 후기는 분류 검토 단계의 "
-        "**참석자 보정** 표에서 수정할 수 있습니다. (사이드바에 멤버 명단 CSV를 올리면 정확도↑)",
+        "매칭이 안 되면 보정 시트에서 고칠 수 있습니다 — **`이름매핑1`에 실명을 채우는 것이 "
+        "가장 효과가 큽니다.** 그래도 남는 것은 `후기이름매핑`·`참석자보정`에서 처리하세요.",
         icon="👥",
     )
 
@@ -1408,10 +1414,21 @@ def render_sidebar(stores, analysis: dict | None) -> None:
             pending = fix_store.pending_count()
         except Exception:  # noqa: BLE001
             pending = None
-        if pending:
-            st.warning(f"아직 채우지 않은 보정 {pending}건", icon="✍️")
-        elif pending == 0:
-            st.success("보정 대기 없음", icon="✅")
+        if pending is not None:
+            from core.store import TAB_MEMBER_NAMES
+            # 실명이 먼저다 — 채우고 나면 나머지 후보 자체가 줄어든다.
+            if pending.get(TAB_MEMBER_NAMES):
+                st.warning(
+                    f"**① 실명 미기입 {pending[TAB_MEMBER_NAMES]}명** — "
+                    "`이름매핑1`부터 채우시면 아래 항목이 줄어듭니다.", icon="👤")
+            rest = {t: n for t, n in pending.items()
+                    if t != TAB_MEMBER_NAMES and n}
+            if rest:
+                st.warning("아직 채우지 않은 보정 · "
+                           + " · ".join(f"{t} {n}건" for t, n in rest.items()),
+                           icon="✍️")
+            elif not pending.get(TAB_MEMBER_NAMES):
+                st.success("보정 대기 없음", icon="✅")
         if st.button("🔄 새로고침", width="stretch"):
             st.session_state.pop("_analysis", None)
             st.rerun()
@@ -1424,8 +1441,10 @@ def render_sidebar(stores, analysis: dict | None) -> None:
                 analysis["history"], analysis["posts"], analysis["photos"])
             if rng:
                 tag = period_tag(*rng)
+                from core.store import relabel_attendees
                 xlsx = build_excel(
-                    analysis["posts"], analysis["photos"], rng[0], rng[1],
+                    relabel_attendees(analysis["posts"], analysis.get("real_names")),
+                    analysis["photos"], rng[0], rng[1],
                     members=analysis["members"],
                     resolution=analysis["resolution"],
                 )
@@ -1481,12 +1500,18 @@ def _run_collection(raw_store, fix_store, start_ym: int, end_ym: int) -> None:
             raw_store.save_field_report(field_report)
 
             on_progress("보정 후보 정리…", 0.99)
+            # 후보 계산도 분석과 **같은 해소 기준**으로 해야 한다. 실명을 빠뜨리면
+            # 이미 풀린 이름이 후기이름매핑에 계속 쌓인다.
+            corrections = fix_store.load()
             annotate_attendees(posts, active_mns,
                                {**join_aliases,
-                                **_resolution_of(fix_store.load())})
+                                **real_name_resolution(
+                                    corrections.get("member_names") or {}, members),
+                                **_resolution_of(corrections)})
             added = fix_store.seed(
                 correction_candidates(posts, dict(collect_all_unresolved(posts)),
-                                      fix_store.load()),
+                                      corrections, members=members,
+                                      join_aliases=join_aliases),
                 master_names=active_mns)
         except Exception as e:  # noqa: BLE001
             status.update(label="수집 실패", state="error")
@@ -1506,6 +1531,11 @@ def _run_collection(raw_store, fix_store, start_ym: int, end_ym: int) -> None:
 def _resolution_of(corrections: dict) -> dict[str, str]:
     from core.store import resolution_from_corrections
     return resolution_from_corrections(corrections)
+
+
+def real_name_resolution(member_names, members):
+    from core.store import real_name_resolution as _f
+    return _f(member_names, members)
 
 
 def load_analysis(stores) -> dict | None:
@@ -1553,7 +1583,10 @@ def main() -> None:
     view = _period_picker(full)
     st.session_state["_view_range"] = view
     posts, photos = slice_period(analysis, *view)
-    render_results(view[0], view[1], posts, photos, analysis["master"],
+    from core.store import relabel_attendees
+    render_results(view[0], view[1],
+                   relabel_attendees(posts, analysis.get("real_names")),
+                   photos, analysis["master"],
                    members=analysis["members"], applied=analysis["applied"])
 
 
