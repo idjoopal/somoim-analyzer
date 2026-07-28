@@ -287,3 +287,33 @@ def test_pending_corrections_are_surfaced():
     at = run(stores=make_stores(MULTI_YEAR, PHOTOS, corrections=corrections))
     assert not at.exception, [str(e) for e in at.exception]
     assert any("채우지 않은 보정" in w.value for w in at.warning)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 연동 실패가 화면에 보여야 한다
+# ═══════════════════════════════════════════════════════════════
+#
+# Streamlit Cloud는 잡히지 않은 예외의 메시지를 가린다. 조치 방법을 적어 둔
+# 안내가 로그에만 남으면 사용자는 무엇을 고쳐야 할지 알 수 없다.
+
+FAKE_CREDS = '{"client_email": "a@b.iam.gserviceaccount.com", "private_key": "-----K-----"}'
+
+
+def test_missing_folder_id_is_reported_before_calling_google():
+    """folder_id 없이는 반드시 실패하므로, 시도하기 전에 알려 준다."""
+    at = run(secrets={"gsheets": {"credentials": FAKE_CREDS}})
+    assert not at.exception, [str(e) for e in at.exception]
+    assert any("folder_id" in e.value for e in at.error)
+
+
+def test_store_open_failure_shows_message_instead_of_crashing():
+    """GSheetsError가 화면에 뜨고 앱은 계속 그려져야 한다.
+
+    자격증명이 JSON이 아니면 `_open_stores` 안에서 `parse_credentials`가
+    GSheetsError를 던진다 — 네트워크 없이 실제 실패 경로를 그대로 탄다.
+    """
+    at = AppTest.from_file(APP, default_timeout=TIMEOUT)
+    at.secrets["gsheets"] = {"credentials": "이건 JSON이 아님", "folder_id": "FOLDER1"}
+    at.run()
+    assert not at.exception, [str(e) for e in at.exception]
+    assert any("JSON" in e.value for e in at.error)

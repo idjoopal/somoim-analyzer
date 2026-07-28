@@ -632,17 +632,33 @@ def _open_stores(_conf_key: str):
 
 
 def get_stores():
-    """(raw_store, correction_store). secrets 미설정이면 None.
+    """(raw_store, correction_store). secrets 미설정이거나 열기 실패면 None.
 
     세션에 이미 열린 스토어가 있으면 그것을 쓴다 — 테스트에서 가짜 스토어를
     주입하는 지점이기도 하다.
+
+    실패를 예외로 올리지 않고 `st.error`로 보여 준 뒤 None을 돌려준다:
+    Streamlit Cloud는 **잡히지 않은 예외의 메시지를 가리므로**, 그대로 두면
+    조치 방법을 적어 둔 안내가 화면에 못 뜨고 로그를 열어야만 보인다.
     """
     if st.session_state.get("_stores") is not None:
         return st.session_state["_stores"]
     conf = _gsheets_conf()
     if not conf:
         return None
-    stores = _open_stores(str(sorted(conf.items())))
+    if not conf.get("folder_id"):
+        st.error(
+            "`[gsheets]`에 **`folder_id`가 없습니다.** 서비스 계정은 자기 드라이브에 "
+            "파일을 만들 수 없어, 사용자가 공유해 준 폴더를 반드시 지정해야 합니다.\n\n"
+            "`folder_id`가 `[auth]` 같은 다른 섹션 아래로 내려가 있지 않은지도 "
+            "확인하세요 — TOML은 바로 위 섹션에 속합니다.", icon="⚙️",
+        )
+        return None
+    try:
+        stores = _open_stores(str(sorted(conf.items())))
+    except Exception as e:  # noqa: BLE001 — 메시지를 화면에 띄우는 것이 목적
+        st.error(str(e), icon="⚠️")
+        return None
     st.session_state["_stores"] = stores
     return stores
 

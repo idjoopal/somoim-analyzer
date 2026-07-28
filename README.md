@@ -145,7 +145,15 @@ save_excel(posts, photos, start_ym, end_ym, members=members)
 1. [Google Cloud Console](https://console.cloud.google.com)에서 프로젝트 생성 → **Google Drive API**와 **Google Sheets API** 사용 설정
 2. **서비스 계정** 생성 → 키 추가 → **JSON** 다운로드
 3. 구글 드라이브에 **비공개 폴더**를 만들고, 서비스 계정 이메일(`...@....iam.gserviceaccount.com`)에 **편집자**로 공유 → 폴더 URL의 `folders/` 뒤 문자열이 `folder_id`
-4. `.streamlit/secrets.toml`(배포 시에는 Streamlit Cloud → 앱 **Settings → Secrets**)에 입력:
+4. **그 폴더 안에 빈 스프레드시트 2개를 직접 만들고** 이름을 정확히 아래로 지정:
+
+   | 파일 이름 | 용도 |
+   |---|---|
+   | `다감노_raw` | 수집 데이터 |
+   | `다감노_보정` | 사람이 채우는 보정 |
+
+   탭은 만들지 않아도 됩니다 — 앱이 알아서 만듭니다.
+5. `.streamlit/secrets.toml`(배포 시에는 Streamlit Cloud → 앱 **Settings → Secrets**)에 입력:
 
 ```toml
 [gsheets]
@@ -158,7 +166,11 @@ folder_id = "1AbC..."
 password = "관리자만 아는 값"
 ```
 
-앱이 그 폴더 안에 `다감노_raw`와 `다감노_보정` 두 파일을 이름으로 찾아 쓰고, 없으면 만듭니다. URL을 붙여넣을 필요가 없습니다.
+앱은 그 폴더에서 두 파일을 **이름으로 찾아** 씁니다. URL을 붙여넣을 필요가 없습니다.
+
+> ⚠️ **시트를 왜 직접 만들어야 하나** — 구글 드라이브에서는 파일을 만든 주체가 소유자가 되는데, **서비스 계정은 저장 용량이 0이라 파일을 소유할 수 없습니다.** 폴더를 편집자로 공유해도 "만들기"는 안 되고 `storageQuotaExceeded`(403)가 납니다. 사람이 만들면 소유자가 본인이 되고 서비스 계정은 편집만 하므로 문제가 없습니다.
+>
+> Google Workspace를 쓴다면 **공유 드라이브(Shared Drive)** 안에 폴더를 두는 방법도 있습니다. 그 경우 파일을 드라이브가 소유해서 앱이 직접 만들 수 있습니다. 개인 Gmail 계정에는 공유 드라이브가 없습니다.
 
 > ⚠️ **`credentials`는 반드시 `'''`(작은따옴표 3개)로 감싸세요.** TOML에서 `"""`는 이스케이프를 해석하기 때문에 `private_key`의 `\n`이 실제 줄바꿈으로 바뀌어 JSON 파싱이 깨집니다.
 
