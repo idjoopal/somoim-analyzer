@@ -194,11 +194,24 @@ class GoogleSheetsStore:
         """이름으로 찾고 없으면 만든다. `(file_id, 새로_만들었는지)` 반환.
 
         URL을 매번 붙여넣지 않아도 되도록 **고정된 이름**으로 파일을 관리하는 진입점.
+
+        생성은 실패할 수 있는 것이 정상이다 — 서비스 계정은 드라이브 저장 용량이
+        없어 파일을 소유할 수 없기 때문에, 개인 구글 계정 환경에서는 사람이 시트를
+        미리 만들어 두는 쪽이 정석이다. 그래서 실패 시 그 방법을 안내한다.
         """
         existing = self.find_by_name(title)
         if existing:
             return existing, False
-        return self.create_spreadsheet(title), True
+        try:
+            return self.create_spreadsheet(title), True
+        except GSheetsError as e:
+            raise GSheetsError(
+                f"{e}\n\n"
+                f"**해결 방법** — 구글 드라이브에서 폴더"
+                f"{f'(`{self.folder_id}`)' if self.folder_id else ''} 안에 "
+                f"빈 스프레드시트를 만들고 이름을 정확히 **`{title}`** 로 지정하세요. "
+                "앱이 그 파일을 찾아 그대로 사용합니다(탭은 자동으로 만듭니다)."
+            ) from e
 
     # ── 공유 ────────────────────────────────────────────────────
     def share_anyone_reader(self, file_id: str) -> None:
@@ -323,6 +336,46 @@ def _status_of(exc: Exception):
     return getattr(getattr(exc, "resp", None), "status", None)
 
 
+def _error_body(exc: Exception) -> dict:
+    """구글 에러 응답 본문을 dict로 (없거나 깨졌으면 빈 dict).
+
+    에러를 설명하다가 다시 죽으면 안 되므로 어떤 입력에도 예외를 내지 않는다.
+    """
+    content = getattr(exc, "content", None)
+    if not content:
+        return {}
+    try:
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", "replace")
+        body = json.loads(content)
+        return body.get("error") or {} if isinstance(body, dict) else {}
+    except (ValueError, AttributeError, TypeError):
+        return {}
+
+
+def _reason_of(exc: Exception) -> str:
+    """구글 에러 본문에서 `reason`을 꺼낸다 (없으면 빈 문자열).
+
+    같은 403이라도 `storageQuotaExceeded`(소유권 문제)와
+    `insufficientFilePermissions`(공유 문제)는 조치가 완전히 다르다.
+    이 값을 버리면 사용자는 무엇을 고쳐야 할지 알 수 없다.
+    """
+    errors = _error_body(exc).get("errors") or []
+    try:
+        return str(errors[0].get("reason") or "")
+    except (IndexError, AttributeError, TypeError):
+        return ""
+
+
+def _detail_of(exc: Exception) -> str:
+    """사람이 읽을 수 있는 원본 설명.
+
+    `str(exc)`에 의존하지 않는다 — 클라이언트가 예외를 어떻게 포매팅하든
+    본문의 `message`가 가장 구체적이고, 그게 조치의 실마리가 된다.
+    """
+    return str(_error_body(exc).get("message") or "") or str(exc)
+
+
 def _build_service(credentials_info: dict, api: str = "drive"):
     try:
         from google.oauth2.service_account import Credentials
@@ -341,15 +394,39 @@ def _build_service(credentials_info: dict, api: str = "drive"):
 
 
 def _explain(exc: Exception, action: str) -> str:
-    """API 예외를 사용자가 조치할 수 있는 한국어 메시지로."""
-    status = _status_of(exc)
+    """API 예외를 사용자가 조치할 수 있는 한국어 메시지로.
+
+    `reason`별로 조치를 특정하고, 모르는 경우에도 **원본 메시지를 반드시 덧붙인다** —
+    번역하다 원인을 삼켜 버리면 로그를 뒤져야만 알 수 있게 된다.
+    """
+    status, reason = _status_of(exc), _reason_of(exc)
+    detail = _detail_of(exc)
+
+    if reason == "storageQuotaExceeded":
+        return (
+            f"{action} 실패 — **서비스 계정은 구글 드라이브에 파일을 소유할 수 없습니다** "
+            "(저장 용량 0). 폴더를 편집자로 공유해도 파일을 '만드는' 것은 안 됩니다.\n\n"
+            "→ 공유해 둔 폴더 안에 빈 스프레드시트를 **직접 만들어** 주세요. "
+            "그러면 소유자가 사용자가 되고 앱은 편집만 하므로 문제가 사라집니다."
+        )
+    if reason in ("insufficientFilePermissions", "forbidden"):
+        return (
+            f"{action} 실패 — 대상에 대한 권한이 없습니다. 서비스 계정 이메일이 "
+            "그 폴더/시트에 **편집자**(뷰어 아님)로 공유돼 있는지 확인하세요."
+        )
+    if reason in ("accessNotConfigured", "SERVICE_DISABLED"):
+        return (f"{action} 실패 — API가 켜져 있지 않습니다. GCP 콘솔에서 "
+                "**Google Drive API**와 **Google Sheets API**를 모두 사용 설정하세요.\n\n"
+                f"원본: {detail}")
+    if reason in ("rateLimitExceeded", "userRateLimitExceeded") or status == 429:
+        return f"{action} 실패 — 요청이 너무 잦습니다. 잠시 후 다시 시도하세요."
     if status in (401, 403):
         return (
-            f"{action} 권한이 없습니다 (HTTP {status}). 서비스 계정 이메일을 "
-            "대상 시트/폴더에 **편집자**로 공유했는지, Drive API가 켜져 있는지 확인하세요."
+            f"{action} 권한이 없습니다 (HTTP {status}, reason={reason or '알 수 없음'}). "
+            "서비스 계정 이메일을 대상 시트/폴더에 **편집자**로 공유했는지, "
+            f"Drive·Sheets API가 켜져 있는지 확인하세요.\n\n원본: {detail}"
         )
     if status == 404:
-        return f"{action} 실패 — 시트를 찾을 수 없습니다. 주소와 공유 설정을 확인하세요."
-    if status == 429:
-        return f"{action} 실패 — 요청이 너무 잦습니다. 잠시 후 다시 시도하세요."
-    return f"{action} 실패: {exc}"
+        return (f"{action} 실패 — 대상을 찾을 수 없습니다 (HTTP 404). "
+                f"folder_id와 공유 설정을 확인하세요.\n\n원본: {detail}")
+    return f"{action} 실패: {detail}"
