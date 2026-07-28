@@ -260,6 +260,15 @@ def test_validation_targets_the_right_column_and_skips_header():
     assert (rng["startColumnIndex"], rng["endColumnIndex"]) == (1, 2)
 
 
+def test_validation_range_covers_rows_added_later():
+    """끝 행을 안 적으면 일부 행에만 걸린다 — 실제로 330행부터만 생긴 적이 있다."""
+    svc = FakeSheetsService(tabs={"이름매핑": []})
+    SheetsClient({}, service=svc).set_validation(FILE_ID, "이름매핑", 1, ["a"])
+
+    rng = _reqs(svc)[0]["setDataValidation"]["range"]
+    assert rng["endRowIndex"] >= 10_000
+
+
 def test_validation_on_unknown_tab_is_noop():
     """탭이 아직 없다고 죽으면 안 된다 — 서식은 부가 기능이다."""
     svc = FakeSheetsService(tabs={"이름매핑": []})
@@ -289,6 +298,33 @@ def test_header_notes_attach_to_header_row_without_changing_text():
 def test_header_notes_empty_sends_nothing():
     svc = FakeSheetsService(tabs={"공지보정": []})
     SheetsClient({}, service=svc).set_header_notes(FILE_ID, "공지보정", {})
+    assert svc.batch_updates == []
+
+
+def test_rename_tab_changes_only_the_title():
+    """내용은 그대로 두고 이름만 갈아 끼운다 — 새로 만들면 사람이 채운 값이 끊긴다."""
+    svc = FakeSheetsService(tabs={"이름매핑": [["a"]], "공지보정": []})
+    assert SheetsClient({}, service=svc).rename_tab(
+        FILE_ID, "이름매핑", "후기이름매핑") is True
+
+    req = _reqs(svc)[0]["updateSheetProperties"]
+    assert req["properties"] == {"sheetId": 100, "title": "후기이름매핑"}
+    assert req["fields"] == "title"            # 다른 속성은 건드리지 않는다
+
+
+def test_rename_tab_is_a_noop_when_target_exists():
+    """둘 다 있으면 새 탭이 진짜다 — 덮어쓰면 안 된다."""
+    svc = FakeSheetsService(tabs={"이름매핑": [], "후기이름매핑": []})
+    assert SheetsClient({}, service=svc).rename_tab(
+        FILE_ID, "이름매핑", "후기이름매핑") is False
+    assert svc.batch_updates == []
+
+
+def test_rename_tab_is_a_noop_when_source_missing():
+    """두 번째 실행 — 이미 이관이 끝난 상태."""
+    svc = FakeSheetsService(tabs={"후기이름매핑": []})
+    assert SheetsClient({}, service=svc).rename_tab(
+        FILE_ID, "이름매핑", "후기이름매핑") is False
     assert svc.batch_updates == []
 
 

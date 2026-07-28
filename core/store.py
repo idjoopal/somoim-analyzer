@@ -42,11 +42,17 @@ TAB_FIELDS = "_원본필드"
 RAW_TABS = [TAB_POSTS, TAB_PHOTOS, TAB_MEMBERS, TAB_BANNED, TAB_JOIN_ALIASES,
             TAB_HISTORY, TAB_FIELDS]
 
-TAB_NAME_MAP = "이름매핑"
+TAB_MEMBER_NAMES = "이름매핑1"      # ① 멤버 실명 — 나머지 보정의 전제
+TAB_NAME_MAP = "후기이름매핑"        # ② 실명으로도 안 풀린 나머지
 TAB_POST_FIX = "공지보정"
 TAB_ATTENDEE_FIX = "참석자보정"
 TAB_GUIDE = "_사용법"
-CORRECTION_TABS = [TAB_GUIDE, TAB_NAME_MAP, TAB_POST_FIX, TAB_ATTENDEE_FIX]
+CORRECTION_TABS = [TAB_GUIDE, TAB_MEMBER_NAMES, TAB_NAME_MAP,
+                   TAB_POST_FIX, TAB_ATTENDEE_FIX]
+
+# 이름이 바뀌기 전의 탭. 사람이 채워 둔 값을 살리려면 새로 만들지 말고
+# 이름만 갈아 끼워야 한다 (`CorrectionStore.ensure`).
+LEGACY_NAME_MAP = "이름매핑"
 
 # ── 컬럼 (헤더 행 = 이 순서) ──
 POST_KEYS = [
@@ -62,6 +68,7 @@ MEMBER_KEYS = ["mid", "mn", "is_admin", "joined_at", "last_visit", "os", "push"]
 HISTORY_KEYS = ["수집시각", "시작월", "종료월", "게시글", "사진", "멤버"]
 FIELD_COLS = ["필드", "사용중", "건수", "예시", "비고"]
 
+MEMBER_NAME_COLS = ["멤버 id", "닉네임", "실명", "비고"]
 NAME_MAP_COLS = ["이름토큰", "처리", "빈도", "비고"]
 POST_FIX_COLS = ["공지 id", "제목", "카테고리", "출사일", "취소", "제외", "비고"]
 ATTENDEE_FIX_COLS = ["후기 id", "제목", "참석자", "비고"]
@@ -306,7 +313,9 @@ def filter_excluded(posts: list[dict]) -> list[dict]:
 
 
 def correction_candidates(posts: list[dict], unresolved_freq: dict[str, int],
-                          corrections: dict) -> dict[str, list[list]]:
+                          corrections: dict, members: Optional[list[dict]] = None,
+                          join_aliases: Optional[dict] = None,
+                          ) -> dict[str, list[list]]:
     """보정 시트에 넣을 **후보 행**을 계산 (이미 보정된 것은 제외).
 
     사용자가 시트를 열었을 때 무엇을 채워야 하는지 보이게 하는 장치.
@@ -336,8 +345,11 @@ def correction_candidates(posts: list[dict], unresolved_freq: dict[str, int],
         and str(p["id"]) not in done_att
     ]
 
-    return {TAB_NAME_MAP: name_rows, TAB_POST_FIX: post_rows,
-            TAB_ATTENDEE_FIX: att_rows}
+    out = {TAB_NAME_MAP: name_rows, TAB_POST_FIX: post_rows,
+           TAB_ATTENDEE_FIX: att_rows}
+    if members:
+        out[TAB_MEMBER_NAMES] = member_name_candidates(members, join_aliases)
+    return out
 
 
 def missing_rows(existing_rows: list[list], candidate_rows: list[list]) -> list[list]:
@@ -377,34 +389,53 @@ GUIDE_ROWS: list[list[str]] = [
     ["  · 첫 열(id·이름토큰)이 보정을 붙이는 열쇠입니다. 절대 고치지 마세요."],
     ["  · 각 탭 헤더 칸에 마우스를 올리면 그 칸 설명이 뜹니다."],
     [""],
-    ["■ 이름매핑 — 후기 본문에서 나온 이름이 멤버 명단과 안 맞을 때"],
+    ["■ ① 이름매핑1 — 멤버 실명 (여기부터 하세요)"],
+    ["  앱은 닉네임만 알고 실명을 모릅니다. 그런데 후기 본문에는 실명이 더 자주 나옵니다."],
+    ["  실명을 채워 두면 나머지 보정에서 손댈 것이 크게 줄어듭니다."],
+    ["  · 실명      실제 이름. 가입인사에서 찾은 것은 미리 채워 두었습니다"],
+    ["  · 닉네임 순으로 정렬돼 있어 갖고 계신 명단을 '실명' 열에 통째로 붙여넣을 수 있습니다"],
+    ["  · '멤버 id'는 고치지 마세요 — 닉네임이 바뀌어도 이 값으로 같은 사람을 따라갑니다"],
+    [""],
+    ["■ ② 후기이름매핑 — 실명 명단으로도 안 풀린 나머지"],
+    ["  ①을 채우고 나면 여기 남는 것은 오타·탈퇴자·이름이 아닌 것들입니다."],
     ["  '처리' 칸에 셋 중 하나를 넣습니다 (드롭다운에서 고르세요)."],
     ["  · 마스터 닉네임    같은 사람의 다른 표기일 때. 멤버 명단에 있는 닉네임 그대로"],
     [f"  · {LEFT_MEMBER}         탈퇴한 멤버. 집계에서 빠집니다. \"탈퇴\"라고 써도 됩니다"],
     [f"  · {NOT_A_NAME}         이름이 아님(조사·오탈자 등). \"노이즈\"·\"❌\"도 됩니다"],
     ["  목록에 없는 새 닉네임도 직접 입력할 수 있습니다(경고만 뜹니다)."],
     [""],
-    ["■ 공지보정 — 출사 공지의 카테고리·날짜가 자동 판단으로 안 잡힐 때"],
+    ["■ ③ 공지보정 — 출사 공지의 카테고리·날짜가 자동 판단으로 안 잡힐 때"],
     ["  · 카테고리   " + " / ".join(ALL_CATS)],
     ["  · 출사일     YYYY-MM-DD (예: 2026-03-14). 공지 작성일이 아니라 실제 출사한 날"],
     ["  · 취소       출사가 취소됐으면 TRUE"],
     ["  · 제외       출사 공지가 아니거나 집계에서 빼야 하면 TRUE"],
     ["  넷 중 채운 칸만 덮어씁니다. 카테고리만 고치고 싶으면 카테고리만 채우세요."],
     [""],
-    ["■ 참석자보정 — 후기 본문에서 참석자를 못 뽑았거나 틀리게 뽑았을 때"],
+    ["■ ④ 참석자보정 — 후기 본문에서 참석자를 못 뽑았거나 틀리게 뽑았을 때"],
     ["  · 참석자     쉼표로 구분한 닉네임. 예: 원석사진, 나무, 바다"],
     ["  · 여기에 적으면 본문에서 뽑은 결과를 통째로 대체합니다(더하지 않습니다)."],
     ["  · 작성자도 참석했다면 작성자 닉네임을 함께 적어 주세요."],
     [""],
     ["■ 작업 순서"],
-    ["  ① 앱에서 수집  → 앱이 채울 후보 행을 이 시트에 추가"],
-    ["  ② 이 시트에서 빈칸 채우기"],
-    ["  ③ 앱에서 [새로고침] → 보정이 반영된 분석 결과"],
-    ["  다음부터는 ①을 다시 해도 ②가 유지되므로 ③만 누르면 됩니다."],
+    ["  1. 앱에서 수집  → 앱이 채울 후보 행을 이 시트에 추가"],
+    ["  2. 이 시트에서 ①부터 차례로 빈칸 채우기"],
+    ["  3. 앱에서 [새로고침] → 보정이 반영된 분석 결과"],
+    ["  다음부터는 1을 다시 해도 2가 유지되므로 3만 누르면 됩니다."],
+    [""],
+    ["⚠️ 이 시트와 분석 결과 파일에는 실명이 들어갑니다. 공유에 주의하세요."],
 ]
 
 # 열 인덱스 → 헤더 셀 메모. 헤더 텍스트를 바꾸면 파싱이 깨지므로 메모로 붙인다.
 HEADER_NOTES: dict[str, dict[int, str]] = {
+    TAB_MEMBER_NAMES: {
+        0: "멤버 고유 id. 닉네임이 바뀌어도 이 값으로 같은 사람을 따라갑니다.\n"
+           "고치지 마세요 — 보정을 붙이는 열쇠입니다.",
+        1: "수집 시점의 닉네임. 앱이 채운 참고값이라 이후 갱신되지 않습니다.",
+        2: "**이 칸을 채우시면 됩니다.** 실제 이름.\n"
+           "가입인사에서 찾은 것은 미리 채워 두었습니다. 나머지를 채우세요.\n"
+           "닉네임 순으로 정렬돼 있어 기존 명단을 통째로 붙여넣을 수 있습니다.",
+        3: "자유 메모. 앱은 읽지 않습니다.",
+    },
     TAB_NAME_MAP: {
         0: "후기 본문에서 나온 이름 표기. 보정을 붙이는 열쇠이므로 고치지 마세요.",
         1: f"마스터 닉네임 / {LEFT_MEMBER}(탈퇴) / {NOT_A_NAME}(이름 아님) 중 하나.\n"
@@ -444,9 +475,106 @@ def dropdowns(master_names=None) -> list[tuple[str, int, list[str]]]:
     names = sorted({str(n).strip() for n in (master_names or []) if str(n).strip()})
     if names:
         out.append((TAB_NAME_MAP, 1, names + [LEFT_MEMBER, NOT_A_NAME]))
+    # `이름매핑1`의 `실명`에는 걸지 않는다 — 목록이 있을 수 없는 자유 입력이다.
     out.append((TAB_POST_FIX, 2, list(ALL_CATS)))
     out.append((TAB_POST_FIX, 4, BOOL_CHOICES))
     out.append((TAB_POST_FIX, 5, BOOL_CHOICES))
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
+# 멤버 실명 — 보정의 1단계
+#
+# raw `멤버` 탭에는 닉네임만 있고 실명이 없다. 그런데 후기 본문에는 실명이
+# 더 자주 나온다. 그래서 실명 명단이 없으면 `후기이름매핑`에 "사실 멤버인데
+# 못 알아본 이름"과 "진짜 문제(오타·탈퇴자·이름 아님)"가 뒤섞여 쌓인다.
+#
+# 키는 `mid`다. 닉네임은 바뀌고 중복될 수 있어 키로 쓸 수 없다.
+# ═══════════════════════════════════════════════════════════════
+
+def member_name_candidates(members: list[dict],
+                           join_aliases: Optional[dict] = None) -> list[list]:
+    """`이름매핑1`에 깔 행 — 전 멤버, 닉네임 오름차순.
+
+    `실명`은 가입인사에서 뽑은 것(실명→닉네임)을 미리 채운다. 나머지는 사람이
+    채우는데, 정렬이 안정적이라 기존 명단을 열에 통째로 붙여넣을 수 있다.
+    """
+    real_by_nick: dict[str, str] = {}
+    for real, nick in (join_aliases or {}).items():
+        if _clean(real) and _clean(nick):
+            real_by_nick.setdefault(_clean(nick), _clean(real))
+
+    rows = []
+    for m in members or []:
+        mid, nick = _clean(m.get("mid")), _clean(m.get("mn"))
+        if not mid:
+            continue
+        rows.append([mid, nick, real_by_nick.get(nick, ""), ""])
+    return sorted(rows, key=lambda r: (r[1], r[0]))
+
+
+def parse_member_names(rows: list[list]) -> dict[str, str]:
+    """`이름매핑1` → `{mid: 실명}`. 빈칸은 "아직 안 채움"이라 건너뛴다."""
+    out: dict[str, str] = {}
+    for r in rows_to_records(rows):
+        mid, real = _clean(r.get("멤버 id")), _clean(r.get("실명"))
+        if mid and real:
+            out[mid] = real
+    return out
+
+
+def real_name_resolution(member_names: dict[str, str],
+                         members: list[dict]) -> dict[str, str]:
+    """`{실명: 현재 닉네임}` — `annotate_attendees(resolution=…)`에 넣을 형태.
+
+    닉네임은 시트의 참고 열이 아니라 **raw 멤버의 현재 값**에서 가져온다.
+    그래서 닉네임이 바뀌어도 매칭이 따라간다.
+    """
+    nick_by_mid = {_clean(m.get("mid")): _clean(m.get("mn"))
+                   for m in members or [] if _clean(m.get("mid"))}
+    out: dict[str, str] = {}
+    for mid, real in (member_names or {}).items():
+        nick = nick_by_mid.get(_clean(mid))
+        if nick and real != nick:      # 실명==닉네임이면 매핑할 것이 없다
+            out[real] = nick
+    return out
+
+
+def real_by_nickname(member_names: dict[str, str],
+                     members: list[dict]) -> dict[str, str]:
+    """`{닉네임: 실명}` — 화면·엑셀 병기용."""
+    out: dict[str, str] = {}
+    for m in members or []:
+        mid, nick = _clean(m.get("mid")), _clean(m.get("mn"))
+        real = _clean((member_names or {}).get(mid))
+        if nick and real:
+            out[nick] = real
+    return out
+
+
+def display_name(nick, real_by_nick: Optional[dict] = None) -> str:
+    """`닉네임(실명)`. 실명을 모르거나 같으면 닉네임 그대로."""
+    n = _clean(nick)
+    real = _clean((real_by_nick or {}).get(n))
+    return f"{n}({real})" if real and real != n else n
+
+
+def relabel_attendees(posts: list[dict],
+                      real_by_nick: Optional[dict] = None) -> list[dict]:
+    """표시용 **사본** — `attendees`를 `닉네임(실명)`으로 바꾼다.
+
+    참석 횟수·선호 카테고리·첫 등장이 모두 `attendees`에서 파생되므로, 여기
+    한 곳만 바꾸면 표·랭킹·엑셀이 한꺼번에 병기된다. 원본을 건드리면 매칭
+    키가 깨지므로 **사본**을 돌려준다.
+    """
+    if not real_by_nick:
+        return posts
+    out = []
+    for p in posts or []:
+        att = p.get("attendees")
+        if att:
+            p = {**p, "attendees": [display_name(n, real_by_nick) for n in att]}
+        out.append(p)
     return out
 
 
@@ -571,13 +699,27 @@ class CorrectionStore:
         이미 내용이 있으면 헤더도 건드리지 않는다. 안내(사용법 탭·메모·드롭다운·
         헤더 고정)는 사용자가 입력한 셀에 닿지 않으므로 매번 갱신한다.
         """
+        self.migrate()
         self.c.ensure_tabs(self.file_id, CORRECTION_TABS)
-        for tab, cols in ((TAB_NAME_MAP, NAME_MAP_COLS),
+        for tab, cols in ((TAB_MEMBER_NAMES, MEMBER_NAME_COLS),
+                          (TAB_NAME_MAP, NAME_MAP_COLS),
                           (TAB_POST_FIX, POST_FIX_COLS),
                           (TAB_ATTENDEE_FIX, ATTENDEE_FIX_COLS)):
             if not self.c.read(self.file_id, tab):
                 self.c.write(self.file_id, tab, [cols])
         self.write_guide(master_names)
+
+    def migrate(self) -> None:
+        """`이름매핑` → `후기이름매핑`. 탭 이름만 갈아 끼워 내용을 살린다.
+
+        `ensure_tabs`보다 **먼저** 돌아야 한다. 순서가 뒤집히면 빈
+        `후기이름매핑`이 먼저 생겨 이름 변경이 건너뛰어지고, 사람이 채워 둔
+        값이 옛 탭에 고립된다.
+        """
+        try:
+            self.c.rename_tab(self.file_id, LEGACY_NAME_MAP, TAB_NAME_MAP)
+        except Exception:  # noqa: BLE001 — 이관 실패가 보정을 막아서는 안 된다
+            pass
 
     def write_guide(self, master_names=None) -> None:
         """사용법 탭·헤더 메모·드롭다운·헤더 고정.
@@ -599,11 +741,14 @@ class CorrectionStore:
             pass
 
     def load(self) -> dict:
-        return parse_corrections(
+        out = parse_corrections(
             self.c.read(self.file_id, TAB_NAME_MAP),
             self.c.read(self.file_id, TAB_POST_FIX),
             self.c.read(self.file_id, TAB_ATTENDEE_FIX),
         )
+        out["member_names"] = parse_member_names(
+            self.c.read(self.file_id, TAB_MEMBER_NAMES))
+        return out
 
     def seed(self, candidates: dict[str, list[list]],
              master_names=None) -> dict[str, int]:
@@ -612,8 +757,6 @@ class CorrectionStore:
         append만 쓰므로 사용자가 편집 중인 셀을 덮어쓸 일이 없다.
         `master_names`를 주면 이름 드롭다운 목록을 최신 멤버 명단으로 갱신한다.
         """
-        if master_names:
-            self.write_guide(master_names)
         added: dict[str, int] = {}
         for tab, rows in candidates.items():
             existing = self.c.read(self.file_id, tab)
@@ -621,18 +764,28 @@ class CorrectionStore:
             if new_rows:
                 self.c.append(self.file_id, tab, new_rows)
             added[tab] = len(new_rows)
+        # 안내는 **행을 붙인 뒤에** 갱신한다. 먼저 걸면 나중에 붙는 행이
+        # 드롭다운에서 빠진다 (330행부터만 드롭다운이 있던 원인).
+        if master_names:
+            self.write_guide(master_names)
         return added
 
-    def pending_count(self) -> int:
-        """값이 비어 있는(=아직 안 채운) 행 수 — 사이드바 안내용."""
-        n = 0
-        for tab, val_col in ((TAB_NAME_MAP, 1), (TAB_POST_FIX, 2), (TAB_ATTENDEE_FIX, 2)):
+    def pending_count(self) -> dict[str, int]:
+        """탭별 미기입 행 수 — 사이드바 안내용.
+
+        `이름매핑1`이 맨 앞이다. 실명 명단이 먼저 서야 나머지 보정이 줄어든다.
+        """
+        out: dict[str, int] = {}
+        for tab, val_col in ((TAB_MEMBER_NAMES, 2), (TAB_NAME_MAP, 1),
+                             (TAB_POST_FIX, 2), (TAB_ATTENDEE_FIX, 2)):
+            n = 0
             for row in (self.c.read(self.file_id, tab) or [])[1:]:
                 if not row or not _clean(row[0]):
                     continue
                 if len(row) <= val_col or not _clean(row[val_col]):
                     n += 1
-        return n
+            out[tab] = n
+        return out
 
 
 def open_stores(drive_store, client, raw_file_id=None,
@@ -647,5 +800,11 @@ def open_stores(drive_store, client, raw_file_id=None,
     fix_id = correction_file_id or drive_store.find_or_create(CORRECTION_TITLE)[0]
     raw, fix = RawStore(client, raw_id), CorrectionStore(client, fix_id)
     raw.ensure()
-    fix.ensure()
+    # 멤버 명단을 넘겨야 이름 드롭다운이 **수집 없이도** 걸린다.
+    # 예전에는 `seed()`에서만 걸려서 수집한 적 없으면 목록이 비어 있었다.
+    try:
+        members = raw.load().get("members") or []
+    except Exception:  # noqa: BLE001 — 드롭다운은 부가 기능이다
+        members = []
+    fix.ensure({m["mn"] for m in members if m.get("mn")})
     return raw, fix

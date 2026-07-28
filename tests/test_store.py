@@ -17,6 +17,7 @@ from core.store import (
     RAW_TITLE,
     open_stores,
     ATTENDEE_FIX_COLS,
+    MEMBER_NAME_COLS,
     NAME_MAP_COLS,
     POST_FIX_COLS,
     POST_KEYS,
@@ -25,6 +26,7 @@ from core.store import (
     TAB_FIELDS,
     TAB_GUIDE,
     TAB_HISTORY,
+    TAB_MEMBER_NAMES,
     TAB_NAME_MAP,
     TAB_POST_FIX,
     CorrectionStore,
@@ -34,6 +36,11 @@ from core.store import (
     coerce_dt,
     coerce_iso_date,
     correction_candidates,
+    display_name,
+    member_name_candidates,
+    parse_member_names,
+    real_by_nickname,
+    real_name_resolution,
     filter_excluded,
     missing_rows,
     normalize_record,
@@ -458,6 +465,187 @@ def test_open_stores_can_pin_just_one():
 
 
 # ═══════════════════════════════════════════════════════════════
+# 멤버 실명 — 보정의 1단계
+#
+# 핵심은 **키가 mid라는 것**이다. 닉네임을 키로 쓰면 닉네임이 바뀌는 순간
+# 사람이 채운 실명이 고아가 된다.
+# ═══════════════════════════════════════════════════════════════
+
+def member(mid, mn, **kw):
+    return {"mid": mid, "mn": mn, "is_admin": False, "joined_at": None,
+            "last_visit": None, "os": "", "push": False, **kw}
+
+
+MEMBERS = [member("m2", "나무"), member("m1", "원석사진"), member("m3", "바다")]
+
+
+def test_roster_lists_every_member_sorted_by_nickname():
+    """닉네임 순이라 갖고 있던 명단을 열에 통째로 붙여넣을 수 있다."""
+    rows = member_name_candidates(MEMBERS)
+    assert [r[1] for r in rows] == ["나무", "바다", "원석사진"]
+    assert [r[0] for r in rows] == ["m2", "m3", "m1"]
+
+
+def test_roster_prefills_real_names_found_in_join_greetings():
+    """가입인사에서 이미 알아낸 것을 사람이 다시 칠 이유가 없다."""
+    rows = member_name_candidates(MEMBERS, {"정원석": "원석사진"})
+    by_nick = {r[1]: r[2] for r in rows}
+    assert by_nick["원석사진"] == "정원석"
+    assert by_nick["나무"] == ""            # 모르는 것은 빈칸으로 남긴다
+
+
+def test_roster_skips_members_without_an_id():
+    assert member_name_candidates([{"mid": "", "mn": "유령"}]) == []
+
+
+def test_real_names_survive_a_nickname_change():
+    """이 설계의 존재 이유 — mid가 키라 닉네임이 바뀌어도 실명이 따라간다."""
+    names = {"m1": "정원석"}
+    renamed = [member("m1", "새닉네임")]
+    assert real_name_resolution(names, renamed) == {"정원석": "새닉네임"}
+
+
+def test_real_name_equal_to_nickname_is_not_mapped():
+    assert real_name_resolution({"m1": "원석사진"}, MEMBERS) == {}
+
+
+def test_real_name_for_unknown_member_is_dropped():
+    """탈퇴해서 멤버 목록에 없으면 매핑할 닉네임이 없다."""
+    assert real_name_resolution({"없는사람": "홍길동"}, MEMBERS) == {}
+
+
+def test_parse_member_names_treats_blank_as_not_filled():
+    rows = [MEMBER_NAME_COLS, ["m1", "원석사진", "정원석", ""], ["m2", "나무", "", ""]]
+    assert parse_member_names(rows) == {"m1": "정원석"}
+
+
+def test_real_by_nickname_for_display():
+    assert real_by_nickname({"m1": "정원석"}, MEMBERS) == {"원석사진": "정원석"}
+
+
+@pytest.mark.parametrize("nick,real_map,expected", [
+    ("원석사진", {"원석사진": "정원석"}, "원석사진(정원석)"),
+    ("나무", {"원석사진": "정원석"}, "나무"),          # 실명을 모르면 그대로
+    ("정원석", {"정원석": "정원석"}, "정원석"),        # 같으면 병기하지 않는다
+    ("", {}, ""),
+])
+def test_display_name(nick, real_map, expected):
+    assert display_name(nick, real_map) == expected
+
+
+def test_roster_is_seeded_and_user_values_are_never_touched():
+    c = FakeClient()
+    store = CorrectionStore(c, "F")
+    store.ensure()
+    store.seed(correction_candidates([], {}, {"names": {}, "posts": {}, "attendees": {}},
+                                     members=MEMBERS))
+    # 사람이 실명을 채운다
+    for row in c.tabs[TAB_MEMBER_NAMES][1:]:
+        if row[0] == "m1":
+            row[2] = "정원석"
+
+    store.seed(correction_candidates([], {}, {"names": {}, "posts": {}, "attendees": {}},
+                                     members=MEMBERS))          # 재수집
+    filled = [r for r in c.tabs[TAB_MEMBER_NAMES][1:] if r[0] == "m1"]
+    assert len(filled) == 1 and filled[0][2] == "정원석"          # 중복도, 유실도 없다
+
+
+def test_real_names_resolve_review_tokens_end_to_end():
+    """이 작업의 존재 이유 — 실명을 채우면 후기 본문의 그 이름이 멤버로 인식된다."""
+    from core.collector import annotate_attendees
+
+    posts = [post("r1", cat="E", author="나무",
+                  body="오늘 정원석 님과 함께했습니다", attendees=[])]
+    resolution = real_name_resolution({"m1": "정원석"}, MEMBERS)
+    annotate_attendees(posts, {"나무", "원석사진", "바다"}, resolution)
+
+    assert "원석사진" in posts[0]["attendees"]      # 실명이 닉네임으로 풀렸다
+    assert "정원석" not in posts[0].get("unresolved_names", [])
+
+
+def test_resolved_real_names_drop_out_of_the_leftover_tab():
+    """풀린 이름이 후기이름매핑에 계속 쌓이면 채워도 줄지 않는다."""
+    resolved = correction_candidates(
+        [], {}, {"names": {}, "posts": {}, "attendees": {}})
+    assert resolved[TAB_NAME_MAP] == []
+
+    leftover = correction_candidates(
+        [], {"오타이름": 3}, {"names": {}, "posts": {}, "attendees": {}})
+    assert [r[0] for r in leftover[TAB_NAME_MAP]] == ["오타이름"]
+
+
+def test_relabel_attendees_does_not_mutate_the_original():
+    """원본을 건드리면 매칭 키가 깨진다."""
+    from core.store import relabel_attendees
+
+    posts = [post("p1", attendees=["원석사진", "나무"])]
+    shown = relabel_attendees(posts, {"원석사진": "정원석"})
+
+    assert shown[0]["attendees"] == ["원석사진(정원석)", "나무"]
+    assert posts[0]["attendees"] == ["원석사진", "나무"]
+
+
+def test_relabel_is_a_noop_without_real_names():
+    from core.store import relabel_attendees
+    posts = [post("p1", attendees=["원석사진"])]
+    assert relabel_attendees(posts, {}) is posts
+
+
+def test_load_exposes_member_names():
+    c = FakeClient({TAB_MEMBER_NAMES: [MEMBER_NAME_COLS,
+                                       ["m1", "원석사진", "정원석", ""]]})
+    assert CorrectionStore(c, "F").load()["member_names"] == {"m1": "정원석"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 이름매핑 → 후기이름매핑 이관
+# ═══════════════════════════════════════════════════════════════
+
+class RenamingClient(FakeClient):
+    """탭 이름 변경을 지원하는 가짜 — 실제처럼 내용을 그대로 옮긴다."""
+
+    def rename_tab(self, file_id, old, new):
+        if old not in self.tabs or new in self.tabs:
+            return False
+        self.tabs = {(new if k == old else k): v for k, v in self.tabs.items()}
+        return True
+
+
+def test_legacy_tab_is_renamed_keeping_its_rows():
+    """상수만 바꾸면 빈 탭이 새로 생기고 사람이 채운 값이 끊긴다."""
+    c = RenamingClient({"이름매핑": [NAME_MAP_COLS, ["가나다", "원석사진", 3, "확인함"]]})
+    CorrectionStore(c, "F").ensure()
+
+    assert "이름매핑" not in c.tabs
+    assert c.tabs[TAB_NAME_MAP][1] == ["가나다", "원석사진", 3, "확인함"]
+
+
+def test_migration_is_safe_to_run_twice():
+    c = RenamingClient({"이름매핑": [NAME_MAP_COLS, ["가나다", "원석사진", 3, ""]]})
+    store = CorrectionStore(c, "F")
+    store.ensure()
+    store.ensure()
+    assert len(c.tabs[TAB_NAME_MAP]) == 2
+
+
+def test_migration_does_nothing_when_new_tab_already_has_data():
+    """둘 다 있으면 새 탭이 진짜다 — 옛 탭으로 덮어쓰면 안 된다."""
+    c = RenamingClient({
+        "이름매핑": [NAME_MAP_COLS, ["옛것", "", 1, ""]],
+        TAB_NAME_MAP: [NAME_MAP_COLS, ["새것", "원석사진", 1, ""]],
+    })
+    CorrectionStore(c, "F").ensure()
+    assert c.tabs[TAB_NAME_MAP][1][0] == "새것"
+
+
+def test_client_without_rename_support_still_works():
+    """서식·이관 실패가 보정 자체를 막아서는 안 된다."""
+    c = FakeClient()                       # rename_tab 없음
+    CorrectionStore(c, "F").ensure()
+    assert c.tabs[TAB_NAME_MAP] == [NAME_MAP_COLS]
+
+
+# ═══════════════════════════════════════════════════════════════
 # CorrectionStore
 # ═══════════════════════════════════════════════════════════════
 
@@ -553,7 +741,8 @@ def test_pending_count_counts_unfilled_rows():
         TAB_POST_FIX: [POST_FIX_COLS, ["p1", "제목", "", "", "", "", ""]],
         TAB_ATTENDEE_FIX: [ATTENDEE_FIX_COLS, ["r1", "제목", "정원석", ""]],
     })
-    assert CorrectionStore(c, "F").pending_count() == 2   # b, p1
+    assert CorrectionStore(c, "F").pending_count() == {
+        TAB_MEMBER_NAMES: 0, TAB_NAME_MAP: 1, TAB_POST_FIX: 1, TAB_ATTENDEE_FIX: 0}
 
 
 # ═══════════════════════════════════════════════════════════════
