@@ -628,14 +628,18 @@ def _open_stores(_conf_key: str):
     creds = parse_credentials(conf.get("credentials"))
     drive = GoogleSheetsStore(creds, folder_id=conf.get("folder_id"))
     client = SheetsClient(creds)
-    return open_stores(drive, client)
+    return open_stores(drive, client,
+                       raw_file_id=conf.get("raw_file_id") or None,
+                       correction_file_id=conf.get("correction_file_id") or None)
 
 
 def get_stores():
     """(raw_store, correction_store). secrets 미설정이거나 열기 실패면 None.
 
-    세션에 이미 열린 스토어가 있으면 그것을 쓴다 — 테스트에서 가짜 스토어를
-    주입하는 지점이기도 하다.
+    `session_state["_stores"]`는 **테스트가 가짜 스토어를 주입하는 통로**로만
+    읽는다. 앱이 여기에 쓰지 않는 이유: 세션 상태는 코드가 다시 배포돼도
+    비워지지 않아, 옛 모듈에 묶인 스토어 객체가 그대로 살아남는다. 캐싱은
+    Streamlit이 관리하는 `@st.cache_resource` 하나로 충분하다.
 
     실패를 예외로 올리지 않고 `st.error`로 보여 준 뒤 None을 돌려준다:
     Streamlit Cloud는 **잡히지 않은 예외의 메시지를 가리므로**, 그대로 두면
@@ -659,7 +663,6 @@ def get_stores():
     except Exception as e:  # noqa: BLE001 — 메시지를 화면에 띄우는 것이 목적
         st.error(str(e), icon="⚠️")
         return None
-    st.session_state["_stores"] = stores
     return stores
 
 

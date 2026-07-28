@@ -13,6 +13,9 @@ from core.collector import (
     summarize_body_lengths, summarize_raw_fields,
 )
 from core.store import (
+    CORRECTION_TITLE,
+    RAW_TITLE,
+    open_stores,
     ATTENDEE_FIX_COLS,
     NAME_MAP_COLS,
     POST_FIX_COLS,
@@ -415,6 +418,43 @@ def test_raw_store_merges_banned_and_aliases():
 def test_raw_store_load_empty_sheet():
     loaded = RawStore(FakeClient(), "F").load()
     assert loaded["posts"] == [] and loaded["banned"] == set()
+
+
+# ═══════════════════════════════════════════════════════════════
+# open_stores — 파일 id를 직접 주면 이름 탐색을 건너뛴다
+#
+# 이름 매칭은 글자 하나만 달라도 "파일이 없다 → 만들려다 403"으로 나타난다.
+# ═══════════════════════════════════════════════════════════════
+
+class FakeDriveStore:
+    def __init__(self):
+        self.looked_up = []
+
+    def find_or_create(self, title):
+        self.looked_up.append(title)
+        return f"ID_{title}", False
+
+
+def test_open_stores_finds_by_name_when_no_ids_given():
+    drive = FakeDriveStore()
+    raw, fix = open_stores(drive, FakeClient())
+    assert drive.looked_up == [RAW_TITLE, CORRECTION_TITLE]
+    assert (raw.file_id, fix.file_id) == (f"ID_{RAW_TITLE}", f"ID_{CORRECTION_TITLE}")
+
+
+def test_open_stores_pinned_ids_skip_name_lookup_entirely():
+    drive = FakeDriveStore()
+    raw, fix = open_stores(drive, FakeClient(),
+                           raw_file_id="RAW1", correction_file_id="FIX1")
+    assert drive.looked_up == []                  # 드라이브 탐색을 아예 안 한다
+    assert (raw.file_id, fix.file_id) == ("RAW1", "FIX1")
+
+
+def test_open_stores_can_pin_just_one():
+    drive = FakeDriveStore()
+    raw, fix = open_stores(drive, FakeClient(), raw_file_id="RAW1")
+    assert drive.looked_up == [CORRECTION_TITLE]
+    assert (raw.file_id, fix.file_id) == ("RAW1", f"ID_{CORRECTION_TITLE}")
 
 
 # ═══════════════════════════════════════════════════════════════
