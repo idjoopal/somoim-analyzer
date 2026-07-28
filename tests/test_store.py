@@ -26,6 +26,7 @@ from core.store import (
     TAB_GUIDE,
     TAB_HISTORY,
     TAB_NAME_MAP,
+    TAB_POSTS,
     TAB_POST_FIX,
     CorrectionStore,
     RawStore,
@@ -418,6 +419,63 @@ def test_raw_store_merges_banned_and_aliases():
 def test_raw_store_load_empty_sheet():
     loaded = RawStore(FakeClient(), "F").load()
     assert loaded["posts"] == [] and loaded["banned"] == set()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 상세 조회로 늘어난 열·탭 — 기존 시트를 깨지 않아야 한다
+# ═══════════════════════════════════════════════════════════════
+
+def test_old_sheet_without_the_new_columns_still_loads():
+    """이미 쌓아 둔 시트에는 detail_at·image_urls 열도 댓글 탭도 없다.
+
+    마이그레이션 없이 읽혀야 한다 — 안 그러면 사용자가 시트를 지워야 한다.
+    """
+    old_cols = [k for k in POST_KEYS if k not in ("detail_at", "image_urls")]
+    c = FakeClient({TAB_POSTS: [old_cols,
+                                [post("p1").get(k) for k in old_cols]]})
+    loaded = RawStore(c, "F").load()
+
+    assert len(loaded["posts"]) == 1
+    assert loaded["posts"][0]["detail_at"] is None      # 없는 키는 None으로 채워진다
+    assert loaded["comments"] == []
+
+
+def test_detail_at_survives_recollection():
+    """살아남지 않으면 재수집 때마다 수백 건을 다시 받는다."""
+    c = FakeClient()
+    store = RawStore(c, "F")
+    store.ensure()
+    store.save(posts=[post("p1", detail_at="2026-07-28 10:00:00", body="전문")],
+               photos=[])
+    store.save(posts=[post("p2")], photos=[])          # 다른 기간 재수집
+
+    by_id = {p["id"]: p for p in store.load()["posts"]}
+    assert by_id["p1"]["detail_at"] == "2026-07-28 10:00:00"
+    assert by_id["p1"]["body"] == "전문"
+
+
+def test_comments_upsert_by_id_across_collections():
+    c = FakeClient()
+    store = RawStore(c, "F")
+    store.ensure()
+    store.save(comments=[{"id": "c1", "post_id": "p1", "body": "처음"}])
+    store.save(comments=[{"id": "c1", "post_id": "p1", "body": "수정됨"},
+                         {"id": "c2", "post_id": "p1", "body": "새 댓글"}])
+
+    comments = store.load()["comments"]
+    assert [x["id"] for x in comments] == ["c1", "c2"]
+    assert comments[0]["body"] == "수정됨"
+
+
+def test_save_without_comments_leaves_the_tab_alone():
+    """댓글을 안 넘긴 수집이 이미 쌓인 댓글을 지우면 안 된다."""
+    c = FakeClient()
+    store = RawStore(c, "F")
+    store.ensure()
+    store.save(comments=[{"id": "c1", "post_id": "p1", "body": "유지"}])
+    store.save(posts=[post("p9")], photos=[])          # comments 미지정
+
+    assert [x["id"] for x in store.load()["comments"]] == ["c1"]
 
 
 # ═══════════════════════════════════════════════════════════════

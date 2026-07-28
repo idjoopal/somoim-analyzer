@@ -37,10 +37,11 @@ TAB_PHOTOS = "사진"
 TAB_MEMBERS = "멤버"
 TAB_BANNED = "탈퇴멤버"
 TAB_JOIN_ALIASES = "가입인사매핑"
+TAB_COMMENTS = "댓글"
 TAB_HISTORY = "_수집이력"
 TAB_FIELDS = "_원본필드"
-RAW_TABS = [TAB_POSTS, TAB_PHOTOS, TAB_MEMBERS, TAB_BANNED, TAB_JOIN_ALIASES,
-            TAB_HISTORY, TAB_FIELDS]
+RAW_TABS = [TAB_POSTS, TAB_PHOTOS, TAB_COMMENTS, TAB_MEMBERS, TAB_BANNED,
+            TAB_JOIN_ALIASES, TAB_HISTORY, TAB_FIELDS]
 
 TAB_NAME_MAP = "이름매핑"
 TAB_POST_FIX = "공지보정"
@@ -53,7 +54,13 @@ POST_KEYS = [
     "id", "author", "wid", "title", "body", "outing_date", "posted_at",
     "cat", "cat_label", "category", "is_outing", "is_canceled",
     "likes", "comments", "images", "needs_review", "review_reason",
+    # 상세 조회로 채우는 열. `detail_at`이 있으면 본문이 전문이라는 뜻이라
+    # 재수집 때 다시 받지 않는다.
+    "detail_at", "image_urls",
 ]
+# 댓글은 별도 탭이다. 게시글 탭에 밀어 넣으면 한 글의 댓글 수십 개가 한 셀에
+# 뭉쳐 쓸 수 없게 된다.
+COMMENT_KEYS = ["id", "post_id", "author", "wid", "body", "posted_at"]
 PHOTO_KEYS = [
     "id", "author", "wid", "posted_at", "likes", "comments", "has_comment",
     "url_large", "url_medium", "url_small", "url_thumb",
@@ -494,11 +501,14 @@ class RawStore:
                 for r in (self.c.read(self.file_id, TAB_JOIN_ALIASES) or [])[1:]
                 if r and len(r) > 1 and _clean(r[0]) and _clean(r[1])
             },
+            "comments": rows_to_records(self.c.read(self.file_id, TAB_COMMENTS),
+                                        COMMENT_KEYS),
             "history": rows_to_records(self.c.read(self.file_id, TAB_HISTORY)),
         }
 
-    def save(self, *, posts=None, photos=None, members=None, banned=None,
-             join_aliases=None, period: Optional[tuple[int, int]] = None,
+    def save(self, *, posts=None, photos=None, comments=None, members=None,
+             banned=None, join_aliases=None,
+             period: Optional[tuple[int, int]] = None,
              now: Optional[datetime] = None) -> dict[str, int]:
         """기존 데이터와 upsert 병합해 저장하고 `_수집이력`에 한 줄 남긴다."""
         cur = self.load()
@@ -508,6 +518,11 @@ class RawStore:
 
         self.c.write(self.file_id, TAB_POSTS, records_to_rows(merged_posts, POST_KEYS))
         self.c.write(self.file_id, TAB_PHOTOS, records_to_rows(merged_photos, PHOTO_KEYS))
+        merged_comments = cur["comments"]
+        if comments is not None:
+            merged_comments = upsert(cur["comments"], comments, "id")
+            self.c.write(self.file_id, TAB_COMMENTS,
+                         records_to_rows(merged_comments, COMMENT_KEYS))
         if members is not None:
             self.c.write(self.file_id, TAB_MEMBERS,
                          records_to_rows(merged_members, MEMBER_KEYS))
@@ -531,7 +546,7 @@ class RawStore:
                 self.c.append(self.file_id, TAB_HISTORY, [row])
 
         return {"게시글": len(merged_posts), "사진": len(merged_photos),
-                "멤버": len(merged_members)}
+                "댓글": len(merged_comments), "멤버": len(merged_members)}
 
     def save_field_report(self, report: dict) -> None:
         """API 응답 요약을 `_원본필드` 탭에 덮어쓴다 (진단용, 매 수집 최신으로 교체).

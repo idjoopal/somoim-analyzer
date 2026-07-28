@@ -393,6 +393,111 @@ def summarize_body_lengths(raw_items: list[dict], key: str = "c") -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 상세 조회 — 목록이 주지 않는 본문 전문·첨부 이미지·댓글
+#
+# 목록 API는 본문을 미리보기로 자르고 댓글은 개수(`rn`)만 준다. 잘린 본문은
+# 참석자 추출·출사일 추론·가입인사 매핑의 **입력**이라, 절반만 보고 판단하면
+# 손으로 보정할 거리가 그만큼 늘어난다.
+#
+# 여기서는 `fetch`를 주입받는다. 실제 API 주소·필드명에 매이지 않으므로
+# 네트워크 없이 테스트할 수 있고, 주소가 바뀌어도 이 로직은 그대로다.
+# ═══════════════════════════════════════════════════════════════
+
+DETAIL_CATS = ("A", "E")   # 공지(출사일 추론) + 후기(참석자 추출)
+DETAIL_WORKERS = 4         # 비공식 API라 낮게
+
+
+def enrich_posts(
+    posts: list[dict],
+    fetch: Callable[[str], dict],
+    cats: tuple[str, ...] = DETAIL_CATS,
+    known_full: Optional[set] = None,
+    progress: ProgressFn = None,
+    now: Optional[datetime] = None,
+    workers: int = DETAIL_WORKERS,
+) -> tuple[int, list[dict]]:
+    """상세를 받아 본문을 전문으로 교체하고 이미지·댓글을 모은다.
+
+    `fetch(post_id)`는 **우리 형식**으로 정규화된 dict를 돌려준다:
+    `{"body": str, "image_urls": [str], "comments": [{...}]}`. 소모임 응답을
+    이 모양으로 옮기는 일은 `fetch_post_detail`이 맡는다 — 바뀔 수 있는 부분을
+    한 곳에 몰아 두는 것이 목적이다.
+
+    Args:
+        cats: 상세를 받을 카테고리. 참석자는 후기에서만, 출사일은 공지에서만
+            뽑으므로 이 둘이면 정확도 이득의 거의 전부를 얻는다.
+        known_full: 이미 상세를 받아 둔 글 id. raw는 id 기준 upsert라 한 번
+            받아 두면 재수집 때 다시 받을 이유가 없다.
+
+    Returns:
+        `(본문을 교체한 건수, 댓글 레코드 목록)`. posts는 제자리에서 수정된다.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    done = {str(i) for i in (known_full or set())}
+    targets = [p for p in posts
+               if p.get("cat") in cats and str(p.get("id")) not in done
+               and not _clean_str(p.get("detail_at"))]
+    if not targets:
+        _emit(progress, "상세 조회: 새로 받을 글 없음", 0.5)
+        return 0, []
+
+    stamp = (now or datetime.now()).isoformat(sep=" ", timespec="seconds")
+    total, filled = len(targets), 0
+    comments: list[dict] = []
+
+    def one(p):
+        # 한 글이 실패해도 수집 전체를 죽이지 않는다 — 잘린 본문이라도 남긴다.
+        try:
+            return p, fetch(str(p.get("id")))
+        except Exception:  # noqa: BLE001
+            return p, None
+
+    _emit(progress, f"상세 조회 0/{total}…", 0.4)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for i, (p, detail) in enumerate(pool.map(one, targets), 1):
+            if i % 20 == 0 or i == total:
+                _emit(progress, f"상세 조회 {i}/{total}…", 0.4 + 0.15 * i / total)
+            if not detail:
+                continue
+            body = _clean_str(detail.get("body"))
+            if body and len(body) >= len(_clean_str(p.get("body"))):
+                p["body"] = body
+                filled += 1
+            urls = [str(u).strip() for u in (detail.get("image_urls") or []) if str(u).strip()]
+            if urls:
+                p["image_urls"] = ", ".join(urls)
+            p["detail_at"] = stamp
+            comments.extend(_comment_records(detail.get("comments"), p.get("id")))
+
+    _emit(progress, f"상세 조회 완료 — 본문 {filled}건, 댓글 {len(comments)}건", 0.55)
+    return filled, comments
+
+
+def _clean_str(v) -> str:
+    return "" if v is None else str(v).strip()
+
+
+def _comment_records(raw, post_id) -> list[dict]:
+    """댓글을 `COMMENT_KEYS` 모양으로. `post_id`를 붙이는 것이 핵심이다."""
+    out = []
+    for c in raw or []:
+        if not isinstance(c, dict):
+            continue
+        cid = _clean_str(c.get("id"))
+        if not cid:
+            continue
+        out.append({
+            "id": cid, "post_id": str(post_id),
+            "author": _clean_str(c.get("author")),
+            "wid": _clean_str(c.get("wid")),
+            "body": _clean_str(c.get("body")),
+            "posted_at": c.get("posted_at"),
+        })
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
 # 게시글 수집
 # ═══════════════════════════════════════════════════════════════
 
