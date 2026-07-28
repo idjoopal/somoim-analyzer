@@ -26,7 +26,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
-from .collector import ALL_CATS, LEFT_MEMBER, NOT_A_NAME
+from .collector import ALL_CATS, LEFT_MEMBER, NOT_A_NAME, OUTING_CATS
 
 # ── 파일·탭 이름 (고정 — URL을 붙여넣지 않고 이름으로 찾는다) ──
 RAW_TITLE = "다감노_raw"
@@ -293,6 +293,9 @@ def apply_corrections(posts: list[dict], corrections: dict) -> dict[str, int]:
         if fix:
             if "category" in fix:
                 p["category"] = fix["category"]
+                # 카테고리를 고치면 출사 여부도 따라가야 한다. 안 그러면
+                # `일반공지`로 바꿔도 출사로 계속 집계된다.
+                p["is_outing"] = fix["category"] in OUTING_CATS
             if "outing_date" in fix:
                 p["outing_date"] = fix["outing_date"]
             if "is_canceled" in fix:
@@ -406,6 +409,7 @@ GUIDE_ROWS: list[list[str]] = [
     [""],
     ["■ ③ 공지보정 — 출사 공지의 카테고리·날짜가 자동 판단으로 안 잡힐 때"],
     ["  · 카테고리   " + " / ".join(ALL_CATS)],
+    ["                어느 것도 아닌 전체 공지라면 `일반공지`를 고르세요 — 출사 집계에서 빠집니다"],
     ["  · 출사일     YYYY-MM-DD (예: 2026-03-14). 공지 작성일이 아니라 실제 출사한 날"],
     ["  · 취소       출사가 취소됐으면 TRUE"],
     ["  · 제외       출사 공지가 아니거나 집계에서 빼야 하면 TRUE"],
@@ -446,7 +450,8 @@ HEADER_NOTES: dict[str, dict[int, str]] = {
     TAB_POST_FIX: {
         0: "공지 게시글 id. 보정을 붙이는 열쇠이므로 고치지 마세요.",
         1: "공지 제목. 앱이 채운 참고값입니다.",
-        2: "출사 카테고리: " + " / ".join(ALL_CATS),
+        2: "카테고리: " + " / ".join(ALL_CATS) + "\n"
+           "어느 것도 아닌 전체 공지는 `일반공지` — 출사 집계에서 빠집니다.",
         3: "실제 출사한 날짜 YYYY-MM-DD (예: 2026-03-14). 공지 작성일이 아닙니다.",
         4: "출사가 취소됐으면 TRUE.",
         5: "출사 공지가 아니거나 집계에서 빼야 하면 TRUE.",
@@ -559,22 +564,39 @@ def display_name(nick, real_by_nick: Optional[dict] = None) -> str:
     return f"{n}({real})" if real and real != n else n
 
 
-def relabel_attendees(posts: list[dict],
-                      real_by_nick: Optional[dict] = None) -> list[dict]:
-    """표시용 **사본** — `attendees`를 `닉네임(실명)`으로 바꾼다.
+# 표시용으로 `닉네임(실명)`으로 바꿀 필드. 스칼라와 목록을 나눠 둔다.
+_NAME_FIELDS = ("author", "mn")
+_NAME_LIST_FIELDS = ("attendees",)
 
-    참석 횟수·선호 카테고리·첫 등장이 모두 `attendees`에서 파생되므로, 여기
-    한 곳만 바꾸면 표·랭킹·엑셀이 한꺼번에 병기된다. 원본을 건드리면 매칭
-    키가 깨지므로 **사본**을 돌려준다.
+
+def relabel_names(records: list[dict],
+                  real_by_nick: Optional[dict] = None) -> list[dict]:
+    """표시용 **사본** — 이름을 전부 `닉네임(실명)`으로.
+
+    게시글·사진·멤버 어디에나 쓴다. 참석 횟수·업로더 랭킹·선호 카테고리가
+    모두 이 필드들에서 파생되므로 여기 한 곳만 바꾸면 표·엑셀이 한꺼번에 따라온다.
+
+    원본 값은 `_raw_<필드>`에 남긴다 — 동명이인 마킹처럼 **표시가 아니라
+    동일성 판정**에 쓰는 곳이 있어서, 그쪽은 계속 원래 닉네임을 봐야 한다.
+    원본 리스트는 건드리지 않는다(매칭 키가 깨진다).
     """
     if not real_by_nick:
-        return posts
+        return records
     out = []
-    for p in posts or []:
-        att = p.get("attendees")
-        if att:
-            p = {**p, "attendees": [display_name(n, real_by_nick) for n in att]}
-        out.append(p)
+    for r in records or []:
+        changed = {}
+        for f in _NAME_FIELDS:
+            v = r.get(f)
+            if v:
+                shown = display_name(v, real_by_nick)
+                if shown != v:
+                    changed[f] = shown
+                    changed[f"_raw_{f}"] = v
+        for f in _NAME_LIST_FIELDS:
+            v = r.get(f)
+            if v:
+                changed[f] = [display_name(n, real_by_nick) for n in v]
+        out.append({**r, **changed} if changed else r)
     return out
 
 

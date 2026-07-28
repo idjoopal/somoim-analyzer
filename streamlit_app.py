@@ -1196,6 +1196,15 @@ def _tab_users(posts: list[dict], photos: list[dict]) -> None:
         st.info("데이터가 없습니다.")
 
 
+def _raw_nick(m: dict) -> str:
+    """표시용으로 실명이 붙기 전의 닉네임. **동일성 판정에는 이쪽을 쓴다.**"""
+    return m.get("_raw_mn") or m.get("mn") or ""
+
+
+def display_of(m: dict) -> str:
+    return m.get("mn") or ""
+
+
 def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
                   duplicates: set[str] | None = None,
                   months: list[int] | None = None) -> None:
@@ -1204,7 +1213,9 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
         st.info("멤버 정보가 없습니다. 사이드바의 **API 수집**으로 받아오면 이 탭이 채워집니다.")
         return
 
-    duplicates = duplicates or find_duplicate_member_names(members)
+    # 표시용으로 실명이 붙은 members가 들어오므로 원래 닉네임으로 되돌려 센다.
+    duplicates = duplicates or find_duplicate_member_names(
+        [{"mn": _raw_nick(m)} for m in members])
     months = months or []
     posts_A = [p for p in posts if p.get("cat") == "A"]
     active_authors = ({p.get("author", "") for p in posts}
@@ -1235,10 +1246,13 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
     if duplicates:
         dup_rows = []
         for mn in sorted(duplicates):
-            same = [m for m in members if m.get("mn") == mn]
+            # 동명이인 판정은 **원래 닉네임**으로 한다. 실명을 병기하면 두 사람이
+            # 서로 다른 이름이 되지만, 후기 본문에는 여전히 닉네임만 적히므로
+            # 보고서에서 합쳐 집계되는 문제는 그대로다 — 경고는 유지돼야 한다.
+            same = [m for m in members if _raw_nick(m) == mn]
             for m in same:
                 dup_rows.append({
-                    "닉네임": f"⚠️ {mn}",
+                    "닉네임": f"⚠️ {display_of(m)}",
                     "mid": m.get("mid", ""),
                     "가입일": m["joined_at"].strftime("%Y-%m-%d") if m.get("joined_at") else "-",
                     "마지막 방문": m["last_visit"].strftime("%Y-%m-%d") if m.get("last_visit") else "-",
@@ -1251,7 +1265,8 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
     st.markdown(f"#### 유령 멤버 ({len(ghosts)}명)")
     if ghosts:
         gdf = pd.DataFrame([{
-            "닉네임": (f"⚠️ {m['mn']}" if m["mn"] in duplicates else m["mn"]),
+            "닉네임": (f"⚠️ {display_of(m)}" if _raw_nick(m) in duplicates
+                     else display_of(m)),
             "가입일": m["joined_at"].strftime("%Y-%m-%d") if m.get("joined_at") else "-",
             "마지막 방문": m["last_visit"].strftime("%Y-%m-%d") if m.get("last_visit") else "-",
             "OS": m.get("os") or "",
@@ -1441,11 +1456,12 @@ def render_sidebar(stores, analysis: dict | None) -> None:
                 analysis["history"], analysis["posts"], analysis["photos"])
             if rng:
                 tag = period_tag(*rng)
-                from core.store import relabel_attendees
+                from core.store import relabel_names
+                real = analysis.get("real_names")
                 xlsx = build_excel(
-                    relabel_attendees(analysis["posts"], analysis.get("real_names")),
-                    analysis["photos"], rng[0], rng[1],
-                    members=analysis["members"],
+                    relabel_names(analysis["posts"], real),
+                    relabel_names(analysis["photos"], real), rng[0], rng[1],
+                    members=relabel_names(analysis["members"], real),
                     resolution=analysis["resolution"],
                 )
                 st.download_button(
@@ -1583,11 +1599,13 @@ def main() -> None:
     view = _period_picker(full)
     st.session_state["_view_range"] = view
     posts, photos = slice_period(analysis, *view)
-    from core.store import relabel_attendees
+    from core.store import relabel_names
+    real = analysis.get("real_names")
     render_results(view[0], view[1],
-                   relabel_attendees(posts, analysis.get("real_names")),
-                   photos, analysis["master"],
-                   members=analysis["members"], applied=analysis["applied"])
+                   relabel_names(posts, real), relabel_names(photos, real),
+                   analysis["master"],
+                   members=relabel_names(analysis["members"], real),
+                   applied=analysis["applied"])
 
 
 

@@ -55,7 +55,9 @@ RAW_CATS = ["1:1인물출사", "1:1인물", "인물", "인풍", "풍경", "GN", 
 CAT_NORMALIZE = {"1:1인물": "인물", "1:1인물출사": "인물", "인풍": "인물&풍경"}
 
 OUTING_CATS     = ["인물", "인물&풍경", "풍경", "GN"]
-NON_OUTING_CATS = ["보정", "문화"]
+# `일반공지`는 제목 태그로 오지 않는다 — 어느 카테고리에도 안 걸리는 공지를
+# 사람이 보정에서 지정하는 값이다. 출사가 아니므로 집계에서 빠진다.
+NON_OUTING_CATS = ["보정", "문화", "일반공지"]
 ALL_CATS        = OUTING_CATS + NON_OUTING_CATS
 
 CAT_RX    = re.compile(r"\[(" + "|".join(re.escape(c) for c in RAW_CATS) + r")\]")
