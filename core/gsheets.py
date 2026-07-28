@@ -29,6 +29,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import unicodedata
 from typing import Optional
 
 MIME_SHEET = "application/vnd.google-apps.spreadsheet"
@@ -175,7 +176,37 @@ class GoogleSheetsStore:
         except Exception as e:  # noqa: BLE001
             raise GSheetsError(_explain(e, f"'{title}' 찾기")) from e
         files = res.get("files") or []
-        return files[0]["id"] if files else None
+        if files:
+            return files[0]["id"]
+        return self._find_by_normalized_name(title)
+
+    def _find_by_normalized_name(self, title: str) -> Optional[str]:
+        """이름 정규화까지 맞춰 한 번 더 찾는다.
+
+        Drive의 `name = '…'`는 바이트 단위 비교라, **맥에서 만든 이름은 자소가
+        분리(NFD)돼 저장되어 NFC로 쓴 질의에 걸리지 않는다.** 겉보기에 똑같은
+        이름인데 "파일이 없다"가 되는 흔한 함정이라 폴백을 둔다.
+        """
+        want = unicodedata.normalize("NFC", str(title)).strip().casefold()
+        for name, fid in self.list_spreadsheets():
+            if unicodedata.normalize("NFC", name).strip().casefold() == want:
+                return fid
+        return None
+
+    def list_spreadsheets(self) -> list[tuple[str, str]]:
+        """폴더 안 스프레드시트의 `(이름, id)`. 실패하면 빈 목록 (진단용이라 죽지 않는다)."""
+        clauses = [f"mimeType = '{MIME_SHEET}'", "trashed = false"]
+        if self.folder_id:
+            clauses.append(f"'{self.folder_id}' in parents")
+        try:
+            res = self._service.files().list(
+                q=" and ".join(clauses), fields="files(id,name)",
+                orderBy="createdTime", pageSize=50,
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+            ).execute()
+        except Exception:  # noqa: BLE001
+            return []
+        return [(f.get("name", ""), f["id"]) for f in (res.get("files") or [])]
 
     def create_spreadsheet(self, title: str) -> str:
         """빈 스프레드시트를 만들고 id를 돌려준다 (업로드 변환이 아니라 신규 생성)."""
@@ -210,8 +241,22 @@ class GoogleSheetsStore:
                 f"**해결 방법** — 구글 드라이브에서 폴더"
                 f"{f'(`{self.folder_id}`)' if self.folder_id else ''} 안에 "
                 f"빈 스프레드시트를 만들고 이름을 정확히 **`{title}`** 로 지정하세요. "
-                "앱이 그 파일을 찾아 그대로 사용합니다(탭은 자동으로 만듭니다)."
+                "앱이 그 파일을 찾아 그대로 사용합니다(탭은 자동으로 만듭니다).\n\n"
+                + self._folder_contents_hint()
             ) from e
+
+    def _folder_contents_hint(self) -> str:
+        """폴더에 실제로 뭐가 있는지 보여 준다 — 뒤에 붙은 공백 하나까지 눈에 보이게.
+
+        "만들었는데 못 찾는다"의 대부분은 이름 차이다. 목록을 보여 주면
+        `다감노_raw ` 같은 것이 즉시 드러난다.
+        """
+        found = self.list_spreadsheets()
+        if not found:
+            return ("폴더에서 스프레드시트를 하나도 못 찾았습니다. `folder_id`가 맞는지, "
+                    "그 폴더가 서비스 계정에 공유돼 있는지 확인하세요.")
+        names = "\n".join(f"  · `{n}`" for n, _ in found[:20])
+        return f"참고 — 이 폴더에서 앱이 보고 있는 스프레드시트:\n{names}"
 
     # ── 공유 ────────────────────────────────────────────────────
     def share_anyone_reader(self, file_id: str) -> None:
@@ -355,21 +400,27 @@ class SheetsClient:
                 spreadsheetId=file_id, range=a1_range(tab),
             ).execute()
         except Exception as e:  # noqa: BLE001
-            if _status_of(e) == 400:      # 존재하지 않는 탭
+            if _is_missing_tab(e):        # 존재하지 않는 탭 = 빈 탭으로 취급
                 return []
             raise GSheetsError(_explain(e, f"'{tab}' 읽기")) from e
         return res.get("values") or []
 
     # ── 쓰기 ────────────────────────────────────────────────────
-    def clear(self, file_id: str, tab: str) -> None:
+    def clear(self, file_id: str, tab: str) -> bool:
+        """탭을 비운다. 탭이 **없었으면** False (호출부가 만들 수 있게 알린다).
+
+        예전에는 여기서 400을 조용히 삼켰다. 그러면 "탭이 없다"는 정확한 진단이
+        사라지고, 바로 다음 `_update`가 구글 원문 영어로 죽는다.
+        """
         try:
             self._service.spreadsheets().values().clear(
                 spreadsheetId=file_id, range=a1_range(tab), body={},
             ).execute()
         except Exception as e:  # noqa: BLE001
-            if _status_of(e) == 400:
-                return
+            if _is_missing_tab(e):
+                return False
             raise GSheetsError(_explain(e, f"'{tab}' 비우기")) from e
+        return True
 
     def write(self, file_id: str, tab: str, rows: list[list]) -> None:
         """탭을 rows로 **완전히 교체**한다 (기존 내용 삭제 후 기록).
@@ -377,12 +428,13 @@ class SheetsClient:
         행이 줄어드는 경우까지 반영하려면 먼저 비워야 한다. 페이로드가 크면
         `chunk_rows`로 나눠 여러 번 보낸다.
         """
-        self.clear(file_id, tab)
+        if not self.clear(file_id, tab):
+            self.ensure_tabs(file_id, [tab])       # 없으면 만들고 계속 간다
         if not rows:
             return
         start = 1
         for chunk in chunk_rows(rows):
-            self._update(file_id, a1_range(tab, start), chunk, f"'{tab}' 쓰기")
+            self._write_chunk(file_id, tab, a1_range(tab, start), chunk)
             start += len(chunk)
 
     def append(self, file_id: str, tab: str, rows: list[list]) -> None:
@@ -390,21 +442,49 @@ class SheetsClient:
         if not rows:
             return
         for chunk in chunk_rows(rows):
-            try:
-                self._service.spreadsheets().values().append(
-                    spreadsheetId=file_id, range=a1_range(tab),
-                    valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-                    body={"values": chunk},
-                ).execute()
-            except Exception as e:  # noqa: BLE001
-                raise GSheetsError(_explain(e, f"'{tab}' 추가")) from e
+            self._retry_after_ensure(
+                file_id, tab, lambda c=chunk: self._append_once(file_id, tab, c),
+                f"'{tab}' 추가")
+
+    # ── 탭 자가 보장 ────────────────────────────────────────────
+    #
+    # 탭 생성이 `open_stores` 한 곳에만 있으면, 그 결과가 캐시에 갇힌 사이
+    # 시트 쪽이 바뀌었을 때 이후 모든 쓰기가 실패한다. 전제 조건은 그것을
+    # 필요로 하는 쪽이 직접 지키는 편이 낫다.
+    def _retry_after_ensure(self, file_id: str, tab: str, call, action: str) -> None:
+        """탭이 없어 실패하면 탭을 만들고 **한 번만** 다시 시도한다."""
+        try:
+            call()
+            return
+        except Exception as e:  # noqa: BLE001
+            if not _is_missing_tab(e):
+                raise GSheetsError(_explain(e, action)) from e
+        self.ensure_tabs(file_id, [tab])
+        try:
+            call()
+        except Exception as e:  # noqa: BLE001 — 두 번째는 그대로 올린다 (루프 방지)
+            raise GSheetsError(_explain(e, action)) from e
+
+    def _write_chunk(self, file_id: str, tab: str, rng: str, rows: list[list]) -> None:
+        self._retry_after_ensure(
+            file_id, tab, lambda: self._update_once(file_id, rng, rows), f"'{tab}' 쓰기")
+
+    def _update_once(self, file_id: str, rng: str, rows: list[list]) -> None:
+        self._service.spreadsheets().values().update(
+            spreadsheetId=file_id, range=rng,
+            valueInputOption="RAW", body={"values": rows},
+        ).execute()
+
+    def _append_once(self, file_id: str, tab: str, rows: list[list]) -> None:
+        self._service.spreadsheets().values().append(
+            spreadsheetId=file_id, range=a1_range(tab),
+            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+            body={"values": rows},
+        ).execute()
 
     def _update(self, file_id: str, rng: str, rows: list[list], action: str) -> None:
         try:
-            self._service.spreadsheets().values().update(
-                spreadsheetId=file_id, range=rng,
-                valueInputOption="RAW", body={"values": rows},
-            ).execute()
+            self._update_once(file_id, rng, rows)
         except Exception as e:  # noqa: BLE001
             raise GSheetsError(_explain(e, action)) from e
 
@@ -470,6 +550,16 @@ def _build_service(credentials_info: dict, api: str = "drive"):
     return build(name, version, credentials=creds, cache_discovery=False)
 
 
+def _is_missing_tab(exc: Exception) -> bool:
+    """그 이름의 탭이 없어서 난 오류인가.
+
+    Sheets API는 없는 탭을 400 `Unable to parse range: '게시글'!A1`로 돌려준다.
+    "범위 문법이 틀렸다"처럼 읽히지만 실제 뜻은 **탭이 없다**이다.
+    """
+    return (_status_of(exc) == 400
+            and "unable to parse range" in _detail_of(exc).lower())
+
+
 def _explain(exc: Exception, action: str) -> str:
     """API 예외를 사용자가 조치할 수 있는 한국어 메시지로.
 
@@ -506,4 +596,9 @@ def _explain(exc: Exception, action: str) -> str:
     if status == 404:
         return (f"{action} 실패 — 대상을 찾을 수 없습니다 (HTTP 404). "
                 f"folder_id와 공유 설정을 확인하세요.\n\n원본: {detail}")
+    if _is_missing_tab(exc):
+        return (f"{action} 실패 — **그 이름의 탭이 시트에 없습니다.** "
+                "앱이 탭을 만들어 다시 시도했는데도 실패했다면, 시트가 열려 있어 "
+                "잠겼거나 서비스 계정에 편집 권한이 없을 수 있습니다.\n\n"
+                f"원본: {detail}")
     return f"{action} 실패: {detail}"

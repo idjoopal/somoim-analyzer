@@ -635,10 +635,16 @@ class CorrectionStore:
         return n
 
 
-def open_stores(drive_store, client) -> tuple[RawStore, CorrectionStore]:
-    """폴더에서 두 파일을 이름으로 찾고(없으면 생성) 스토어를 돌려준다."""
-    raw_id, _ = drive_store.find_or_create(RAW_TITLE)
-    fix_id, _ = drive_store.find_or_create(CORRECTION_TITLE)
+def open_stores(drive_store, client, raw_file_id=None,
+                correction_file_id=None) -> tuple[RawStore, CorrectionStore]:
+    """폴더에서 두 파일을 이름으로 찾고(없으면 생성) 스토어를 돌려준다.
+
+    파일 id를 직접 주면 이름 탐색을 건너뛴다. 이름 매칭은 글자 하나(뒤에 붙은
+    공백, 자소 분리)만 달라도 "파일이 없다 → 만들려다 403"으로 나타나므로,
+    한 번 자리를 잡은 뒤에는 id로 고정하는 편이 안전하다.
+    """
+    raw_id = raw_file_id or drive_store.find_or_create(RAW_TITLE)[0]
+    fix_id = correction_file_id or drive_store.find_or_create(CORRECTION_TITLE)[0]
     raw, fix = RawStore(client, raw_id), CorrectionStore(client, fix_id)
     raw.ensure()
     fix.ensure()

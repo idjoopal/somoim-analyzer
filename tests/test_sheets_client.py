@@ -3,6 +3,8 @@
 `tests/test_gsheets.py`의 FakeDrive 패턴을 Sheets values API로 확장한 것.
 """
 
+import json
+
 import pytest
 
 from core.gsheets import (
@@ -11,6 +13,7 @@ from core.gsheets import (
     GoogleSheetsStore,
     GSheetsError,
     SheetsClient,
+    _is_missing_tab,
     a1_range,
     chunk_rows,
 )
@@ -73,41 +76,63 @@ class FakeReq:
 
 
 class FakeHttpError(Exception):
-    """googleapiclient.errors.HttpError 흉내 — `.resp.status`만 있으면 된다."""
+    """googleapiclient.errors.HttpError 흉내 — `.resp.status` + JSON `content`."""
 
-    def __init__(self, status):
+    def __init__(self, status, message="boom"):
         super().__init__(f"HTTP {status}")
         self.resp = type("R", (), {"status": status})()
+        self.content = json.dumps(
+            {"error": {"code": status, "message": message}}).encode()
+
+
+def missing_tab_error(tab: str) -> FakeHttpError:
+    """구글이 없는 탭에 돌려주는 실제 응답 — 400 + "Unable to parse range"."""
+    return FakeHttpError(400, f"Unable to parse range: '{tab}'!A1")
+
+
+def _tab_of(rng: str) -> str:
+    return rng.split("'")[1].replace("''", "'")
 
 
 class FakeValues:
+    """없는 탭을 건드리면 400을 낸다 — 실제 API와 같아야 자가치유가 검증된다."""
+
     def __init__(self, parent):
         self.p = parent
+
+    def _require(self, tab):
+        return None if tab in self.p.tabs else missing_tab_error(tab)
 
     def get(self, spreadsheetId=None, range=None):  # noqa: A002
         if self.p.read_error:
             return FakeReq(None, self.p.read_error)
-        tab = range.split("'")[1].replace("''", "'")
-        return FakeReq({"values": self.p.tabs.get(tab, [])})
+        tab = _tab_of(range)
+        return FakeReq({"values": self.p.tabs.get(tab, [])}, self._require(tab))
 
     def update(self, spreadsheetId=None, range=None, valueInputOption=None, body=None):  # noqa: A002
+        tab = _tab_of(range)
+        if (err := self._require(tab)):
+            return FakeReq(None, err)
         self.p.updates.append({"range": range, "rows": body["values"],
                                "valueInputOption": valueInputOption})
-        tab = range.split("'")[1].replace("''", "'")
-        self.p.tabs.setdefault(tab, []).extend(body["values"])
+        self.p.tabs[tab].extend(body["values"])
         return FakeReq({})
 
     def append(self, spreadsheetId=None, range=None, valueInputOption=None,  # noqa: A002
                insertDataOption=None, body=None):
+        tab = _tab_of(range)
+        if (err := self._require(tab)):
+            return FakeReq(None, err)
         self.p.appends.append({"range": range, "rows": body["values"]})
-        tab = range.split("'")[1].replace("''", "'")
-        self.p.tabs.setdefault(tab, []).extend(body["values"])
+        self.p.tabs[tab].extend(body["values"])
         return FakeReq({})
 
     def clear(self, spreadsheetId=None, range=None, body=None):  # noqa: A002
         if self.p.clear_error:
             return FakeReq(None, self.p.clear_error)
-        tab = range.split("'")[1].replace("''", "'")
+        tab = _tab_of(range)
+        if (err := self._require(tab)):
+            return FakeReq(None, err)
         self.p.cleared.append(tab)
         self.p.tabs[tab] = []
         return FakeReq({})
@@ -276,7 +301,14 @@ def test_read_returns_rows():
 
 def test_read_missing_tab_returns_empty_not_error():
     """없는 탭은 400이 오는데, 빈 값으로 다뤄야 첫 실행이 매끄럽다."""
-    assert client(read_error=FakeHttpError(400)).read(FILE_ID, "없는탭") == []
+    assert client(tabs={"게시글": []}).read(FILE_ID, "없는탭") == []
+
+
+def test_read_does_not_swallow_other_400s():
+    """탭 없음이 아닌 400까지 빈 값으로 뭉개면 진짜 오류가 조용히 사라진다."""
+    with pytest.raises(GSheetsError):
+        client(read_error=FakeHttpError(400, "Invalid value at 'data'")).read(
+            FILE_ID, "게시글")
 
 
 def test_read_real_error_is_raised():
@@ -334,6 +366,82 @@ def test_append_empty_is_noop():
 
 
 # ═══════════════════════════════════════════════════════════════
+# 탭 자가 보장
+#
+# 탭 생성이 "스토어를 열 때 한 번"에만 있으면, 그 결과가 캐시에 갇힌 사이
+# 시트 쪽이 바뀌었을 때 이후 모든 쓰기가 실패한다. 쓰기가 스스로 지켜야 한다.
+# ═══════════════════════════════════════════════════════════════
+
+def test_is_missing_tab_only_matches_the_range_parse_400():
+    assert _is_missing_tab(missing_tab_error("게시글"))
+    assert not _is_missing_tab(FakeHttpError(400, "Invalid value at 'data'"))
+    assert not _is_missing_tab(FakeHttpError(403, "Unable to parse range: 'x'!A1"))
+    assert not _is_missing_tab(Exception("plain"))       # 본문도 status도 없음
+
+
+def test_clear_reports_that_the_tab_was_missing():
+    """예전에는 여기서 400을 삼켜 진단이 사라지고 다음 호출이 죽었다."""
+    svc = FakeSheetsService(tabs={"게시글": [["a"]]})
+    c = SheetsClient({}, service=svc)
+    assert c.clear(FILE_ID, "게시글") is True
+    assert c.clear(FILE_ID, "없는탭") is False
+
+
+def test_write_creates_the_tab_it_needs():
+    """이것이 이번 버그의 핵심 — 탭이 없어도 쓰기가 성사돼야 한다."""
+    svc = FakeSheetsService()                       # 탭이 하나도 없는 새 시트
+    SheetsClient({}, service=svc).write(FILE_ID, "게시글", [["id"], ["p1"]])
+
+    added = [r["addSheet"]["properties"]["title"]
+             for b in svc.batch_updates for r in b["requests"] if "addSheet" in r]
+    assert "게시글" in added
+    assert svc.tabs["게시글"] == [["id"], ["p1"]]
+
+
+def test_append_creates_the_tab_it_needs():
+    svc = FakeSheetsService()
+    SheetsClient({}, service=svc).append(FILE_ID, "_수집이력", [["2026-07"]])
+    assert svc.tabs["_수집이력"] == [["2026-07"]]
+
+
+def test_retry_happens_only_once():
+    """탭을 만들었는데도 같은 오류면 그대로 올린다 — 무한 재시도는 안 된다."""
+    svc = FakeSheetsService(tabs={"게시글": []})
+
+    class NeverWorks(FakeValues):
+        def append(self, **kw):
+            svc.appends.append(kw)
+            return FakeReq(None, missing_tab_error("게시글"))
+
+    class S(FakeSpreadsheets):
+        def values(self):
+            return NeverWorks(svc)
+
+    svc.spreadsheets = lambda: S(svc)
+    with pytest.raises(GSheetsError):
+        SheetsClient({}, service=svc).append(FILE_ID, "게시글", [["a"]])
+    assert len(svc.appends) == 2                    # 최초 1 + 재시도 1
+
+
+def test_missing_tab_message_is_in_korean_and_actionable():
+    """구글 원문 "Unable to parse range"는 범위 문법 오류처럼 읽힌다."""
+    svc = FakeSheetsService(tabs={"게시글": []})
+
+    class NeverWorks(FakeValues):
+        def append(self, **kw):
+            return FakeReq(None, missing_tab_error("게시글"))
+
+    class S(FakeSpreadsheets):
+        def values(self):
+            return NeverWorks(svc)
+
+    svc.spreadsheets = lambda: S(svc)
+    with pytest.raises(GSheetsError, match="탭이 시트에 없습니다") as ei:
+        SheetsClient({}, service=svc).append(FILE_ID, "게시글", [["a"]])
+    assert "Unable to parse range" in str(ei.value)   # 원문도 남긴다
+
+
+# ═══════════════════════════════════════════════════════════════
 # find_or_create (Drive)
 # ═══════════════════════════════════════════════════════════════
 
@@ -342,7 +450,7 @@ class FakeFiles:
         self.p = parent
 
     def list(self, **kw):
-        self.p.list_kwargs = kw
+        self.p.list_calls.append(kw)
         if self.p.list_error:
             return FakeReq(None, self.p.list_error)
         return FakeReq({"files": self.p.found})
@@ -356,7 +464,12 @@ class FakeDrive:
     def __init__(self, found=None, list_error=None):
         self.found = found or []
         self.list_error = list_error
-        self.list_kwargs = self.create_kwargs = None
+        self.list_calls, self.create_kwargs = [], None
+
+    @property
+    def list_kwargs(self):
+        """이름으로 찾는 첫 질의 — 못 찾으면 정규화 폴백이 한 번 더 호출한다."""
+        return self.list_calls[0] if self.list_calls else None
 
     def files(self):
         return FakeFiles(self)
@@ -406,3 +519,88 @@ def test_find_by_name_picks_oldest_when_duplicated():
 def test_find_by_name_error_is_wrapped():
     with pytest.raises(GSheetsError):
         store(FakeDrive(list_error=FakeHttpError(403))).find_by_name("다감노_raw")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 이름이 미묘하게 다를 때 — "만들었는데 못 찾는다"의 대부분
+# ═══════════════════════════════════════════════════════════════
+
+class NameQueryDrive(FakeDrive):
+    """Drive처럼 `name = '…'` 절을 **정확히** 대조한다 (한 글자만 달라도 못 찾음)."""
+
+    def __init__(self, names, create_error=None):
+        super().__init__()
+        self.names = dict(names)                    # 이름 → id
+        self.create_error = create_error
+
+    def files(self):
+        outer = self
+
+        class F(FakeFiles):
+            def list(self, **kw):
+                outer.list_calls.append(kw)
+                q = kw["q"]
+                if "name = " in q:
+                    want = q.split("name = '")[1].split("'")[0]
+                    hit = outer.names.get(want)
+                    return FakeReq({"files": [{"id": hit, "name": want}] if hit else []})
+                return FakeReq({"files": [{"id": i, "name": n}
+                                          for n, i in outer.names.items()]})
+
+            def create(self, **kw):
+                return FakeReq({"id": "NEW_FILE_ID"}, outer.create_error)
+        return F(self)
+
+
+def test_mac_made_name_is_found_despite_unicode_decomposition():
+    """맥에서 만든 이름은 자소가 분리(NFD)돼 저장돼 NFC 질의에 안 걸린다."""
+    import unicodedata
+    nfd = unicodedata.normalize("NFD", "다감노_raw")
+    assert nfd != "다감노_raw"                        # 전제 확인
+    drive = NameQueryDrive({nfd: "FILE_NFD"})
+    assert store(drive).find_by_name("다감노_raw") == "FILE_NFD"
+
+
+def test_trailing_space_in_the_sheet_name_is_absorbed():
+    """이름 끝의 공백은 눈에 보이지도 않는다 — 그것 때문에 403을 내면 안 된다."""
+    drive = NameQueryDrive({"다감노_raw ": "FILE_SPACE"})
+    assert store(drive).find_by_name("다감노_raw") == "FILE_SPACE"
+
+
+def test_genuinely_different_name_shows_what_the_folder_has():
+    """비슷한 이름은 자동으로 못 고른다 — 대신 뭐가 있는지 보여 준다."""
+    drive = NameQueryDrive({"다감노_RAW_백업": "OTHER"}, create_error=_api_403_quota())
+    with pytest.raises(GSheetsError) as ei:
+        store(drive).find_or_create("다감노_raw")
+    assert "다감노_RAW_백업" in str(ei.value)         # 폴더에 실제로 있는 이름
+
+
+def test_create_failure_lists_what_the_folder_actually_has():
+    drive = FailingCreateDrive(_api_403_quota())
+    drive.found = []
+    with pytest.raises(GSheetsError) as ei:
+        GoogleSheetsStore({}, folder_id="FOLDER1",
+                          service=drive).find_or_create("다감노_raw")
+    assert "스프레드시트를 하나도 못 찾았습니다" in str(ei.value)
+
+
+def _api_403_quota():
+    err = FakeHttpError(403, "quota")
+    err.content = json.dumps({"error": {
+        "code": 403, "message": "quota",
+        "errors": [{"reason": "storageQuotaExceeded", "message": "quota"}]}}).encode()
+    return err
+
+
+class FailingCreateDrive(FakeDrive):
+    def __init__(self, error):
+        super().__init__(found=[])
+        self.error = error
+
+    def files(self):
+        outer = self
+
+        class F(FakeFiles):
+            def create(self, **kw):
+                return FakeReq(None, outer.error)
+        return F(self)
