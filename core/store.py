@@ -26,7 +26,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
-from .collector import LEFT_MEMBER, NOT_A_NAME
+from .collector import ALL_CATS, LEFT_MEMBER, NOT_A_NAME
 
 # ── 파일·탭 이름 (고정 — URL을 붙여넣지 않고 이름으로 찾는다) ──
 RAW_TITLE = "다감노_raw"
@@ -45,7 +45,8 @@ RAW_TABS = [TAB_POSTS, TAB_PHOTOS, TAB_MEMBERS, TAB_BANNED, TAB_JOIN_ALIASES,
 TAB_NAME_MAP = "이름매핑"
 TAB_POST_FIX = "공지보정"
 TAB_ATTENDEE_FIX = "참석자보정"
-CORRECTION_TABS = [TAB_NAME_MAP, TAB_POST_FIX, TAB_ATTENDEE_FIX]
+TAB_GUIDE = "_사용법"
+CORRECTION_TABS = [TAB_GUIDE, TAB_NAME_MAP, TAB_POST_FIX, TAB_ATTENDEE_FIX]
 
 # ── 컬럼 (헤더 행 = 이 순서) ──
 POST_KEYS = [
@@ -352,6 +353,103 @@ def missing_rows(existing_rows: list[list], candidate_rows: list[list]) -> list[
     return [r for r in candidate_rows if _clean(r[0]) not in have]
 
 
+# ═══════════════════════════════════════════════════════════════
+# 보정 시트 가이드
+#
+# 보정이 이 설계의 핵심인데, 정작 보정하는 화면에 설명이 없으면 아무도
+# 제대로 채울 수 없다. 설명은 세 겹으로 넣는다.
+#   ① `_사용법` 탭      — 전체 규칙
+#   ② 헤더 셀 메모      — 그 칸에 뭘 넣는지 (헤더 텍스트는 파싱 키라 못 바꿈)
+#   ③ 드롭다운          — 애초에 잘못 넣을 수 없게. 설명보다 이게 세다
+# ═══════════════════════════════════════════════════════════════
+
+GUIDE_ROWS: list[list[str]] = [
+    ["📕 다감노 보정 시트 사용법"],
+    [""],
+    ["이 시트는 사람이 채우는 곳입니다. 앱은 여기 값을 읽기만 하고,"],
+    ["빠진 항목을 새로 추가할 뿐 이미 적으신 값은 절대 건드리지 않습니다."],
+    ["→ 다시 수집해도, 다른 기간을 수집해도 보정은 그대로 유지됩니다."],
+    [""],
+    ["■ 공통 규칙"],
+    ["  · 빈칸 = \"아직 보정 안 함\". 비워 두면 앱의 자동 판단을 그대로 씁니다."],
+    ["  · 행을 지우지 마세요. 지워도 다음 수집 때 다시 추가됩니다."],
+    ["  · 회색 참고 열(제목·빈도)은 알아보기 쉬우라고 앱이 채워 둔 값입니다. 고쳐도 반영되지 않습니다."],
+    ["  · 첫 열(id·이름토큰)이 보정을 붙이는 열쇠입니다. 절대 고치지 마세요."],
+    ["  · 각 탭 헤더 칸에 마우스를 올리면 그 칸 설명이 뜹니다."],
+    [""],
+    ["■ 이름매핑 — 후기 본문에서 나온 이름이 멤버 명단과 안 맞을 때"],
+    ["  '처리' 칸에 셋 중 하나를 넣습니다 (드롭다운에서 고르세요)."],
+    ["  · 마스터 닉네임    같은 사람의 다른 표기일 때. 멤버 명단에 있는 닉네임 그대로"],
+    [f"  · {LEFT_MEMBER}         탈퇴한 멤버. 집계에서 빠집니다. \"탈퇴\"라고 써도 됩니다"],
+    [f"  · {NOT_A_NAME}         이름이 아님(조사·오탈자 등). \"노이즈\"·\"❌\"도 됩니다"],
+    ["  목록에 없는 새 닉네임도 직접 입력할 수 있습니다(경고만 뜹니다)."],
+    [""],
+    ["■ 공지보정 — 출사 공지의 카테고리·날짜가 자동 판단으로 안 잡힐 때"],
+    ["  · 카테고리   " + " / ".join(ALL_CATS)],
+    ["  · 출사일     YYYY-MM-DD (예: 2026-03-14). 공지 작성일이 아니라 실제 출사한 날"],
+    ["  · 취소       출사가 취소됐으면 TRUE"],
+    ["  · 제외       출사 공지가 아니거나 집계에서 빼야 하면 TRUE"],
+    ["  넷 중 채운 칸만 덮어씁니다. 카테고리만 고치고 싶으면 카테고리만 채우세요."],
+    [""],
+    ["■ 참석자보정 — 후기 본문에서 참석자를 못 뽑았거나 틀리게 뽑았을 때"],
+    ["  · 참석자     쉼표로 구분한 닉네임. 예: 원석사진, 나무, 바다"],
+    ["  · 여기에 적으면 본문에서 뽑은 결과를 통째로 대체합니다(더하지 않습니다)."],
+    ["  · 작성자도 참석했다면 작성자 닉네임을 함께 적어 주세요."],
+    [""],
+    ["■ 작업 순서"],
+    ["  ① 앱에서 수집  → 앱이 채울 후보 행을 이 시트에 추가"],
+    ["  ② 이 시트에서 빈칸 채우기"],
+    ["  ③ 앱에서 [새로고침] → 보정이 반영된 분석 결과"],
+    ["  다음부터는 ①을 다시 해도 ②가 유지되므로 ③만 누르면 됩니다."],
+]
+
+# 열 인덱스 → 헤더 셀 메모. 헤더 텍스트를 바꾸면 파싱이 깨지므로 메모로 붙인다.
+HEADER_NOTES: dict[str, dict[int, str]] = {
+    TAB_NAME_MAP: {
+        0: "후기 본문에서 나온 이름 표기. 보정을 붙이는 열쇠이므로 고치지 마세요.",
+        1: f"마스터 닉네임 / {LEFT_MEMBER}(탈퇴) / {NOT_A_NAME}(이름 아님) 중 하나.\n"
+           "비워 두면 '아직 보정 안 함'으로 봅니다.",
+        2: "이 표기가 나온 횟수. 앱이 채운 참고값입니다.",
+        3: "자유 메모. 앱은 읽지 않습니다.",
+    },
+    TAB_POST_FIX: {
+        0: "공지 게시글 id. 보정을 붙이는 열쇠이므로 고치지 마세요.",
+        1: "공지 제목. 앱이 채운 참고값입니다.",
+        2: "출사 카테고리: " + " / ".join(ALL_CATS),
+        3: "실제 출사한 날짜 YYYY-MM-DD (예: 2026-03-14). 공지 작성일이 아닙니다.",
+        4: "출사가 취소됐으면 TRUE.",
+        5: "출사 공지가 아니거나 집계에서 빼야 하면 TRUE.",
+        6: "자유 메모. 앱은 읽지 않습니다.",
+    },
+    TAB_ATTENDEE_FIX: {
+        0: "후기 게시글 id. 보정을 붙이는 열쇠이므로 고치지 마세요.",
+        1: "후기 제목. 앱이 채운 참고값입니다.",
+        2: "쉼표로 구분한 참석자 닉네임 (예: 원석사진, 나무).\n"
+           "본문에서 뽑은 결과를 통째로 대체합니다. 작성자도 참석했으면 함께 적으세요.",
+        3: "자유 메모. 앱은 읽지 않습니다.",
+    },
+}
+
+BOOL_CHOICES = ["TRUE", "FALSE"]
+
+
+def dropdowns(master_names=None) -> list[tuple[str, int, list[str]]]:
+    """(탭, 열 인덱스, 목록). 설명을 읽게 하는 것보다 잘못 넣을 수 없게 하는 게 낫다.
+
+    `이름매핑`의 목록은 멤버 명단이 바뀌면 달라지므로 `seed()` 때마다 갱신한다.
+    다만 목록에 없는 새 닉네임을 입력조차 못 하게 막으면 곤란하므로
+    `set_validation`은 `strict=False`(경고만)로 건다.
+    """
+    out: list[tuple[str, int, list[str]]] = []
+    names = sorted({str(n).strip() for n in (master_names or []) if str(n).strip()})
+    if names:
+        out.append((TAB_NAME_MAP, 1, names + [LEFT_MEMBER, NOT_A_NAME]))
+    out.append((TAB_POST_FIX, 2, list(ALL_CATS)))
+    out.append((TAB_POST_FIX, 4, BOOL_CHOICES))
+    out.append((TAB_POST_FIX, 5, BOOL_CHOICES))
+    return out
+
+
 def resolution_from_corrections(corrections: dict) -> dict[str, str]:
     """보정 시트의 이름매핑 → `annotate_attendees(resolution=...)` 형태.
 
@@ -467,14 +565,38 @@ class CorrectionStore:
     def __init__(self, client, file_id: str):
         self.c, self.file_id = client, file_id
 
-    def ensure(self) -> None:
-        """탭과 헤더를 만든다. 이미 내용이 있으면 헤더도 건드리지 않는다."""
+    def ensure(self, master_names=None) -> None:
+        """탭과 헤더를 만들고 안내를 갱신한다.
+
+        이미 내용이 있으면 헤더도 건드리지 않는다. 안내(사용법 탭·메모·드롭다운·
+        헤더 고정)는 사용자가 입력한 셀에 닿지 않으므로 매번 갱신한다.
+        """
         self.c.ensure_tabs(self.file_id, CORRECTION_TABS)
         for tab, cols in ((TAB_NAME_MAP, NAME_MAP_COLS),
                           (TAB_POST_FIX, POST_FIX_COLS),
                           (TAB_ATTENDEE_FIX, ATTENDEE_FIX_COLS)):
             if not self.c.read(self.file_id, tab):
                 self.c.write(self.file_id, tab, [cols])
+        self.write_guide(master_names)
+
+    def write_guide(self, master_names=None) -> None:
+        """사용법 탭·헤더 메모·드롭다운·헤더 고정.
+
+        서식은 부가 기능이라 실패해도 보정 자체를 막아서는 안 된다 —
+        구버전 시트나 권한 문제로 서식 요청이 거절돼도 조용히 넘어간다.
+        """
+        try:
+            ids = self.c.sheet_ids(self.file_id)
+            self.c.write(self.file_id, TAB_GUIDE, GUIDE_ROWS)
+            for tab, notes in HEADER_NOTES.items():
+                self.c.set_header_notes(self.file_id, tab, notes,
+                                        sheet_id=ids.get(tab))
+                self.c.freeze_header(self.file_id, tab, sheet_id=ids.get(tab))
+            for tab, col, values in dropdowns(master_names):
+                self.c.set_validation(self.file_id, tab, col, values,
+                                      sheet_id=ids.get(tab))
+        except Exception:  # noqa: BLE001
+            pass
 
     def load(self) -> dict:
         return parse_corrections(
@@ -483,11 +605,15 @@ class CorrectionStore:
             self.c.read(self.file_id, TAB_ATTENDEE_FIX),
         )
 
-    def seed(self, candidates: dict[str, list[list]]) -> dict[str, int]:
+    def seed(self, candidates: dict[str, list[list]],
+             master_names=None) -> dict[str, int]:
         """후보 중 시트에 없는 키만 append. 추가한 행 수를 탭별로 반환.
 
         append만 쓰므로 사용자가 편집 중인 셀을 덮어쓸 일이 없다.
+        `master_names`를 주면 이름 드롭다운 목록을 최신 멤버 명단으로 갱신한다.
         """
+        if master_names:
+            self.write_guide(master_names)
         added: dict[str, int] = {}
         for tab, rows in candidates.items():
             existing = self.c.read(self.file_id, tab)

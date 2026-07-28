@@ -9,7 +9,7 @@ from datetime import date, datetime
 import pytest
 
 from core.collector import (
-    LEFT_MEMBER, NOT_A_NAME,
+    ALL_CATS, LEFT_MEMBER, NOT_A_NAME,
     summarize_body_lengths, summarize_raw_fields,
 )
 from core.store import (
@@ -20,6 +20,7 @@ from core.store import (
     FIELD_COLS,
     TAB_ATTENDEE_FIX,
     TAB_FIELDS,
+    TAB_GUIDE,
     TAB_HISTORY,
     TAB_NAME_MAP,
     TAB_POST_FIX,
@@ -49,6 +50,19 @@ class FakeClient:
     def __init__(self, tabs=None):
         self.tabs = {k: [list(r) for r in v] for k, v in (tabs or {}).items()}
         self.cleared, self.appended = [], []
+        self.notes, self.validations, self.frozen = {}, [], []
+
+    def sheet_ids(self, file_id):
+        return {t: 100 + i for i, t in enumerate(self.tabs)}
+
+    def set_header_notes(self, file_id, tab, notes, sheet_id=None):
+        self.notes[tab] = dict(notes)
+
+    def set_validation(self, file_id, tab, col, values, strict=False, sheet_id=None):
+        self.validations.append((tab, col, list(values)))
+
+    def freeze_header(self, file_id, tab, sheet_id=None):
+        self.frozen.append(tab)
 
     def ensure_tabs(self, file_id, tabs):
         made = [t for t in tabs if t not in self.tabs]
@@ -415,6 +429,82 @@ def test_correction_store_ensure_writes_headers_once():
     c.tabs[TAB_NAME_MAP].append(["가나다", "정원석", 1, ""])
     CorrectionStore(c, "F").ensure()                 # 두 번째 호출
     assert len(c.tabs[TAB_NAME_MAP]) == 2            # 헤더로 덮어쓰지 않음
+
+
+# ═══════════════════════════════════════════════════════════════
+# 보정 시트 가이드 — 설명 없는 보정 시트는 채울 수가 없다
+# ═══════════════════════════════════════════════════════════════
+
+def test_ensure_creates_usage_tab_with_the_three_special_values():
+    c = FakeClient()
+    CorrectionStore(c, "F").ensure()
+
+    text = "\n".join(r[0] for r in c.tabs[TAB_GUIDE])
+    assert LEFT_MEMBER in text and NOT_A_NAME in text
+    assert "YYYY-MM-DD" in text                  # 출사일 형식
+    assert "빈칸" in text                         # 빈칸 = 아직 보정 안 함
+
+
+def test_ensure_notes_every_column_of_every_tab():
+    """설명 없는 칸이 하나라도 있으면 거기서 막힌다."""
+    c = FakeClient()
+    CorrectionStore(c, "F").ensure()
+
+    for tab, cols in ((TAB_NAME_MAP, NAME_MAP_COLS),
+                      (TAB_POST_FIX, POST_FIX_COLS),
+                      (TAB_ATTENDEE_FIX, ATTENDEE_FIX_COLS)):
+        assert sorted(c.notes[tab]) == list(range(len(cols))), tab
+        assert all(c.notes[tab].values()), tab
+        assert tab in c.frozen
+
+
+def test_ensure_without_members_still_offers_category_and_bool_dropdowns():
+    """멤버 명단은 수집 전엔 없지만 카테고리·TRUE/FALSE는 항상 고정이다."""
+    c = FakeClient()
+    CorrectionStore(c, "F").ensure()
+
+    by_col = {(t, col): v for t, col, v in c.validations}
+    assert by_col[(TAB_POST_FIX, 2)] == list(ALL_CATS)
+    assert by_col[(TAB_POST_FIX, 4)] == ["TRUE", "FALSE"]
+    assert (TAB_NAME_MAP, 1) not in by_col       # 목록이 비면 걸지 않는다
+
+
+def test_name_dropdown_lists_members_plus_special_values():
+    c = FakeClient()
+    CorrectionStore(c, "F").ensure(master_names={"정원석", "나무"})
+
+    values = dict(((t, col), v) for t, col, v in c.validations)[(TAB_NAME_MAP, 1)]
+    assert values == ["나무", "정원석", LEFT_MEMBER, NOT_A_NAME]
+
+
+def test_seed_refreshes_name_dropdown_with_current_members():
+    """멤버가 새로 들어오면 목록도 따라와야 한다 — 목록은 seed마다 갱신된다."""
+    c = FakeClient()
+    store = CorrectionStore(c, "F")
+    store.ensure(master_names={"정원석"})
+    c.validations.clear()
+
+    store.seed({TAB_NAME_MAP: [["가나다", "", 1, ""]]}, master_names={"정원석", "신입"})
+    assert dict(((t, col), v) for t, col, v in c.validations)[(TAB_NAME_MAP, 1)] == [
+        "신입", "정원석", LEFT_MEMBER, NOT_A_NAME]
+
+
+def test_guide_does_not_touch_user_filled_rows():
+    """안내를 갱신한다고 사람이 채운 값이 사라지면 안 된다."""
+    c = FakeClient({TAB_NAME_MAP: [NAME_MAP_COLS, ["가나다", "정원석", 1, "확인함"]]})
+    CorrectionStore(c, "F").ensure(master_names={"정원석"})
+    assert c.tabs[TAB_NAME_MAP][1] == ["가나다", "정원석", 1, "확인함"]
+
+
+def test_formatting_failure_never_blocks_corrections():
+    """서식은 부가 기능이다 — 실패해도 보정 시트 자체는 쓸 수 있어야 한다."""
+    class NoFormatting(FakeClient):
+        def sheet_ids(self, file_id):
+            raise RuntimeError("이 시트에는 서식 권한이 없다")
+
+    c = NoFormatting()
+    CorrectionStore(c, "F").ensure()
+    assert c.tabs[TAB_NAME_MAP] == [NAME_MAP_COLS]
 
 
 def test_pending_count_counts_unfilled_rows():

@@ -1481,8 +1481,10 @@ def _run_collection(raw_store, fix_store, start_ym: int, end_ym: int) -> None:
             annotate_attendees(posts, active_mns,
                                {**join_aliases,
                                 **_resolution_of(fix_store.load())})
-            added = fix_store.seed(correction_candidates(
-                posts, dict(collect_all_unresolved(posts)), fix_store.load()))
+            added = fix_store.seed(
+                correction_candidates(posts, dict(collect_all_unresolved(posts)),
+                                      fix_store.load()),
+                master_names=active_mns)
         except Exception as e:  # noqa: BLE001
             status.update(label="수집 실패", state="error")
             st.error("수집 중 오류가 발생했습니다. (API·네트워크·구글 권한 확인)")
