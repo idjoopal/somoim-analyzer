@@ -86,8 +86,22 @@ def default_title(period_tag_str: str) -> str:
     return f"다감노_{period_tag_str}_분석"
 
 
+def a1_tab(tab: str) -> str:
+    """탭 **전체**를 가리키는 범위 — `'탭이름'`.
+
+    셀을 붙이면(`'탭이름'!A1`) 구글은 딱 그 한 칸만 다룬다. 읽기·비우기에
+    그걸 쓰면 **헤더 한 글자만 읽히고 데이터는 안 보인다.** 쓰기는 A1에서
+    2차원 배열만큼 펼쳐지므로 멀쩡해 보여서, 저장은 되는데 못 읽는 상태가 된다.
+    """
+    return f"'{str(tab).replace(chr(39), chr(39) * 2)}'"
+
+
 def a1_range(tab: str, start_row: int = 1) -> str:
-    """`'탭이름'!A1` 형태의 A1 표기. 탭 이름의 작은따옴표는 두 번 써서 이스케이프."""
+    """`'탭이름'!A1` — **쓰기 시작 지점**을 가리키는 표기.
+
+    `values.update`는 여기서부터 준 배열만큼 펼쳐 쓴다. 읽기·비우기에는
+    쓰지 말 것 (`a1_tab` 참고).
+    """
     safe = str(tab).replace("'", "''")
     return f"'{safe}'!A{int(start_row)}"
 
@@ -397,7 +411,7 @@ class SheetsClient:
         """
         try:
             res = self._service.spreadsheets().values().get(
-                spreadsheetId=file_id, range=a1_range(tab),
+                spreadsheetId=file_id, range=a1_tab(tab),
             ).execute()
         except Exception as e:  # noqa: BLE001
             if _is_missing_tab(e):        # 존재하지 않는 탭 = 빈 탭으로 취급
@@ -414,7 +428,7 @@ class SheetsClient:
         """
         try:
             self._service.spreadsheets().values().clear(
-                spreadsheetId=file_id, range=a1_range(tab), body={},
+                spreadsheetId=file_id, range=a1_tab(tab), body={},
             ).execute()
         except Exception as e:  # noqa: BLE001
             if _is_missing_tab(e):
@@ -477,7 +491,7 @@ class SheetsClient:
 
     def _append_once(self, file_id: str, tab: str, rows: list[list]) -> None:
         self._service.spreadsheets().values().append(
-            spreadsheetId=file_id, range=a1_range(tab),
+            spreadsheetId=file_id, range=a1_tab(tab),
             valueInputOption="RAW", insertDataOption="INSERT_ROWS",
             body={"values": rows},
         ).execute()
