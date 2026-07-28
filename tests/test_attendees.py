@@ -208,101 +208,6 @@ def test_candidates_merge_same_token_across_sources():
 
 
 # ── 엑셀 번들 라운드트립 (no network) ────────────────────────────
-def test_excel_round_trip(tmp_path):
-    """build_excel(master_records=...) → load_excel_bundle 으로 posts/photos/master 무손실 복원."""
-    from core.excel_builder import build_excel, load_excel_bundle
-
-    posts = [{
-        "id": "p1", "author": "닉", "wid": "w1", "title": "후기",
-        "body": "정원석 이하얀", "outing_date": None,
-        "posted_at": datetime(2026, 6, 7, 12, 34, 56),
-        "cat": "E", "cat_label": "후기", "category": None,
-        "is_outing": False, "is_canceled": False,
-        "likes": 1, "comments": 0, "images": 0,
-        "needs_review": False, "review_reason": "",
-    }]
-    photos = [{
-        "id": "ph1", "author": "닉b", "wid": "w2",
-        "posted_at": datetime(2026, 6, 7, 10, 0, 0),
-        "likes": 3, "comments": 1, "has_comment": True,
-        "url_large": "x", "url_medium": "y", "url_small": "z", "url_thumb": "n",
-    }]
-    master = [{"실명": "정원석", "닉네임": "원석닉", "별칭": ["원석님"]}]
-
-    blob = build_excel(posts, photos, 202601, 202612, master_records=master)
-    loaded = load_excel_bundle(blob)
-    assert loaded["start_ym"] == 202601 and loaded["end_ym"] == 202612
-    assert len(loaded["posts"]) == 1 and len(loaded["photos"]) == 1
-    assert loaded["posts"][0]["body"] == "정원석 이하얀"
-    assert loaded["posts"][0]["posted_at"] == datetime(2026, 6, 7, 12, 34, 56)
-    assert loaded["posts"][0]["is_outing"] is False
-    assert loaded["photos"][0]["posted_at"] == datetime(2026, 6, 7, 10, 0, 0)
-    assert loaded["photos"][0]["has_comment"] is True
-    assert loaded["master"][0]["실명"] == "정원석"
-    assert loaded["master"][0]["별칭"] == ["원석님"]
-
-
-def test_excel_load_rejects_wrong_version(tmp_path):
-    """엑셀 _메타 시트의 schema_version이 다르면 ValueError."""
-    from io import BytesIO
-    from openpyxl import Workbook, load_workbook
-    from core.excel_builder import build_excel, load_excel_bundle
-
-    blob = build_excel([], [], 202601, 202612, master_records=[])
-    wb = load_workbook(BytesIO(blob))
-    ws = wb["_메타"]
-    for row in ws.iter_rows(min_row=2):
-        if row[0].value == "schema_version":
-            row[1].value = 999
-            break
-    buf = BytesIO()
-    wb.save(buf)
-    try:
-        load_excel_bundle(buf.getvalue())
-    except ValueError as e:
-        assert "버전" in str(e)
-    else:
-        raise AssertionError("expected ValueError")
-
-
-def _make_v1_excel(year, month):
-    """v1 스키마(_메타에 year/month)를 가진 엑셀을 만들어 bytes로 반환."""
-    from io import BytesIO
-    from openpyxl import load_workbook
-    from core.excel_builder import build_excel
-
-    blob = build_excel([], [], year * 100 + 1, year * 100 + 12)
-    wb = load_workbook(BytesIO(blob))
-    ws = wb["_메타"]
-    for row in ws.iter_rows(min_row=2):
-        if row[0].value in ("schema_version", "start_ym", "end_ym"):
-            row[0].value, row[1].value = None, None
-    ws.append(["schema_version", 1])
-    ws.append(["year", year])
-    ws.append(["month", "" if month is None else month])
-    buf = BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
-def test_excel_v1_full_year_migrates_to_range():
-    """구 버전 엑셀(연 전체)은 업로드 시 자동으로 202601~202612로 변환."""
-    from core.excel_builder import load_excel_bundle
-
-    loaded = load_excel_bundle(_make_v1_excel(2026, None))
-    assert loaded["start_ym"] == 202601
-    assert loaded["end_ym"] == 202612
-
-
-def test_excel_v1_single_month_migrates_to_range():
-    """구 버전 엑셀(단일 월)은 그 달 하나짜리 범위로 변환."""
-    from core.excel_builder import load_excel_bundle
-
-    loaded = load_excel_bundle(_make_v1_excel(2026, 5))
-    assert loaded["start_ym"] == 202605
-    assert loaded["end_ym"] == 202605
-
-
 def test_excel_multi_year_matrix_columns_grow():
     """다년 범위면 월 매트릭스 시트의 컬럼이 기간 길이만큼 늘어난다.
 
@@ -332,24 +237,6 @@ def test_excel_single_month_matrix_does_not_break():
     header = [c.value for c in wb["📅 월별 참석 매트릭스"][4]]
     assert len(header) == 2 + 1 + 1
     assert header[2] == "5월"
-
-
-def test_excel_load_rejects_missing_meta(tmp_path):
-    """_메타 시트가 없는 일반 엑셀은 거부."""
-    from io import BytesIO
-    from openpyxl import Workbook
-    from core.excel_builder import load_excel_bundle
-
-    wb = Workbook()
-    wb.active.append(["random", "data"])
-    buf = BytesIO()
-    wb.save(buf)
-    try:
-        load_excel_bundle(buf.getvalue())
-    except ValueError as e:
-        assert "원본 데이터" in str(e)
-    else:
-        raise AssertionError("expected ValueError")
 
 
 # ── v2: extract_raw_names / resolve_names / annotate_attendees ──
@@ -413,28 +300,6 @@ def test_annotate_attendees_and_unresolved_counter():
     assert "처음본이" in posts[0]["unresolved_names"]
     cnt = collect_all_unresolved(posts)
     assert cnt["처음본이"] >= 1
-
-
-def test_excel_round_trip_with_members_and_resolution():
-    from core.excel_builder import build_excel, load_excel_bundle
-    members = [{
-        "mid": "m1", "mn": "이이현", "is_admin": True,
-        "joined_at": datetime(2020, 1, 1, 0, 0, 0),
-        "last_visit": datetime(2026, 5, 28, 12, 0, 0),
-        "os": "iOS", "push": True,
-    }]
-    banned = {"민민기", "이종민"}
-    resolution = {"음승구": "승구", "민민기": LEFT_MEMBER, "습니다": NOT_A_NAME}
-    blob = build_excel([], [], 202601, 202612,
-                       members=members, banned=banned, resolution=resolution)
-    loaded = load_excel_bundle(blob)
-    assert len(loaded["members"]) == 1
-    assert loaded["members"][0]["mn"] == "이이현"
-    assert loaded["members"][0]["is_admin"] is True
-    assert isinstance(loaded["members"][0]["joined_at"], datetime)
-    assert loaded["banned"] == banned
-    assert loaded["resolution"]["음승구"] == "승구"
-    assert loaded["resolution"]["민민기"] == LEFT_MEMBER
 
 
 # ── 9차: 가입인사 자동 매핑 + 동명이인 ─────────────────────────
@@ -508,14 +373,6 @@ def test_find_duplicate_member_names():
         {"mid": "m6", "mn": ""},          # 빈 닉은 무시
     ]
     assert find_duplicate_member_names(members) == {"정원석", "김민수"}
-
-
-def test_excel_round_trip_with_join_aliases():
-    from core.excel_builder import build_excel, load_excel_bundle
-    aliases = {"정원석": "원석사진", "이하얀": "하얀필름"}
-    blob = build_excel([], [], 202601, 202612, join_aliases=aliases)
-    loaded = load_excel_bundle(blob)
-    assert loaded["join_aliases"] == aliases
 
 
 def test_excel_listing_sheets_keep_year_in_month_column():

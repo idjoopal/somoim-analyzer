@@ -16,10 +16,7 @@ import streamlit as st
 
 from core.collector import (
     GROUP_NAME,
-    LEFT_MEMBER,
-    NAME_BLACKLIST,
     NON_OUTING_CATS,
-    NOT_A_NAME,
     OUTING_CATS,
     annotate_attendees,
     collect_all_unresolved,
@@ -38,8 +35,10 @@ from core.collector import (
     period_tag,
     ym_label,
     ym_of,
+    ym_valid,
 )
-from core.excel_builder import build_excel, load_excel_bundle
+from core.excel_builder import build_excel
+from core.gsheets import sheet_url
 
 ALL_CATS = OUTING_CATS + NON_OUTING_CATS
 CAT_OPTIONS = ALL_CATS + ["(없음)"]
@@ -467,96 +466,6 @@ def orphan_reviews(posts: list[dict]) -> list[dict]:
     return [p for p in posts if p.get("cat") == "E" and not p.get("matched_outing_id")]
 
 
-# ═══════════════════════════════════════════════════════════════
-# 분류 검토 (triage)
-# ═══════════════════════════════════════════════════════════════
-
-def build_editor_df(cat_a_sorted: list[dict]) -> pd.DataFrame:
-    df = pd.DataFrame([{
-        "검토": p["review_reason"] or "",
-        "공지일": p["posted_at"].date(),
-        "작성자": p["author"],
-        "제목": p["title"],
-        "카테고리": p["category"] or "(없음)",
-        "출사일": date.fromisoformat(p["outing_date"]) if p["outing_date"] else None,
-        "상태": "취소" if p["is_canceled"] else "진행",
-    } for p in cat_a_sorted])
-    if not df.empty:
-        df["공지일"] = pd.to_datetime(df["공지일"])
-        df["출사일"] = pd.to_datetime(df["출사일"])
-    return df
-
-
-def apply_triage(raw_posts: list[dict], cat_a_sorted: list[dict],
-                 edited: pd.DataFrame, start_ym: int, end_ym: int) -> list[dict]:
-    """편집된 cat=A 분류를 적용하고, 수집기와 **같은 헬퍼**로 기간 필터.
-
-    수집기와 판정이 갈라지지 않도록 `in_ym_range`를 공유한다.
-    """
-    final = [dict(p) for p in raw_posts if p["cat"] != "A"]
-
-    for orig, (_, row) in zip(cat_a_sorted, edited.iterrows()):
-        p = dict(orig)
-        cat_val = row["카테고리"]
-        p["category"] = None if cat_val == "(없음)" else cat_val
-        p["is_outing"] = p["category"] in OUTING_CATS
-        p["is_canceled"] = row["상태"] == "취소"
-
-        od = row["출사일"]
-        if pd.isna(od):
-            continue  # 출사일 미상 → 분석 제외
-        od = od.date() if hasattr(od, "date") else od
-        if not in_ym_range(ym_of(od), start_ym, end_ym):
-            continue
-        p["outing_date"] = od.isoformat()
-        p["needs_review"] = False
-        p["review_reason"] = ""
-        final.append(p)
-
-    return final
-
-
-def build_attendees_editor_df(reviews_sorted: list[dict]) -> pd.DataFrame:
-    """후기(cat=E) 자동 추출 참석자를 편집할 표. 참석자 컬럼만 편집 가능."""
-    rows = []
-    for p in reviews_sorted:
-        body = p.get("body", "") or ""
-        unresolved = p.get("unresolved_names") or []
-        rows.append({
-            "검토": f"미해소 {len(unresolved)}명" if unresolved else "",
-            "작성일": p["posted_at"].date(),
-            "작성자": p["author"],
-            "제목": p["title"],
-            "본문": body,
-            "참석자": ", ".join(p.get("attendees", [])),
-        })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["작성일"] = pd.to_datetime(df["작성일"], errors="coerce")
-    return df
-
-
-def apply_attendees_edits(
-    final_posts: list[dict], reviews_sorted: list[dict], edited_att: pd.DataFrame,
-) -> list[dict]:
-    """편집된 참석자(쉼표) 문자열을 final_posts에 id 기준으로 적용.
-    apply_triage의 dict(p) 얕은복사로 attendees 리스트가 raw와 alias이므로 항상 새 리스트를 할당한다.
-    """
-    if edited_att is None or edited_att.empty:
-        return final_posts
-    by_id = {p["id"]: p for p in final_posts if p.get("cat") == "E"}
-    for orig, (_, row) in zip(reviews_sorted, edited_att.iterrows()):
-        rid = orig["id"]
-        target = by_id.get(rid)
-        if target is None:
-            continue
-        raw = row.get("참석자")
-        text = str(raw) if pd.notna(raw) else ""
-        attendees = [n.strip() for n in text.split(",") if n.strip()]
-        target["attendees"] = attendees  # 새 리스트 (in-place mutate 금지)
-        target["unresolved_names"] = []   # 사용자가 직접 명시 → 미해소 없음
-    return final_posts
-
 
 # ═══════════════════════════════════════════════════════════════
 # Altair 차트
@@ -659,23 +568,6 @@ def stacked_bar(rows: list[dict], x_col: str, y_col: str, color_col: str,
 
 
 # ═══════════════════════════════════════════════════════════════
-# 수집 파이프라인 — 엑셀은 검토 후 생성
-# ═══════════════════════════════════════════════════════════════
-
-def collect_data(start_ym: int, end_ym: int, on_progress=None):
-    """somoim 수집. 진행 콜백이 st를 호출하므로 @st.cache_data 대신 세션 캐시 사용
-    (cache_data 안에서 st 호출 시 캐시 히트 replay가 CacheReplayClosureError로 실패)."""
-    key = (start_ym, end_ym)
-    cached = st.session_state.get("_collect_cache")
-    if cached and cached["key"] == key:
-        return cached["data"]
-    posts = collect_posts(start_ym, end_ym, progress=on_progress, keep_unclassified=True)
-    photos = collect_photos(start_ym, end_ym, progress=on_progress)
-    st.session_state["_collect_cache"] = {"key": key, "data": (posts, photos)}
-    return posts, photos
-
-
-# ═══════════════════════════════════════════════════════════════
 # 데이터 세팅 (수집·엑셀 업로드 양쪽에서 호출)
 # ═══════════════════════════════════════════════════════════════
 
@@ -693,54 +585,141 @@ def _mark_active(items: list[dict], active_mids: set[str] | None) -> None:
         it["is_active"] = it.get("wid", "") in active_mids
 
 
-def _set_data(start_ym: int, end_ym: int, posts: list[dict], photos: list[dict],
-              members: list[dict] | None = None,
-              banned: set[str] | None = None,
-              resolution: dict[str, str] | None = None,
-              join_aliases: dict[str, str] | None = None) -> None:
-    """수집/업로드 양쪽에서 호출. session_state['data'] 설정 + 후속 단계 키 클리어.
 
-    data 튜플: (start_ym, end_ym, posts, photos, members, banned, resolution, join_aliases)
+def _auth_ok() -> bool:
+    """평문 비밀번호 게이트.
+
+    앱 URL은 공개(`*.streamlit.app`)라 우연한 접근을 막는 최소 장치일 뿐이다 —
+    해싱·시도 제한·세션 만료가 없다. 실제 데이터 보호는 구글 드라이브 폴더의
+    공유 설정에 달려 있다(보정 시트에 실명이 들어간다).
+    secrets에 [auth]가 없으면 게이트를 건너뛴다(로컬 개발 편의).
     """
-    active_mids = {m["mid"] for m in (members or []) if m.get("mid")}
+    try:
+        expected = (st.secrets.get("auth") or {}).get("password")
+    except Exception:  # noqa: BLE001 — secrets 파일 자체가 없으면 예외
+        expected = None
+    if not expected:
+        return True
+    if st.session_state.get("_authed"):
+        return True
+
+    st.title("📸 다감노 분석")
+    with st.form("auth"):
+        pw = st.text_input("비밀번호", type="password")
+        if st.form_submit_button("입력", type="primary") :
+            if pw == expected:
+                st.session_state["_authed"] = True
+                st.rerun()
+            st.error("비밀번호가 올바르지 않습니다.")
+    return False
+
+
+@st.cache_resource(show_spinner=False)
+def _open_stores(_conf_key: str):
+    """드라이브 폴더에서 raw·보정 스프레드시트를 열고(없으면 생성) 캐시한다.
+
+    `cache_resource`라 세션마다 파일을 다시 찾지 않는다. `_conf_key`는 secrets가
+    바뀌면 캐시를 무효화하기 위한 것.
+    """
+    conf = _gsheets_conf() or {}
+    from core.gsheets import GoogleSheetsStore, SheetsClient, parse_credentials
+    from core.store import open_stores
+
+    creds = parse_credentials(conf.get("credentials"))
+    drive = GoogleSheetsStore(creds, folder_id=conf.get("folder_id"))
+    client = SheetsClient(creds)
+    return open_stores(drive, client)
+
+
+def get_stores():
+    """(raw_store, correction_store). secrets 미설정이면 None.
+
+    세션에 이미 열린 스토어가 있으면 그것을 쓴다 — 테스트에서 가짜 스토어를
+    주입하는 지점이기도 하다.
+    """
+    if st.session_state.get("_stores") is not None:
+        return st.session_state["_stores"]
+    conf = _gsheets_conf()
+    if not conf:
+        return None
+    stores = _open_stores(str(sorted(conf.items())))
+    st.session_state["_stores"] = stores
+    return stores
+
+
+def build_analysis(raw: dict, corrections: dict) -> dict:
+    """raw + 보정 → 분석 가능한 상태로 조립 (순수 — 네트워크·st 무관).
+
+    보정이 이름 해소보다 **먼저** 적용된다: 공지 분류가 바뀌면 매칭 결과가
+    달라지므로 순서가 중요하다.
+    """
+    from core.store import (
+        apply_corrections, filter_excluded, resolution_from_corrections,
+    )
+
+    posts = [dict(p) for p in raw.get("posts") or []]
+    photos = [dict(p) for p in raw.get("photos") or []]
+    members = raw.get("members") or []
+    join_aliases = raw.get("join_aliases") or {}
+
+    counts = apply_corrections(posts, corrections)
+    posts = filter_excluded(posts)
+
+    active_mids = {m["mid"] for m in members if m.get("mid")}
     _mark_active(posts, active_mids)
     _mark_active(photos, active_mids)
-    st.session_state["data"] = (
-        int(start_ym), int(end_ym), posts, photos,
-        members or [], set(banned or set()), dict(resolution or {}),
-        dict(join_aliases or {}),
-    )
-    # 이전 분석의 잔재를 지운다 — 특히 _gsheet_url을 남기면 새 기간을 분석한 뒤에도
-    # 옛 시트 링크가 "내보내기 완료"처럼 보인다.
-    for k in ("master", "result", "_gsheet_url", "_noise_pending"):
-        st.session_state.pop(k, None)
+
+    master_names = {m["mn"] for m in members if m.get("mn")}
+    resolution = {**join_aliases, **resolution_from_corrections(corrections)}
+    annotate_attendees(posts, master_names, resolution)
+    # 보정으로 참석자를 직접 지정한 후기는 annotate가 덮어쓰므로 다시 적용한다.
+    apply_corrections(posts, {"attendees": corrections.get("attendees") or {}})
+    match_outings_with_reviews(posts)
+
+    return {
+        "posts": posts, "photos": photos, "members": members,
+        "master": {"names": master_names,
+                   "duplicates": find_duplicate_member_names(members)},
+        "resolution": resolution,
+        "applied": counts,
+        "history": raw.get("history") or [],
+    }
 
 
-def _parse_resolution_csv(text: str) -> dict[str, str]:
-    """매핑 CSV(`이름,처리`) → resolution dict. 첫 행이 헤더이면 스킵."""
-    out: dict[str, str] = {}
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return out
-    start = 1 if "이름" in lines[0] and "처리" in lines[0] else 0
-    for line in lines[start:]:
-        if "," not in line:
-            continue
-        k, v = line.split(",", 1)
-        k, v = k.strip(), v.strip()
-        if k and v:
-            out[k] = v
-    return out
+def collected_range(history: list[dict], posts: list[dict],
+                    photos: list[dict]) -> tuple[int, int] | None:
+    """분석 축이 될 기간 — `_수집이력`의 합집합, 없으면 데이터 실측 범위."""
+    months: list[int] = []
+    for h in history or []:
+        for k in ("시작월", "종료월"):
+            try:
+                v = int(float(h.get(k)))
+            except (TypeError, ValueError):
+                continue
+            if ym_valid(v):
+                months.append(v)
+    if not months:
+        for p in posts or []:
+            m = post_ym(p) or (ym_of(p["posted_at"]) if p.get("posted_at") else None)
+            if m:
+                months.append(m)
+        for p in photos or []:
+            if p.get("posted_at"):
+                months.append(ym_of(p["posted_at"]))
+    return (min(months), max(months)) if months else None
 
 
-def _resolution_to_csv(resolution: dict[str, str]) -> bytes:
-    """resolution dict → CSV bytes(utf-8-sig)."""
-    lines = ["이름,처리"]
-    for k, v in resolution.items():
-        if "," in k or "," in v:
-            continue  # 콤마 포함 토큰은 한 번 건너뜀(매우 드묾)
-        lines.append(f"{k},{v}")
-    return ("\n".join(lines) + "\n").encode("utf-8-sig")
+def slice_period(analysis: dict, start_ym: int, end_ym: int) -> tuple[list[dict], list[dict]]:
+    """보기 기간으로 좁힌 (posts, photos). 공지는 출사일, 그 외는 작성일 기준."""
+    posts = []
+    for p in analysis["posts"]:
+        m = post_ym(p) if p.get("cat") == "A" else (
+            ym_of(p["posted_at"]) if p.get("posted_at") else None)
+        if m is None or in_ym_range(m, start_ym, end_ym):
+            posts.append(p)
+    photos = [p for p in analysis["photos"]
+              if p.get("posted_at") and in_ym_range(ym_of(p["posted_at"]), start_ym, end_ym)]
+    return posts, photos
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -761,320 +740,6 @@ def render_basis_box(posts: list[dict], photos: list[dict], period_label: str) -
         icon="ℹ️",
     )
 
-
-OPT_SKIP  = "(선택 안 함)"
-OPT_LEFT  = "🚪 탈퇴 멤버 (추적 안 함)"
-
-
-def render_resolution(start_ym: int, end_ym: int, posts: list[dict],
-                       photos: list[dict], members: list[dict],
-                       banned: set[str], resolution_in: dict[str, str],
-                       join_aliases: dict[str, str] | None = None) -> None:
-    """Stage 1: 미매칭 이름 해소.
-
-    마스터(`master_names`) = 활성 멤버 `mn`. 후기 본문에서 추출한 토큰 중
-    마스터에 정확히 일치하지 않는 이름을 사용자가 드롭다운 3택(마스터 닉네임 /
-    탈퇴 / 노이즈)으로 해소. 매핑은 누적 재사용.
-
-    `join_aliases`(가입인사 자동 추출 `실명→닉네임`)는 사용자 매핑(`resolution_in`)과
-    `{**join_aliases, **resolution_in}`으로 머지해 annotate 시 자동 base로 사용.
-    드롭다운 기본값도 자동 매핑이 있으면 그 닉네임으로 미리 채움(사용자가 덮어쓰면 그 값 우선).
-    """
-    st.divider()
-    st.subheader("① 미매칭 이름 정리")
-
-    master_names: set[str] = {m["mn"] for m in members if m.get("mn")}
-    if not master_names:
-        st.error(
-            "활성 멤버 명단이 없습니다. 이전 버전 엑셀을 업로드하셨다면 "
-            "**🔄 처음으로** 후 **API 수집**으로 한 번 더 받아주세요."
-        )
-        return
-
-    join_aliases = dict(join_aliases or {})
-    user_res = dict(resolution_in or {})
-    duplicates = find_duplicate_member_names(members)
-    # 자동 매핑은 사용자 매핑이 비어 있을 때만 적용 (사용자 override 우선)
-    effective = {**join_aliases, **user_res}
-
-    # 매핑 보정 후 다시 매기기 위해 우선 항상 in-place 재주석
-    annotate_attendees(posts, master_names, effective)
-    unresolved_freq = collect_all_unresolved(posts)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("활성 멤버", len(master_names))
-    c2.metric("미해소 이름", len(unresolved_freq))
-    c3.metric("기존 매핑", len(user_res))
-    c4.metric("🪪 가입인사 자동", len(join_aliases))
-
-    if duplicates:
-        st.warning(
-            f"⚠️ **동명이인 닉네임 {len(duplicates)}개**: {', '.join(sorted(duplicates))} "
-            "— 이 닉네임으로 매핑하면 두 사람이 한 명으로 합쳐 집계됩니다. "
-            "후기 본문이 닉네임만 담고 있어 분리가 불가하니, 보고서 해석 시 참고하세요.",
-            icon="⚠️",
-        )
-
-    if join_aliases:
-        with st.expander(f"📖 가입인사 자동 매핑 보기 ({len(join_aliases)}건)"):
-            st.caption(
-                "가입인사 본문에서 `이름 : XXX` 패턴을 추출한 (실명 → 활성 멤버 닉네임) 매핑입니다. "
-                "아래 표에서 같은 이름을 만나면 자동으로 이 닉네임으로 매핑되며, "
-                "드롭다운에서 다른 값을 선택하면 사용자 매핑이 우선합니다."
-            )
-            st.dataframe(
-                pd.DataFrame(
-                    sorted(join_aliases.items()),
-                    columns=["실명", "→ 활성 멤버 닉네임"],
-                ),
-                hide_index=True, width="stretch", height=240,
-            )
-
-    st.info(
-        "후기에 적혔지만 **활성 멤버 명단과 정확히 일치하지 않는** 이름입니다. "
-        "각 이름을 **① 마스터 닉네임으로 매핑**(닉네임 변형/오타) 또는 "
-        "**② 탈퇴 멤버**(추적 안 함)로 지정하세요. "
-        "이름이 아닌 단어(노이즈)는 **이름 ❌** 체크박스로 빠르게 제외할 수 있습니다. "
-        "🪪 가입인사 본문에서 자동 추출된 매핑은 미리 채워져 있으니 그대로 두면 적용됩니다. "
-        "한 번 지정한 매핑은 같은 엑셀을 올리거나 매핑 CSV로 재사용됩니다.",
-        icon="🧭",
-    )
-
-    if not unresolved_freq:
-        st.success("모든 이름이 마스터와 매칭됐어요. 다음 단계로 진행하세요.")
-        if st.button("✅ 다음 단계로", type="primary"):
-            st.session_state["master"] = {
-                "names": master_names,
-                "members": members,
-                "banned": banned,
-                "resolution": user_res,
-                "join_aliases": join_aliases,
-                "duplicates": duplicates,
-            }
-            st.rerun()
-        return
-
-    master_sorted = sorted(master_names)
-    options = [OPT_SKIP, OPT_LEFT] + master_sorted
-
-    # ── 이름 ❌ 일괄 처리 ─────────────────────────────────────────
-    # 노이즈 토큰(조사·일반명사)은 수십 개씩 나오는데 체크박스를 한 행씩 누르는 게
-    # 이 단계의 병목이었다. data_editor 체크박스는 드래그 채우기를 지원하지 않아
-    # 표 위에 일괄 처리 바를 둔다. 여기서 정한 값은 표의 기본값으로만 반영되고,
-    # 확정은 기존 "✅ 이 매핑으로 분석 진행" 버튼이 그대로 담당한다.
-    noise_pending: set[str] = st.session_state.setdefault("_noise_pending", set())
-    nonce = st.session_state.setdefault("_res_editor_nonce", 0)
-
-    def _bump_editor() -> None:
-        """data_editor는 key가 그대로면 이전 편집 델타를 붙들고 있어 입력 DataFrame을
-        바꿔도 반영되지 않는다. key에 nonce를 섞어 위젯을 새로 만든다."""
-        st.session_state["_res_editor_nonce"] += 1
-
-    all_names = [n for n, _ in unresolved_freq.most_common()]
-    once_names = [n for n in all_names if unresolved_freq[n] == 1]
-
-    with st.container(border=True):
-        st.markdown("**이름 ❌ 일괄 처리** — 이름이 아닌 단어를 한 번에 골라 표시합니다.")
-        picked = st.multiselect(
-            "이름 여러 개 선택 (빈도순 · 타이핑으로 검색)",
-            options=all_names, default=[], key="noise_multiselect",
-            format_func=lambda n: f"{n} ({unresolved_freq[n]}회)",
-        )
-        b1, b2, b3 = st.columns(3)
-        if b1.button("선택 ❌ 처리", width="stretch", disabled=not picked):
-            noise_pending.update(picked)
-            st.session_state["noise_multiselect"] = []
-            _bump_editor()
-            st.rerun()
-        if b2.button(f"빈도 1회 전체 ❌ ({len(once_names)}건)",
-                     width="stretch", disabled=not once_names,
-                     help="한 번만 등장한 토큰은 대개 오탈자·조사 등 노이즈입니다."):
-            noise_pending.update(once_names)
-            _bump_editor()
-            st.rerun()
-        if b3.button("❌ 전부 해제", width="stretch", disabled=not noise_pending):
-            noise_pending.clear()
-            _bump_editor()
-            st.rerun()
-        if noise_pending:
-            st.caption(f"❌ 표시 대기 {len(noise_pending)}건 — 아래 **확정 버튼**을 눌러야 저장됩니다.")
-
-    rows = []
-    for name, cnt in unresolved_freq.most_common():
-        current = user_res.get(name)
-        auto = join_aliases.get(name)
-        is_noise = (current == NOT_A_NAME) or (name in noise_pending)
-        if current == LEFT_MEMBER:
-            default = OPT_LEFT
-        elif current in master_names:
-            default = current
-        elif auto in master_names:
-            default = auto
-        else:
-            default = OPT_SKIP
-        notes = []
-        if auto in master_names:
-            notes.append(f"🪪 가입인사 → {auto}")
-        if name in (banned or set()):
-            notes.append("🚪 탈퇴명단")
-        if default in duplicates:
-            notes.append("⚠️ 동명이인")
-        rows.append({
-            "이름": name,
-            "빈도": int(cnt),
-            "참고": " · ".join(notes),
-            "이름 ❌": is_noise,
-            "처리": default,
-        })
-
-    edited = st.data_editor(
-        pd.DataFrame(rows),
-        column_config={
-            "이름": st.column_config.TextColumn("이름", disabled=True),
-            "빈도": st.column_config.NumberColumn("빈도", disabled=True, width="small"),
-            "참고": st.column_config.TextColumn("참고", disabled=True, width="medium"),
-            "이름 ❌": st.column_config.CheckboxColumn(
-                "이름 ❌", width="small",
-                help="체크하면 이름이 아닌 것(노이즈)으로 즉시 처리 — 드롭다운 선택보다 우선합니다.",
-            ),
-            "처리": st.column_config.SelectboxColumn(
-                "처리", options=options, required=True, width="medium",
-                help="마스터 닉네임으로 매핑하려면 위 옵션 뒤에서 선택. ⚠️ 표시는 동명이인.",
-            ),
-        },
-        column_order=["이름", "빈도", "참고", "이름 ❌", "처리"],
-        hide_index=True, width="stretch", num_rows="fixed",
-        key=f"resolution_editor_{start_ym}_{end_ym}_{nonce}",
-    )
-
-    if st.button("✅ 이 매핑으로 분석 진행", type="primary"):
-        new_user_res = dict(user_res)
-        for _, row in edited.iterrows():
-            name = str(row.get("이름") or "")
-            choice = str(row.get("처리") or OPT_SKIP)
-            noise_flag = bool(row.get("이름 ❌"))
-            auto = join_aliases.get(name)
-            # 체크박스가 켜져 있으면 드롭다운 선택보다 우선 → 노이즈로 확정
-            if noise_flag:
-                new_user_res[name] = NOT_A_NAME
-            elif choice == OPT_SKIP:
-                new_user_res.pop(name, None)
-            elif choice == OPT_LEFT:
-                new_user_res[name] = LEFT_MEMBER
-            elif choice == auto:
-                # 사용자가 자동 매핑 기본값을 그대로 유지 — user_res에 기록 불필요
-                new_user_res.pop(name, None)
-            else:
-                new_user_res[name] = choice
-        final_effective = {**join_aliases, **new_user_res}
-        annotate_attendees(posts, master_names, final_effective)
-        st.session_state["_noise_pending"] = set()  # 확정됐으니 대기 상태 비움
-        st.session_state["master"] = {
-            "names": master_names,
-            "members": members,
-            "banned": banned,
-            "resolution": new_user_res,
-            "join_aliases": join_aliases,
-            "duplicates": duplicates,
-        }
-        st.rerun()
-
-
-def render_triage(start_ym: int, end_ym: int, raw_posts: list[dict],
-                   photos: list[dict], master: dict) -> None:
-    st.divider()
-    st.subheader("② 분류 · 참석자 검토")
-    cat_a = [p for p in raw_posts if p["cat"] == "A"]
-    cat_a_sorted = sorted(cat_a, key=lambda p: (not p["needs_review"], p["posted_at"]))
-    n_review = sum(1 for p in cat_a if p["needs_review"])
-
-    reviews = [p for p in raw_posts if p["cat"] == "E"]
-    reviews_sorted = sorted(
-        reviews, key=lambda p: (not p.get("unresolved_names"), p["posted_at"]),
-    )
-    n_att_review = sum(1 for p in reviews if not p.get("attendees"))
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("출사 공지", len(cat_a))
-    c2.metric("⚠️ 분류 검토", n_review)
-    c3.metric("후기", len(reviews))
-    c4.metric("참석자 0명", n_att_review)
-    st.caption(
-        "**분류 검토**: 자동 분류가 애매한 공지(출사일 추론 실패·카테고리 미상)의 카테고리·출사일·진행/취소를 보정. 출사일을 비우면 분석 제외. "
-        "**참석자 보정**: ①에서 미해소한 이름이 있거나 자동 추출이 부족한 후기를 직접 수정(쉼표 구분). "
-        "아래 버튼을 누르면 그 보정 분류로 인사이트·엑셀이 생성됩니다."
-    )
-
-    # ── 분류 editor ────────────────────────────────────────────
-    st.markdown("##### 분류 보정 (출사 공지)")
-    editor_df = build_editor_df(cat_a_sorted)
-    col_config = {
-        "검토": st.column_config.TextColumn("검토", disabled=True, width="small"),
-        "공지일": st.column_config.DateColumn("공지일", disabled=True, format="YYYY-MM-DD"),
-        "작성자": st.column_config.TextColumn("작성자", disabled=True, width="small"),
-        "제목": st.column_config.TextColumn("제목", disabled=True, width="large"),
-        "카테고리": st.column_config.SelectboxColumn("카테고리", options=CAT_OPTIONS, required=True),
-        "출사일": st.column_config.DateColumn("출사일", format="YYYY-MM-DD"),
-        "상태": st.column_config.SelectboxColumn("상태", options=STATUS_OPTIONS, required=True),
-    }
-    editor_kwargs = dict(
-        column_config=col_config, hide_index=True, width="stretch",
-        num_rows="fixed", key=f"editor_{start_ym}_{end_ym}",
-    )
-
-    if n_review > 0:
-        st.warning(f"검토가 필요한 공지 {n_review}건이 표 위쪽에 있습니다.")
-        edited = st.data_editor(editor_df, **editor_kwargs)
-    else:
-        with st.expander("분류 직접 보정 (선택) — 자동 분류 확인/수정", expanded=False):
-            edited = st.data_editor(editor_df, **editor_kwargs)
-
-    # ── 참석자 editor ──────────────────────────────────────────
-    st.markdown("##### 참석자 보정 (후기 본문)")
-    att_df = build_attendees_editor_df(reviews_sorted)
-    att_config = {
-        "검토": st.column_config.TextColumn("검토", disabled=True, width="small"),
-        "작성일": st.column_config.DateColumn("작성일", disabled=True, format="YYYY-MM-DD"),
-        "작성자": st.column_config.TextColumn("작성자", disabled=True, width="small"),
-        "제목": st.column_config.TextColumn("제목", disabled=True, width="medium"),
-        "본문": st.column_config.TextColumn(
-            "본문", disabled=True, width="large",
-            help="셀을 클릭하면 전체 본문을 펼쳐 볼 수 있습니다.",
-        ),
-        "참석자": st.column_config.TextColumn(
-            "참석자(쉼표 구분)", help="실명을 쉼표로 구분", width="large"),
-    }
-    att_kwargs = dict(
-        column_config=att_config, hide_index=True, width="stretch",
-        num_rows="fixed", key=f"att_editor_{start_ym}_{end_ym}",
-    )
-    if reviews:
-        if n_att_review > 0:
-            st.warning(f"참석자가 비어 있는 후기 {n_att_review}건이 표 위쪽에 있습니다.")
-            edited_att = st.data_editor(att_df, **att_kwargs)
-        else:
-            with st.expander("참석자 직접 보정 (선택)", expanded=False):
-                edited_att = st.data_editor(att_df, **att_kwargs)
-    else:
-        edited_att = att_df
-        st.caption("후기글이 없어 참석자 보정 단계는 건너뜁니다.")
-
-    if st.button("✅ 이 분류·참석자로 분석 진행", type="primary"):
-        final_posts = apply_triage(raw_posts, cat_a_sorted, edited, start_ym, end_ym)
-        apply_attendees_edits(final_posts, reviews_sorted, edited_att)
-        match_outings_with_reviews(final_posts)
-        members = master.get("members", []) if isinstance(master, dict) else []
-        banned = master.get("banned", set()) if isinstance(master, dict) else set()
-        resolution = master.get("resolution", {}) if isinstance(master, dict) else {}
-        join_aliases = master.get("join_aliases", {}) if isinstance(master, dict) else {}
-        xlsx = build_excel(final_posts, photos, start_ym, end_ym,
-                           members=members, banned=banned, resolution=resolution,
-                           join_aliases=join_aliases)
-        st.session_state["result"] = (start_ym, end_ym, final_posts, photos, xlsx,
-                                       master, members, resolution)
-        st.rerun()
-
-
 def _ranking_df(rows: list[dict], count_col: str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -1083,20 +748,21 @@ def _ranking_df(rows: list[dict], count_col: str) -> pd.DataFrame:
 
 
 def render_results(start_ym: int, end_ym: int, posts: list[dict],
-                   photos: list[dict], xlsx: bytes, master: dict,
+                   photos: list[dict], master: dict,
                    members: list[dict] | None = None,
-                   resolution: dict[str, str] | None = None) -> None:
+                   applied: dict[str, int] | None = None) -> None:
     period = period_label(start_ym, end_ym)
     months = month_axis(start_ym, end_ym)
-    st.divider()
-    st.subheader(f"③ {period} 인사이트")
+    st.subheader(f"{period} 인사이트")
     render_basis_box(posts, photos, period)
 
     kpis = compute_kpis(posts, photos)
     for col, (label, val) in zip(st.columns(len(kpis)), kpis.items()):
         col.metric(label, val)
 
-    st.caption("📥 **엑셀 다운로드는 왼쪽 사이드바**의 *다운로드* 섹션에서.")
+    if applied and any(applied.values()):
+        st.caption(f"📕 보정 시트 적용 — 공지 {applied.get('공지', 0)}건 · "
+                   f"참석자 {applied.get('참석자', 0)}건")
 
     master_names = master.get("names") if isinstance(master, dict) else (master or set())
     duplicates = master.get("duplicates") if isinstance(master, dict) else set()
@@ -1641,227 +1307,231 @@ def _gsheets_store():
     )
 
 
-def _load_bundle_into_session(bundle: dict, what: str) -> None:
-    """복원한 번들을 세션에 싣고 성공 메시지 후 rerun (엑셀·구글 시트 공용)."""
-    _set_data(bundle["start_ym"], bundle["end_ym"],
-              bundle["posts"], bundle["photos"],
-              members=bundle.get("members") or [],
-              banned=bundle.get("banned") or set(),
-              resolution=bundle.get("resolution") or {},
-              join_aliases=bundle.get("join_aliases") or {})
-    st.success(
-        f"{what} · 게시글 {len(bundle['posts'])} / 사진 {len(bundle['photos'])} "
-        f"· 멤버 {len(bundle.get('members') or [])} "
-        f"· 매핑 {len(bundle.get('resolution') or {})} "
-        f"· 가입인사 자동 {len(bundle.get('join_aliases') or {})}"
+def _period_picker(full: tuple[int, int]) -> tuple[int, int]:
+    """분석 기간 좁히기 — raw에는 수집한 전 기간이 쌓이므로 보기 범위를 고를 수 있게.
+
+    기본값은 전체. 5년치가 쌓이면 월 축이 60칸이 되어 표·엑셀이 다루기 어려워진다.
+    """
+    axis = month_axis(*full)
+    labels = [f"{m // 100}-{m % 100:02d}" for m in axis]
+    if len(axis) == 1:
+        return full
+    i, j = st.select_slider(
+        "분석 기간", options=list(range(len(axis))),
+        value=(0, len(axis) - 1),
+        format_func=lambda k: labels[k], key="view_range",
     )
+    return axis[i], axis[j]
+
+
+def render_sidebar(stores, analysis: dict | None) -> None:
+    """수집 · 데이터 현황 · 보정 안내 · 다운로드."""
+    with st.sidebar:
+        if stores is None:
+            st.error(
+                "구글 연동이 설정되지 않았습니다. `secrets.toml`에 `[gsheets]`"
+                "(credentials · folder_id)를 넣어 주세요.", icon="⚙️",
+            )
+            return
+        raw_store, fix_store = stores
+
+        # ── 수집 ────────────────────────────────────────────────
+        st.subheader("📥 수집")
+        st.caption("소모임 API에서 기간만큼 받아 구글 시트에 쌓습니다. "
+                   "이미 있는 글은 최신 내용으로 갱신됩니다.")
+        cur = datetime.now().year
+        years = list(range(cur, cur - 8, -1))
+        c1, c2 = st.columns(2)
+        with c1:
+            sy = st.selectbox("시작 년", years, key="api_start_y")
+            sm = st.selectbox("시작 월", list(range(1, 13)), key="api_start_m")
+        with c2:
+            ey = st.selectbox("종료 년", years, key="api_end_y")
+            em = st.selectbox("종료 월", list(range(1, 13)), index=11, key="api_end_m")
+        start_ym, end_ym = sy * 100 + sm, ey * 100 + em
+        valid = start_ym <= end_ym
+        if valid:
+            n = len(month_axis(start_ym, end_ym))
+            st.caption(f"📅 **{period_label(start_ym, end_ym)}** · {n}개월")
+            if n > 24:
+                st.warning("기간이 길면 API 페이지 한도에 걸려 과거 일부가 "
+                           "누락될 수 있습니다. 나눠서 수집하세요.")
+        else:
+            st.error("종료가 시작보다 빠릅니다.")
+
+        if st.button("수집 시작", type="primary", width="stretch", disabled=not valid):
+            _run_collection(raw_store, fix_store, start_ym, end_ym)
+
+        # ── 데이터 현황 ─────────────────────────────────────────
+        st.divider()
+        st.subheader("🗂 데이터 현황")
+        history = (analysis or {}).get("history") or []
+        if history:
+            rng = collected_range(history, [], [])
+            if rng:
+                st.metric("수집한 기간", period_label(*rng))
+            st.caption(f"게시글 {len((analysis or {}).get('posts') or [])}건 · "
+                       f"사진 {len((analysis or {}).get('photos') or [])}건")
+            with st.expander(f"수집 이력 {len(history)}회"):
+                st.dataframe(pd.DataFrame(history[::-1]), hide_index=True,
+                             width="stretch", height=200)
+        else:
+            st.caption("아직 수집한 데이터가 없습니다.")
+
+        # ── 보정 ────────────────────────────────────────────────
+        st.divider()
+        st.subheader("📝 보정")
+        st.caption("보정은 **구글 시트에서 직접** 합니다. 고친 뒤 새로고침하면 "
+                   "분석에 반영되고, 다시 수집해도 그대로 유지됩니다.")
+        st.link_button("📕 보정 시트 열기", sheet_url(fix_store.file_id),
+                       width="stretch")
+        try:
+            pending = fix_store.pending_count()
+        except Exception:  # noqa: BLE001
+            pending = None
+        if pending:
+            st.warning(f"아직 채우지 않은 보정 {pending}건", icon="✍️")
+        elif pending == 0:
+            st.success("보정 대기 없음", icon="✅")
+        if st.button("🔄 새로고침", width="stretch"):
+            st.session_state.pop("_analysis", None)
+            st.rerun()
+
+        # ── 다운로드 ────────────────────────────────────────────
+        if analysis and analysis.get("posts"):
+            st.divider()
+            st.subheader("💾 다운로드")
+            rng = st.session_state.get("_view_range") or collected_range(
+                analysis["history"], analysis["posts"], analysis["photos"])
+            if rng:
+                tag = period_tag(*rng)
+                xlsx = build_excel(
+                    analysis["posts"], analysis["photos"], rng[0], rng[1],
+                    members=analysis["members"],
+                    resolution=analysis["resolution"],
+                )
+                st.download_button(
+                    "📥 엑셀 (인사이트)", data=xlsx,
+                    file_name=f"다감노_{tag}_분석.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width="stretch",
+                )
+                if st.button("📤 구글 시트로 내보내기", width="stretch"):
+                    with st.spinner("올리는 중…"):
+                        try:
+                            from core.gsheets import default_title
+                            fid, url = _gsheets_store().upload(xlsx, default_title(tag))
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"내보내기 실패: {e}")
+                        else:
+                            st.session_state["_gsheet_url"] = url
+            if st.session_state.get("_gsheet_url"):
+                st.link_button("🔗 방금 내보낸 시트 열기",
+                               st.session_state["_gsheet_url"], width="stretch")
+
+
+def _run_collection(raw_store, fix_store, start_ym: int, end_ym: int) -> None:
+    """수집 → raw 저장 → 보정 후보 시딩. 보정 시트의 기존 값은 건드리지 않는다."""
+    from core.store import correction_candidates
+
+    bar = st.progress(0.0, text="시작 준비 중…")
+    with st.status("수집 중…", expanded=True) as status:
+        def on_progress(msg: str, pct: float) -> None:
+            bar.progress(min(max(pct, 0.0), 1.0), text=msg)
+            st.write(msg)
+        try:
+            posts = collect_posts(start_ym, end_ym, progress=on_progress,
+                                  keep_unclassified=True)
+            photos = collect_photos(start_ym, end_ym, progress=on_progress)
+            on_progress("멤버 목록 수집…", 0.92)
+            members, _ = collect_members()
+            banned = collect_banned_names()
+            active_mns = {m["mn"] for m in members if m.get("mn")}
+            joined = [m["joined_at"] for m in members if m.get("joined_at")]
+            joins = collect_join_greetings(progress=on_progress,
+                                           active_members=members,
+                                           min_joined_at=min(joined) if joined else None)
+            join_aliases = parse_join_name_aliases(joins, active_mns)
+
+            on_progress("구글 시트에 저장…", 0.96)
+            totals = raw_store.save(posts=posts, photos=photos, members=members,
+                                    banned=banned, join_aliases=join_aliases,
+                                    period=(start_ym, end_ym))
+
+            on_progress("보정 후보 정리…", 0.99)
+            annotate_attendees(posts, active_mns,
+                               {**join_aliases,
+                                **_resolution_of(fix_store.load())})
+            added = fix_store.seed(correction_candidates(
+                posts, dict(collect_all_unresolved(posts)), fix_store.load()))
+        except Exception as e:  # noqa: BLE001
+            status.update(label="수집 실패", state="error")
+            st.error("수집 중 오류가 발생했습니다. (API·네트워크·구글 권한 확인)")
+            st.exception(e)
+            st.stop()
+        bar.progress(1.0, text="완료")
+        status.update(
+            label=(f"완료 · 누적 게시글 {totals['게시글']} / 사진 {totals['사진']} "
+                   f"· 보정 후보 {sum(added.values())}건 추가"),
+            state="complete",
+        )
+    st.session_state.pop("_analysis", None)
     st.rerun()
 
 
-def render_sidebar() -> None:
-    """사이드바: 데이터 소스(API/엑셀/구글 시트) + 매핑 CSV + 다운로드 + 처음으로."""
-    with st.sidebar:
-        st.subheader("📥 데이터 소스")
-        sources = ["API 수집", "엑셀 업로드"]
-        if _gsheets_configured():
-            sources.append("구글 시트")
-        source = st.radio(
-            "입력 방법", sources,
-            horizontal=True, key="data_source", label_visibility="collapsed",
-        )
+def _resolution_of(corrections: dict) -> dict[str, str]:
+    from core.store import resolution_from_corrections
+    return resolution_from_corrections(corrections)
 
-        if source == "API 수집":
-            current_year = datetime.now().year
-            years = list(range(current_year, current_year - 6, -1))
-            st.caption("분석할 기간을 시작~종료로 지정합니다. 한 달만 보려면 시작·종료를 같게 두세요.")
-            c1, c2 = st.columns(2)
-            with c1:
-                sy = st.selectbox("시작 년", years, key="api_start_y")
-                sm = st.selectbox("시작 월", list(range(1, 13)), key="api_start_m")
-            with c2:
-                ey = st.selectbox("종료 년", years, key="api_end_y")
-                em = st.selectbox("종료 월", list(range(1, 13)), index=11, key="api_end_m")
 
-            start_ym, end_ym = sy * 100 + sm, ey * 100 + em
-            valid_range = start_ym <= end_ym
-            if valid_range:
-                n_months = len(month_axis(start_ym, end_ym))
-                st.caption(f"📅 **{period_label(start_ym, end_ym)}** · {n_months}개월")
-                if n_months > 24:
-                    st.warning("기간이 길면 API 페이지 한도에 걸려 과거 일부가 누락될 수 있습니다. "
-                               "나눠서 수집한 뒤 엑셀을 각각 보관하는 편이 안전합니다.")
-            else:
-                st.error("종료가 시작보다 빠릅니다. 기간을 다시 지정하세요.")
-
-            if st.button("분석 시작", type="primary", width="stretch",
-                         disabled=not valid_range):
-                progress_bar = st.progress(0.0, text="시작 준비 중…")
-                with st.status("데이터 수집 중…", expanded=True) as status:
-                    def on_progress(msg: str, pct: float) -> None:
-                        progress_bar.progress(min(max(pct, 0.0), 1.0), text=msg)
-                        st.write(msg)
-                    try:
-                        posts, photos = collect_data(start_ym, end_ym, on_progress=on_progress)
-                        on_progress("멤버 목록 수집…", 0.95)
-                        members, _ = collect_members()
-                        banned = collect_banned_names()
-                        active_mns = {m["mn"] for m in members if m.get("mn")}
-                        joined_dates = [m["joined_at"] for m in members if m.get("joined_at")]
-                        min_joined = min(joined_dates) if joined_dates else None
-                        joins = collect_join_greetings(
-                            progress=on_progress,
-                            active_members=members,
-                            min_joined_at=min_joined,
-                        )
-                        join_aliases = parse_join_name_aliases(joins, active_mns)
-                    except Exception as e:  # noqa: BLE001
-                        status.update(label="수집 실패", state="error")
-                        st.error("수집 중 오류가 발생했습니다. (somoim API/네트워크 확인)")
-                        st.exception(e)
-                        st.stop()
-                    progress_bar.progress(1.0, text="완료")
-                    status.update(
-                        label=(f"수집 완료 · 게시글 {len(posts)} / 사진 {len(photos)} "
-                               f"/ 멤버 {len(members)} / 가입인사 자동 매핑 {len(join_aliases)}"),
-                        state="complete",
-                    )
-                _set_data(start_ym, end_ym, posts, photos,
-                           members=members, banned=banned, resolution=None,
-                           join_aliases=join_aliases)
-                st.rerun()
-        elif source == "구글 시트":
-            st.caption("이 앱에서 **구글 시트로 내보낸** 분석을 주소로 불러옵니다. "
-                       "엑셀과 같은 데이터라 API 호출은 없습니다.")
-            url = st.text_input("구글 시트 주소", key="gsheet_url",
-                                placeholder="https://docs.google.com/spreadsheets/d/.../edit")
-            if url and st.button("📥 불러오기", type="primary", width="stretch"):
-                with st.spinner("구글 시트에서 내려받는 중…"):
-                    try:
-                        xlsx = _gsheets_store().download(url)
-                        bundle = load_excel_bundle(xlsx)
-                    except Exception as e:  # noqa: BLE001
-                        st.error(f"구글 시트 불러오기 실패: {e}")
-                    else:
-                        _load_bundle_into_session(bundle, "구글 시트 로드")
-        else:
-            st.caption("이전에 받은 **분석 엑셀**을 올리면 API 호출 없이 즉시 분석합니다.")
-            f = st.file_uploader("엑셀 파일 (.xlsx)", type=["xlsx"], key="excel_upload")
-            if f is not None and st.button("📥 불러오기", type="primary", width="stretch"):
-                try:
-                    bundle = load_excel_bundle(f.getvalue())
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"엑셀 파일 오류: {e}")
-                else:
-                    _load_bundle_into_session(bundle, "엑셀 로드")
-
-        # ── 이름 매핑 CSV (어느 단계에서나 노출) ──
-        if "data" in st.session_state:
-            start_d, end_d, _p, _ph, _m, _b, res_uploaded, _ja = st.session_state["data"]
-            current_res = (st.session_state.get("master", {}).get("resolution")
-                           if isinstance(st.session_state.get("master"), dict) else None)
-            export_res = current_res if current_res else res_uploaded
-            st.divider()
-            st.subheader("🧭 이름 매핑")
-            if export_res:
-                tag = period_tag(start_d, end_d)
-                st.download_button(
-                    "⬇️ 매핑 CSV 저장",
-                    data=_resolution_to_csv(export_res),
-                    file_name=f"다감노_{tag}_이름매핑.csv",
-                    mime="text/csv", width="stretch",
-                )
-            else:
-                st.caption("아직 저장된 매핑이 없습니다. ① 단계에서 매핑을 지정한 뒤 받아오세요.")
-            up_csv = st.file_uploader("⬆️ 매핑 CSV 불러오기", type=["csv"],
-                                       key="resolution_csv_upload")
-            if up_csv is not None and st.button("매핑 적용", width="stretch"):
-                try:
-                    loaded = _parse_resolution_csv(up_csv.getvalue().decode("utf-8-sig"))
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"CSV 형식 오류: {e}")
-                else:
-                    # 업로드 매핑은 data 튜플에 보존하고 master/result 클리어해서 Stage 1로 재진입
-                    s_ym, e_ym, posts, photos, members, banned, _, join_aliases = st.session_state["data"]
-                    _set_data(s_ym, e_ym, posts, photos,
-                              members=members, banned=banned, resolution=loaded,
-                              join_aliases=join_aliases)
-                    st.success(f"{len(loaded)}개 매핑 적용 — 다시 ①부터 진행하세요.")
-                    st.rerun()
-
-        if "result" in st.session_state:
-            start_r, end_r = st.session_state["result"][0], st.session_state["result"][1]
-            xlsx_r = st.session_state["result"][4]
-            tag = period_tag(start_r, end_r)
-            st.divider()
-            st.subheader("💾 다운로드")
-            st.download_button(
-                "📥 엑셀 (인사이트 + 원본)",
-                data=xlsx_r,
-                file_name=f"다감노_{tag}_분석.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                width="stretch",
-            )
-            st.caption("이 엑셀을 다음에 그대로 업로드하면 API 호출 없이 같은 분석을 다시 볼 수 있어요.")
-
-            if _gsheets_configured():
-                if st.button("📤 구글 시트로 내보내기", width="stretch"):
-                    with st.spinner("구글 시트로 올리는 중…"):
-                        try:
-                            from core.gsheets import default_title
-                            store = _gsheets_store()
-                            file_id, url = store.upload(xlsx_r, default_title(tag))
-                            if not (_gsheets_conf() or {}).get("folder_id"):
-                                # 서비스 계정 소유 파일은 폴더 지정이 없으면
-                                # 링크 공유를 켜야 사용자가 열 수 있다.
-                                store.share_anyone_reader(file_id)
-                        except Exception as e:  # noqa: BLE001
-                            st.error(f"구글 시트 내보내기 실패: {e}")
-                        else:
-                            st.session_state["_gsheet_url"] = url
-                if st.session_state.get("_gsheet_url"):
-                    st.success("구글 시트로 내보냈습니다.")
-                    st.link_button("🔗 시트 열기", st.session_state["_gsheet_url"],
-                                   width="stretch")
-                    st.code(st.session_state["_gsheet_url"], language=None)
-                    st.caption("이 주소를 **데이터 소스 → 구글 시트**에 붙여넣으면 "
-                               "다시 불러올 수 있습니다.")
-
-        if "data" in st.session_state:
-            st.divider()
-            if st.button("🔄 처음으로", width="stretch"):
-                for k in ("data", "master", "result", "_collect_cache",
-                          "api_start_y", "api_start_m", "api_end_y", "api_end_m",
-                          "excel_upload", "resolution_csv_upload",
-                          "_noise_pending", "_res_editor_nonce", "noise_multiselect",
-                          "gsheet_url", "_gsheet_url"):
-                    st.session_state.pop(k, None)
-                st.rerun()
+def load_analysis(stores) -> dict | None:
+    """시트에서 읽어 분석 상태를 만든다. 세션에 캐시 — 매 rerun마다 읽지 않도록."""
+    if stores is None:
+        return None
+    if "_analysis" in st.session_state:
+        return st.session_state["_analysis"]
+    raw_store, fix_store = stores
+    with st.spinner("구글 시트에서 데이터를 읽는 중…"):
+        try:
+            analysis = build_analysis(raw_store.load(), fix_store.load())
+        except Exception as e:  # noqa: BLE001
+            st.error(f"구글 시트를 읽지 못했습니다: {e}")
+            return None
+    st.session_state["_analysis"] = analysis
+    return analysis
 
 
 def main() -> None:
     st.set_page_config(page_title="다감노 분석", page_icon="📸", layout="wide")
-    st.title("📸 다감노 분석")
-    st.caption(f"{GROUP_NAME} 게시글·사진을 수집·검토하고 통계 엑셀을 생성합니다.")
-
-    render_sidebar()
-
-    if "data" not in st.session_state:
-        st.info(
-            "👈 사이드바에서 **API 수집**으로 데이터를 모으거나, "
-            "이전에 다운로드한 **분석 엑셀**을 업로드해 주세요."
-        )
+    if not _auth_ok():
         return
 
-    start_ym, end_ym, posts, photos, members, banned, resolution_uploaded, join_aliases = \
-        st.session_state["data"]
+    st.title("📸 다감노 분석")
+    st.caption(f"{GROUP_NAME} 게시글·사진을 구글 시트에 쌓아 두고 분석합니다. "
+               "보정은 시트에서 한 번만 하면 이후 수집에도 계속 적용됩니다.")
 
-    if "result" in st.session_state:
-        render_results(*st.session_state["result"])
-    elif "master" in st.session_state:
-        render_triage(start_ym, end_ym, posts, photos, st.session_state["master"])
-    else:
-        render_resolution(start_ym, end_ym, posts, photos, members,
-                           banned, resolution_uploaded, join_aliases)
+    stores = get_stores()
+    analysis = load_analysis(stores)
+    render_sidebar(stores, analysis)
+
+    if stores is None:
+        st.info("👈 먼저 구글 연동을 설정해 주세요.")
+        return
+    if not analysis or not (analysis.get("posts") or analysis.get("photos")):
+        st.info("👈 사이드바 **📥 수집**에서 기간을 지정해 데이터를 받아오세요.")
+        return
+
+    full = collected_range(analysis["history"], analysis["posts"], analysis["photos"])
+    if full is None:
+        st.warning("기간을 판단할 수 있는 데이터가 없습니다.")
+        return
+
+    view = _period_picker(full)
+    st.session_state["_view_range"] = view
+    posts, photos = slice_period(analysis, *view)
+    render_results(view[0], view[1], posts, photos, analysis["master"],
+                   members=analysis["members"], applied=analysis["applied"])
+
 
 
 if __name__ == "__main__":
