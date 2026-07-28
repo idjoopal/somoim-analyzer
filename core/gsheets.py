@@ -1,21 +1,13 @@
 """구글 스프레드시트 입출력 — 분석 결과를 시트로 내보내고 다시 읽어온다.
 
-## 왜 이렇게 만들었나
+## 두 가지 쓰임
 
-가시 시트 12~13개를 Sheets API로 다시 그리는 것은 막대한 작업이고 색·데이터바·
-차트를 전부 잃는다. 대신 **Google Drive의 xlsx ↔ Sheets 자동 변환**에 얹는다:
-
-    내보내기: build_excel() → xlsx bytes → files.create(
-                 mimeType="application/vnd.google-apps.spreadsheet")
-    불러오기: 시트 URL → files.export(
-                 mimeType="…spreadsheetml.sheet") → load_excel_bundle()
-
-`load_excel_bundle`은 시트 **이름**으로 찾아 값만 읽으므로, 숨김 시트
-(`_메타`·`_원본_게시글` 등)가 변환을 왕복해도 그대로 복원된다. 즉 기존 생성/복원
-코드를 건드리지 않고 시트 지원이 붙는다.
-
-변환이 날짜 셀의 타입을 바꿔 놓을 수 있는데, 그건 `excel_builder._coerce_dt` /
-`_coerce_iso_date`가 흡수한다.
+1. **`SheetsClient`** — 탭 단위 셀 읽기/쓰기. `core.store`의 raw·보정 시트가
+   이걸 쓴다. 자주 일부만 갱신하는 데이터라 파일 통째 조작은 맞지 않는다.
+2. **`GoogleSheetsStore`** — Drive 파일 조작. 이름으로 찾기/만들기(`find_or_create`)와,
+   결과 엑셀을 시트로 변환 업로드(`upload`)에 쓴다. 가시 시트 12~13개를 Sheets
+   API로 다시 그리면 색·데이터바·차트를 전부 잃으므로, `build_excel()`이 만든
+   xlsx를 Drive가 변환하게 둔다.
 
 ## 설정
 
@@ -64,30 +56,6 @@ class GSheetsError(RuntimeError):
 # ═══════════════════════════════════════════════════════════════
 # 순수 함수 (네트워크 무관 — 단독 테스트 가능)
 # ═══════════════════════════════════════════════════════════════
-
-def parse_sheet_id(url_or_id: str) -> str:
-    """시트 URL 또는 ID 문자열에서 파일 ID를 뽑는다.
-
-    >>> parse_sheet_id("https://docs.google.com/spreadsheets/d/1AbC.../edit#gid=0")
-    '1AbC...'
-
-    Raises:
-        GSheetsError — 형태를 알아볼 수 없을 때.
-    """
-    s = (url_or_id or "").strip()
-    if not s:
-        raise GSheetsError("시트 주소가 비어 있습니다.")
-    for pat in (_ID_IN_PATH, _ID_IN_QUERY):
-        m = pat.search(s)
-        if m:
-            return m.group(1)
-    if _BARE_ID.match(s):
-        return s
-    raise GSheetsError(
-        "구글 시트 주소를 알아볼 수 없습니다. "
-        "`https://docs.google.com/spreadsheets/d/.../edit` 형태의 링크를 붙여넣어 주세요."
-    )
-
 
 def sheet_url(file_id: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{file_id}/edit"
@@ -181,17 +149,6 @@ class GoogleSheetsStore:
             raise GSheetsError(_explain(e, "시트 생성")) from e
         file_id = created["id"]
         return file_id, sheet_url(file_id)
-
-    # ── 불러오기 ────────────────────────────────────────────────
-    def download(self, url_or_id: str) -> bytes:
-        """구글 시트를 xlsx bytes로 내려받는다 (`load_excel_bundle`에 그대로 넣을 수 있음)."""
-        file_id = parse_sheet_id(url_or_id)
-        try:
-            return self._service.files().export(
-                fileId=file_id, mimeType=MIME_XLSX,
-            ).execute()
-        except Exception as e:  # noqa: BLE001
-            raise GSheetsError(_explain(e, "시트 읽기")) from e
 
     # ── 이름으로 찾기/만들기 ────────────────────────────────────
     def find_by_name(self, title: str) -> Optional[str]:

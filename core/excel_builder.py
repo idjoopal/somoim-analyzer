@@ -1,7 +1,7 @@
 """
 다감노📸 엑셀 빌더
 
-수집된 게시글·사진 데이터를 받아 다중 시트 엑셀(bytes)을 생성.
+수집·보정된 데이터를 받아 다중 시트 엑셀(bytes)을 생성 — 출력 전용.
 
 외부 의존: openpyxl
 
@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from io import BytesIO
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from collections import defaultdict
 from typing import Optional
 
@@ -33,33 +33,12 @@ from .collector import (  # noqa: F401
 
 
 # ═══════════════════════════════════════════════════════════════
-# 엑셀 = 결과 + 원본 (다음 세션 재사용)
+# 엑셀 = 결과물
 # ═══════════════════════════════════════════════════════════════
 #
-# 11개 가시 시트 뒤에 4개 숨김 시트를 둬서, 이 엑셀 하나만으로
-# (인사이트 다시 보기) + (원본 데이터 재분석)이 가능하게 한다.
-# 숨김 시트는 Excel에서 시트 탭 우클릭 → 숨기기 취소로 노출 가능.
+# 원본과 보정은 구글 시트(`core.store`)에 산다. 이 파일은 보고 공유하는
+# 산출물일 뿐이라 재업로드로 복원하는 경로가 없다.
 
-# v2: 메타가 (year, month) 대신 (start_ym, end_ym) 기간 쌍을 저장.
-# v1 엑셀은 load_excel_bundle이 읽을 때 자동으로 범위로 변환한다(하위 호환).
-EXCEL_SCHEMA_VERSION = 2
-
-BASE_POST_KEYS: list[str] = [
-    "id", "author", "wid", "title", "body", "outing_date", "posted_at",
-    "cat", "cat_label", "category", "is_outing", "is_canceled",
-    "likes", "comments", "images", "needs_review", "review_reason",
-]
-BASE_PHOTO_KEYS: list[str] = [
-    "id", "author", "wid", "posted_at", "likes", "comments", "has_comment",
-    "url_large", "url_medium", "url_small", "url_thumb",
-]
-BASE_MEMBER_KEYS: list[str] = [
-    "mid", "mn", "is_admin", "joined_at", "last_visit", "os", "push",
-]
-_BOOL_POST_KEYS = {"is_outing", "is_canceled", "needs_review"}
-_BOOL_PHOTO_KEYS = {"has_comment"}
-_BOOL_MEMBER_KEYS = {"is_admin", "push"}
-_DT_MEMBER_KEYS = {"joined_at", "last_visit"}
 _CELL_MAX_LEN = 32000  # 엑셀 셀당 32,767자 한도 안전 여유
 
 
@@ -125,17 +104,16 @@ def build_excel(
     photos: list[dict],
     start_ym: int,
     end_ym: int,
-    master_records: Optional[list[dict]] = None,
     members: Optional[list[dict]] = None,
-    banned: Optional[set[str]] = None,
-    resolution: Optional[dict[str, str]] = None,
-    join_aliases: Optional[dict[str, str]] = None,
+    **_ignored,
 ) -> bytes:
     """
-    수집 데이터로부터 엑셀 파일(bytes) 생성.
+    수집 데이터로부터 엑셀 파일(bytes) 생성 — **출력 전용**.
 
-    가시 시트 12개(+ 멤버 정보 있으면 13개) + 숨김 시트(원본·매핑 임베드 —
-    재업로드 시 API 호출 없이 재분석).
+    예전에는 숨김 시트 8장에 원본·매핑을 함께 담아 이 파일이 저장 매체 노릇을
+    했지만, 이제 원본과 보정은 구글 시트(`core.store`)에 산다. 여기서는 보고
+    공유할 결과물만 만든다. 구글 시트 내보내기도 이 바이트를 Drive에 올려
+    변환하는 방식이라 이 빌더가 렌더링 엔진 역할을 계속한다.
 
     가시 시트 구성:
     1. 📊 대시보드
@@ -145,14 +123,12 @@ def build_excel(
     5. 📷 사진
     6. 🎨 월별 테마 매트릭스
     7. 👤 사진 통계
-    8. 🏷️ 카테고리
+    8. 🏷️ 카테고리 (+ 카테고리 × 월)
     9. 💡 인사이트
     10. 🎯 출사별 참석자 (+ 고아 후기 섹션)
     11. 👥 멤버별 참석
     12. 📅 월별 참석 매트릭스
     13. 🧑‍🤝‍🧑 멤버 현황          — members 전달 시
-    (숨김) _메타, _원본_게시글, _원본_사진, _멤버마스터, _멤버, _탈퇴멤버,
-            _이름매핑, _가입인사매핑 — 각 인자 전달 시
     """
     label = period_label(start_ym, end_ym)
     months = month_axis(start_ym, end_ym)
@@ -190,20 +166,6 @@ def build_excel(
     if members:
         _build_sheet_member_overview(wb, members, posts, photos, posts_A)
 
-    _build_sheet_meta(wb, start_ym, end_ym)
-    _build_sheet_raw_posts(wb, posts)
-    _build_sheet_raw_photos(wb, photos)
-    if master_records is not None:
-        _build_sheet_master(wb, master_records)
-    if members is not None:
-        _build_sheet_members(wb, members)
-    if banned:
-        _build_sheet_banned(wb, banned)
-    if resolution is not None:
-        _build_sheet_resolution(wb, resolution)
-    if join_aliases is not None:
-        _build_sheet_join_aliases(wb, join_aliases)
-
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -215,26 +177,19 @@ def save_excel(
     start_ym: int,
     end_ym: int,
     path: Optional[str] = None,
-    master_records: Optional[list[dict]] = None,
     members: Optional[list[dict]] = None,
-    banned: Optional[set[str]] = None,
-    resolution: Optional[dict[str, str]] = None,
-    join_aliases: Optional[dict[str, str]] = None,
 ) -> str:
     """엑셀을 파일로 저장. 경로 미지정시 기본 이름 사용."""
     if path is None:
         path = f"다감노_{period_tag(start_ym, end_ym)}_분석.xlsx"
-    data = build_excel(posts, photos, start_ym, end_ym,
-                       master_records=master_records,
-                       members=members, banned=banned, resolution=resolution,
-                       join_aliases=join_aliases)
+    data = build_excel(posts, photos, start_ym, end_ym, members=members)
     with open(path, "wb") as f:
         f.write(data)
     return path
 
 
 # ═══════════════════════════════════════════════════════════════
-# 숨김 시트 — 원본 데이터 + 마스터 임베드
+# 셀 값 정규화
 # ═══════════════════════════════════════════════════════════════
 
 def _truncate(s: str, limit: int = _CELL_MAX_LEN) -> str:
@@ -252,89 +207,6 @@ def _to_cell(value, key: str = "") -> object:
     if isinstance(value, str):
         return _truncate(value) if key == "body" else value
     return str(value)
-
-
-def _build_sheet_meta(wb: Workbook, start_ym: int, end_ym: int) -> None:
-    ws = wb.create_sheet("_메타")
-    ws.sheet_state = "hidden"
-    ws.append(["key", "value"])
-    rows = [
-        ("schema_version", EXCEL_SCHEMA_VERSION),
-        ("start_ym", int(start_ym)),
-        ("end_ym", int(end_ym)),
-        ("saved_at", datetime.now().isoformat(timespec="seconds")),
-    ]
-    for k, v in rows:
-        ws.append([k, v])
-
-
-def _build_sheet_raw_posts(wb: Workbook, posts: list[dict]) -> None:
-    ws = wb.create_sheet("_원본_게시글")
-    ws.sheet_state = "hidden"
-    ws.append(BASE_POST_KEYS)
-    for p in posts:
-        ws.append([_to_cell(p.get(k), k) for k in BASE_POST_KEYS])
-
-
-def _build_sheet_raw_photos(wb: Workbook, photos: list[dict]) -> None:
-    ws = wb.create_sheet("_원본_사진")
-    ws.sheet_state = "hidden"
-    ws.append(BASE_PHOTO_KEYS)
-    for ph in photos:
-        ws.append([_to_cell(ph.get(k), k) for k in BASE_PHOTO_KEYS])
-
-
-def _build_sheet_master(wb: Workbook, master_records: list[dict]) -> None:
-    ws = wb.create_sheet("_멤버마스터")
-    ws.sheet_state = "hidden"
-    ws.append(["실명", "닉네임", "별칭"])
-    for r in master_records or []:
-        aliases = r.get("별칭") or []
-        if isinstance(aliases, str):
-            alias_str = aliases
-        else:
-            alias_str = ";".join(str(a) for a in aliases if a)
-        ws.append([
-            str(r.get("실명") or ""),
-            str(r.get("닉네임") or ""),
-            alias_str,
-        ])
-
-
-def _build_sheet_members(wb: Workbook, members: list[dict]) -> None:
-    """활성 멤버 API 결과를 숨김 시트로 저장(엑셀 재업로드 시 복원용)."""
-    ws = wb.create_sheet("_멤버")
-    ws.sheet_state = "hidden"
-    ws.append(BASE_MEMBER_KEYS)
-    for m in members or []:
-        ws.append([_to_cell(m.get(k), k) for k in BASE_MEMBER_KEYS])
-
-
-def _build_sheet_banned(wb: Workbook, banned: set[str]) -> None:
-    """탈퇴 멤버 닉네임 1컬럼."""
-    ws = wb.create_sheet("_탈퇴멤버")
-    ws.sheet_state = "hidden"
-    ws.append(["닉네임"])
-    for nick in sorted(banned or set()):
-        ws.append([str(nick)])
-
-
-def _build_sheet_resolution(wb: Workbook, resolution: dict[str, str]) -> None:
-    """이름 해소 매핑(이름→처리) 저장."""
-    ws = wb.create_sheet("_이름매핑")
-    ws.sheet_state = "hidden"
-    ws.append(["이름", "처리"])
-    for name, target in (resolution or {}).items():
-        ws.append([str(name), str(target)])
-
-
-def _build_sheet_join_aliases(wb: Workbook, join_aliases: dict[str, str]) -> None:
-    """가입인사 자동 추출 매핑(실명→닉네임) 저장."""
-    ws = wb.create_sheet("_가입인사매핑")
-    ws.sheet_state = "hidden"
-    ws.append(["실명", "닉네임"])
-    for real, nick in (join_aliases or {}).items():
-        ws.append([str(real), str(nick)])
 
 
 def _build_sheet_member_overview(
@@ -440,250 +312,6 @@ def _build_sheet_member_overview(
 
     _set_col_widths(ws, {"A": 16, "B": 8, "C": 12, "D": 12, "E": 10,
                           "F": 8, "G": 8, "H": 8, "I": 10})
-
-
-# ═══════════════════════════════════════════════════════════════
-# 엑셀 → 원본 데이터 복원 (재업로드)
-# ═══════════════════════════════════════════════════════════════
-
-def load_excel_bundle(data: bytes) -> dict:
-    """엑셀 bytes에서 숨김 시트의 원본 데이터를 복원.
-
-    v1(year/month) 엑셀도 읽어서 자동으로 기간 쌍으로 변환한다.
-
-    Returns:
-        {
-          "start_ym": int, "end_ym": int,
-          "posts":  list[dict],
-          "photos": list[dict],
-          "master": list[dict],     # legacy(_멤버마스터) — 비어있을 수 있음
-          "members": list[dict],    # _멤버 (활성 멤버 API 결과)
-          "banned": set[str],       # _탈퇴멤버
-          "resolution": dict[str,str],  # _이름매핑 (이름→처리)
-        }
-    Raises:
-        ValueError — 메타 시트 없음/지원하지 않는 버전/필수 시트 누락.
-    """
-    from openpyxl import load_workbook
-    wb = load_workbook(BytesIO(data), data_only=True)
-
-    for name in ("_메타", "_원본_게시글", "_원본_사진"):
-        if name not in wb.sheetnames:
-            raise ValueError(f"이 엑셀에는 원본 데이터({name})가 포함돼 있지 않습니다.")
-
-    meta = _read_meta(wb["_메타"])
-    start_ym, end_ym = _meta_period(meta)
-
-    posts = _read_raw(wb["_원본_게시글"], BASE_POST_KEYS, _BOOL_POST_KEYS)
-    photos = _read_raw(wb["_원본_사진"], BASE_PHOTO_KEYS, _BOOL_PHOTO_KEYS)
-    master = _read_master(wb["_멤버마스터"]) if "_멤버마스터" in wb.sheetnames else []
-    members = _read_members(wb["_멤버"]) if "_멤버" in wb.sheetnames else []
-    banned = _read_banned(wb["_탈퇴멤버"]) if "_탈퇴멤버" in wb.sheetnames else set()
-    resolution = _read_resolution(wb["_이름매핑"]) if "_이름매핑" in wb.sheetnames else {}
-    join_aliases = (_read_join_aliases(wb["_가입인사매핑"])
-                    if "_가입인사매핑" in wb.sheetnames else {})
-
-    return {"start_ym": start_ym, "end_ym": end_ym, "posts": posts, "photos": photos,
-            "master": master, "members": members, "banned": banned,
-            "resolution": resolution, "join_aliases": join_aliases}
-
-
-def _meta_period(meta: dict) -> tuple[int, int]:
-    """`_메타`에서 기간을 읽는다 — v2는 직독, v1은 year/month를 범위로 변환.
-
-    v1은 "한 해" 또는 "한 해의 한 달"만 표현할 수 있었으므로
-    month가 있으면 그 달 하나(202605~202605), 없으면 그 해 전체(202601~202612).
-    """
-    ver = meta.get("schema_version")
-    if ver == EXCEL_SCHEMA_VERSION:
-        return int(meta["start_ym"]), int(meta["end_ym"])
-    if ver == 1:
-        year = int(meta["year"])
-        mv = meta.get("month")
-        month = int(mv) if mv not in (None, "", 0) else None
-        if month is None:
-            return year * 100 + 1, year * 100 + 12
-        return year * 100 + month, year * 100 + month
-    raise ValueError(
-        f"지원하지 않는 엑셀 버전: {ver} (지원=1, {EXCEL_SCHEMA_VERSION})"
-    )
-
-
-def _read_meta(ws) -> dict:
-    out: dict = {}
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return out
-    for row in rows[1:]:  # 헤더 스킵
-        if not row or row[0] in (None, ""):
-            continue
-        out[str(row[0])] = row[1] if len(row) > 1 else None
-    return out
-
-
-# 셀 값이 어떤 타입으로 돌아오든 파이프라인이 기대하는 타입으로 되돌린다.
-#
-# openpyxl로 우리가 쓴 파일을 그대로 읽으면 datetime이 나오지만, 구글 시트를
-# 거쳐 오면(xlsx → Sheets → xlsx) 같은 셀이 문자열이나 엑셀 serial로 바뀔 수
-# 있다. 그대로 흘리면 다운스트림의 `p["posted_at"].month`가 런타임에 터진다.
-_EXCEL_EPOCH = datetime(1899, 12, 30)   # 엑셀 serial 1 = 1900-01-01
-_DT_KEYS = {"posted_at"}
-_ISO_DATE_KEYS = {"outing_date"}
-
-
-def _coerce_dt(v) -> Optional[datetime]:
-    """datetime | date | ISO 문자열 | 엑셀 serial → datetime (실패 시 None)."""
-    if v is None or v == "":
-        return None
-    if isinstance(v, datetime):
-        return v
-    if isinstance(v, date):
-        return datetime(v.year, v.month, v.day)
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
-        try:
-            return _EXCEL_EPOCH + timedelta(days=float(v))
-        except (OverflowError, ValueError):
-            return None
-    s = str(v).strip()
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00").replace("/", "-"))
-    except ValueError:
-        pass
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def _coerce_iso_date(v) -> Optional[str]:
-    """date | datetime | 문자열 | 엑셀 serial → `"YYYY-MM-DD"` (실패 시 None).
-
-    출사일은 ISO 문자열로 저장되는데, 시트가 날짜로 자동 인식해 되돌려주면
-    datetime이 되어 `date.fromisoformat()`이 깨진다.
-    """
-    dt = _coerce_dt(v)
-    return dt.date().isoformat() if dt else None
-
-
-def _normalize_record(rec: dict) -> dict:
-    """복원한 한 행의 날짜 필드를 파이프라인 기대 타입으로 맞춘다."""
-    for k in _DT_KEYS:
-        if k in rec:
-            rec[k] = _coerce_dt(rec[k])
-    for k in _ISO_DATE_KEYS:
-        if k in rec:
-            rec[k] = _coerce_iso_date(rec[k])
-    return rec
-
-
-def _read_raw(ws, keys: list[str], bool_keys: set[str]) -> list[dict]:
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return []
-    header = [str(c) if c is not None else "" for c in rows[0]]
-    out: list[dict] = []
-    for row in rows[1:]:
-        if not row or all(c is None for c in row):
-            continue
-        rec: dict = {}
-        for i, k in enumerate(header):
-            v = row[i] if i < len(row) else None
-            if k in bool_keys:
-                v = bool(v)
-            elif k == "review_reason" and v is None:
-                v = ""
-            rec[k] = v
-        for k in keys:
-            rec.setdefault(k, "" if k == "review_reason" else None)
-        out.append(_normalize_record(rec))
-    return out
-
-
-def _read_master(ws) -> list[dict]:
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return []
-    out: list[dict] = []
-    for row in rows[1:]:
-        if not row or all(c in (None, "") for c in row):
-            continue
-        real = str(row[0]) if len(row) > 0 and row[0] not in (None, "") else ""
-        nick = str(row[1]) if len(row) > 1 and row[1] not in (None, "") else ""
-        alias_raw = str(row[2]) if len(row) > 2 and row[2] not in (None, "") else ""
-        aliases = [a.strip() for a in alias_raw.split(";") if a.strip()]
-        out.append({"실명": real, "닉네임": nick, "별칭": aliases})
-    return out
-
-
-def _read_members(ws) -> list[dict]:
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return []
-    header = [str(c) if c is not None else "" for c in rows[0]]
-    out: list[dict] = []
-    for row in rows[1:]:
-        if not row or all(c in (None, "") for c in row):
-            continue
-        rec: dict = {}
-        for i, k in enumerate(header):
-            v = row[i] if i < len(row) else None
-            if k in _BOOL_MEMBER_KEYS:
-                v = bool(v)
-            elif k in _DT_MEMBER_KEYS:
-                if v in (None, ""):
-                    v = None
-            elif v is None:
-                v = ""
-            rec[k] = v
-        for k in BASE_MEMBER_KEYS:
-            rec.setdefault(k, None)
-        out.append(rec)
-    return out
-
-
-def _read_banned(ws) -> set[str]:
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return set()
-    out: set[str] = set()
-    for row in rows[1:]:
-        if row and row[0] not in (None, ""):
-            out.add(str(row[0]))
-    return out
-
-
-def _read_resolution(ws) -> dict[str, str]:
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return {}
-    out: dict[str, str] = {}
-    for row in rows[1:]:
-        if not row or row[0] in (None, ""):
-            continue
-        name = str(row[0])
-        target = str(row[1]) if len(row) > 1 and row[1] not in (None, "") else ""
-        if target:
-            out[name] = target
-    return out
-
-
-def _read_join_aliases(ws) -> dict[str, str]:
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return {}
-    out: dict[str, str] = {}
-    for row in rows[1:]:
-        if not row or row[0] in (None, ""):
-            continue
-        real = str(row[0])
-        nick = str(row[1]) if len(row) > 1 and row[1] not in (None, "") else ""
-        if nick:
-            out[real] = nick
-    return out
 
 
 # ═══════════════════════════════════════════════════════════════

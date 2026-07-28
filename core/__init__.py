@@ -14,7 +14,7 @@ from .collector import (
     extract_raw_names, resolve_names, annotate_attendees, collect_all_unresolved,
     parse_review_outing_date, annotate_review_attendees, match_outings_with_reviews,
 )
-from .excel_builder import build_excel, save_excel, load_excel_bundle
+from .excel_builder import build_excel, save_excel
 
 __all__ = [
     "GROUP_ID", "GROUP_NAME",
@@ -29,5 +29,5 @@ __all__ = [
     "parse_member_csv", "build_member_master", "build_member_candidates", "extract_attendees",
     "extract_raw_names", "resolve_names", "annotate_attendees", "collect_all_unresolved",
     "parse_review_outing_date", "annotate_review_attendees", "match_outings_with_reviews",
-    "build_excel", "save_excel", "load_excel_bundle",
+    "build_excel", "save_excel",
 ]
