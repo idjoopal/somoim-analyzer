@@ -9,7 +9,7 @@ from datetime import date, datetime
 import pytest
 
 from core.collector import (
-    ALL_CATS, LEFT_MEMBER, NOT_A_NAME,
+    ALL_CATS, LEFT_MEMBER, NOT_A_NAME, OUTING_CATS,
     summarize_body_lengths, summarize_raw_fields,
 )
 from core.store import (
@@ -37,6 +37,7 @@ from core.store import (
     coerce_iso_date,
     correction_candidates,
     display_name,
+    dropdowns,
     member_name_candidates,
     parse_member_names,
     real_by_nickname,
@@ -227,6 +228,34 @@ def test_parse_corrections_reads_each_field():
     c = parse_corrections([], posts, [])
     assert c["posts"]["p1"] == {"category": "인물", "outing_date": "2026-05-05",
                                 "is_canceled": True, "excluded": False}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 일반공지 — 어느 카테고리에도 안 걸리는 공지를 사람이 지정한다
+# ═══════════════════════════════════════════════════════════════
+
+def test_general_notice_is_a_selectable_non_outing_category():
+    assert "일반공지" in ALL_CATS
+    assert "일반공지" not in OUTING_CATS      # 출사가 아니다
+
+
+def test_general_notice_is_offered_in_the_dropdown():
+    by_col = {(t, col): v for t, col, v in dropdowns()}
+    assert "일반공지" in by_col[(TAB_POST_FIX, 2)]
+
+
+def test_correcting_the_category_also_flips_is_outing():
+    """이걸 빼면 `일반공지`로 바꿔도 출사로 계속 집계된다."""
+    posts = [post("p1", category="풍경", is_outing=True)]
+    apply_corrections(posts, {"posts": {"p1": {"category": "일반공지"}}})
+    assert posts[0]["category"] == "일반공지"
+    assert posts[0]["is_outing"] is False
+
+
+def test_correcting_to_an_outing_category_sets_is_outing():
+    posts = [post("p1", category="보정", is_outing=False)]
+    apply_corrections(posts, {"posts": {"p1": {"category": "인물"}}})
+    assert posts[0]["is_outing"] is True
 
 
 def test_parse_corrections_splits_attendees():
@@ -665,21 +694,52 @@ def test_resolved_real_names_drop_out_of_the_leftover_tab():
     assert [r[0] for r in leftover[TAB_NAME_MAP]] == ["오타이름"]
 
 
-def test_relabel_attendees_does_not_mutate_the_original():
+def test_relabel_names_does_not_mutate_the_original():
     """원본을 건드리면 매칭 키가 깨진다."""
-    from core.store import relabel_attendees
+    from core.store import relabel_names
 
     posts = [post("p1", attendees=["원석사진", "나무"])]
-    shown = relabel_attendees(posts, {"원석사진": "정원석"})
+    shown = relabel_names(posts, {"원석사진": "정원석"})
 
     assert shown[0]["attendees"] == ["원석사진(정원석)", "나무"]
     assert posts[0]["attendees"] == ["원석사진", "나무"]
 
 
 def test_relabel_is_a_noop_without_real_names():
-    from core.store import relabel_attendees
+    from core.store import relabel_names
     posts = [post("p1", attendees=["원석사진"])]
-    assert relabel_attendees(posts, {}) is posts
+    assert relabel_names(posts, {}) is posts
+
+
+def test_relabel_covers_author_and_member_nickname_too():
+    """참석자만 바꾸면 작성자·업로더 랭킹은 닉네임 그대로 남는다."""
+    from core.store import relabel_names
+
+    real = {"원석사진": "정원석"}
+    assert relabel_names([post("p1", author="원석사진")], real)[0]["author"] \
+        == "원석사진(정원석)"
+    assert relabel_names([{"mid": "m1", "mn": "원석사진"}], real)[0]["mn"] \
+        == "원석사진(정원석)"
+
+
+def test_relabel_keeps_the_raw_nickname_for_identity_checks():
+    """동명이인 판정은 표시 이름이 아니라 원래 닉네임으로 해야 한다.
+
+    실명을 붙이면 두 사람이 서로 다른 이름이 되지만, 후기 본문에는 여전히
+    닉네임만 적히므로 합쳐 집계되는 문제는 그대로다 — 경고가 사라지면 안 된다.
+    """
+    from core.store import relabel_names
+
+    shown = relabel_names([{"mid": "m1", "mn": "민수"}], {"민수": "김민수"})[0]
+    assert shown["mn"] == "민수(김민수)"
+    assert shown["_raw_mn"] == "민수"
+
+
+def test_relabel_leaves_records_untouched_when_name_is_unchanged():
+    """실명이 없거나 닉네임과 같으면 사본을 만들 이유도 없다."""
+    from core.store import relabel_names
+    rec = {"mid": "m1", "mn": "나무"}
+    assert relabel_names([rec], {"원석사진": "정원석"})[0] is rec
 
 
 def test_load_exposes_member_names():
