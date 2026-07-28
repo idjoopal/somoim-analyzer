@@ -6,8 +6,10 @@
 - (선택) tqdm
 
 주요 함수:
-- collect_posts(year, month=None, progress=None) -> list[dict]
-- collect_photos(year, month=None, progress=None) -> list[dict]
+- collect_posts(start_ym, end_ym, progress=None) -> list[dict]
+- collect_photos(start_ym, end_ym, progress=None) -> list[dict]
+
+기간은 YYYYMM 정수 쌍(start_ym, end_ym)으로 표현한다 — 아래 "기간" 절 참고.
 """
 
 from __future__ import annotations
@@ -31,6 +33,11 @@ BASE_URL = "https://www.somoim.co.kr"
 CDN_BASE = "https://d3vo2hyhx9t76k.cloudfront.net"
 
 EPOCH_OFFSET = 1_000_000_000  # unix_ts = (w_t or ot) + EPOCH_OFFSET
+
+MAX_PAGES = 200  # /api/articles 페이지 한도 (20건/페이지)
+# 공지는 '출사일' 기준으로 거르는데 작성일은 그보다 앞설 수 있어, 기간 시작보다
+# 이만큼 과거까지 더 받아 둔다(예: 12월에 올린 1월 출사 공지).
+FETCH_MARGIN_MONTHS = 12
 
 HEADERS = {
     "User-Agent":   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -61,6 +68,91 @@ DATE_PATTERNS_NO_YEAR  = [
     r"(\d{1,2})/(\d{2})",
     r"(\d{1,2})월\s*(\d{1,2})일",
 ]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 기간 (YYYYMM) — 단일 진리원
+# ═══════════════════════════════════════════════════════════════
+#
+# 수집·필터·집계·표시가 모두 이 함수들을 공유해 판정이 갈라지지 않게 한다.
+# 기간은 (start_ym, end_ym) 정수 쌍이며 ym = YYYY*100 + MM (예: 202603).
+#   한 해 전체 → (202601, 202612)   한 달 → (202605, 202605)
+#
+# `month_axis`가 월 축의 원천이다 — 데이터가 아니라 **선택한 기간**에서 축을
+# 만들기 때문에 활동이 없는 달도 0으로 남는다. 연도를 버리지 않으므로
+# 2025-03과 2026-03이 한 칸에 합쳐지지 않는다.
+
+def ym_of(d) -> int:
+    """date/datetime → YYYYMM 정수."""
+    return d.year * 100 + d.month
+
+
+def ym_split(ymv: int) -> tuple[int, int]:
+    """YYYYMM → (연, 월)."""
+    return divmod(int(ymv), 100)
+
+
+def ym_valid(ymv) -> bool:
+    """YYYYMM 형식이 유효한지(월이 1~12인지) 검사."""
+    try:
+        y, m = divmod(int(ymv), 100)
+    except (TypeError, ValueError):
+        return False
+    return 1900 <= y <= 9999 and 1 <= m <= 12
+
+
+def ym_add(ymv: int, months: int) -> int:
+    """YYYYMM에 월 단위 가감 (연도 넘김 처리). `ym_add(202601, -1) == 202512`."""
+    y, m = divmod(int(ymv), 100)
+    total = y * 12 + (m - 1) + months
+    return (total // 12) * 100 + (total % 12) + 1
+
+
+def ym_diff(a: int, b: int) -> int:
+    """a - b 를 개월 수로. `ym_diff(202603, 202601) == 2`."""
+    ya, ma = divmod(int(a), 100)
+    yb, mb = divmod(int(b), 100)
+    return (ya * 12 + ma) - (yb * 12 + mb)
+
+
+def in_ym_range(ymv: int, start_ym: int, end_ym: int) -> bool:
+    """ym이 [start_ym, end_ym] 안에 있는지 (양끝 포함)."""
+    return int(start_ym) <= int(ymv) <= int(end_ym)
+
+
+def month_axis(start_ym: int, end_ym: int) -> list[int]:
+    """범위 내 모든 월을 오름차순 리스트로. 역전된 입력은 정렬해서 받아준다."""
+    start_ym, end_ym = int(start_ym), int(end_ym)
+    if end_ym < start_ym:
+        start_ym, end_ym = end_ym, start_ym
+    return [ym_add(start_ym, i) for i in range(ym_diff(end_ym, start_ym) + 1)]
+
+
+def is_multi_year(start_ym: int, end_ym: int) -> bool:
+    """범위가 두 해 이상에 걸치는지 — 월 라벨에 연도를 넣을지 결정."""
+    return int(start_ym) // 100 != int(end_ym) // 100
+
+
+def ym_label(ymv: int, *, multi_year: bool = True) -> str:
+    """월 축 라벨. 다년이면 `2026-03`, 한 해 안이면 `3월`."""
+    y, m = divmod(int(ymv), 100)
+    return f"{y}-{m:02d}" if multi_year else f"{m}월"
+
+
+def period_label(start_ym: int, end_ym: int) -> str:
+    """사람이 읽는 기간 표기. 한 해 전체·단일 월은 기존 표기를 그대로 유지."""
+    sy, sm = divmod(int(start_ym), 100)
+    ey, em = divmod(int(end_ym), 100)
+    if int(start_ym) == int(end_ym):
+        return f"{sy}년 {sm}월"
+    if sy == ey:
+        return f"{sy}년 전체" if (sm, em) == (1, 12) else f"{sy}년 {sm}~{em}월"
+    return f"{sy}-{sm:02d} ~ {ey}-{em:02d}"
+
+
+def period_tag(start_ym: int, end_ym: int) -> str:
+    """파일명·커밋 메시지용 짧은 태그."""
+    return str(int(start_ym)) if int(start_ym) == int(end_ym) else f"{int(start_ym)}-{int(end_ym)}"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -165,25 +257,28 @@ def _emit(progress: ProgressFn, msg: str, pct: float) -> None:
 def _fetch_paginated(
     endpoint: str,
     list_key: str,
-    target_year: int,
+    stop_before_ym: Optional[int],
     progress: ProgressFn = None,
     progress_label: str = "수집",
     extra_payload: Optional[dict] = None,
     should_stop: Optional[Callable[[list[dict], datetime], bool]] = None,
 ) -> list[dict]:
-    """공통 페이지네이션 수집기. 대상 연도-1까지 도달하면 중단.
+    """공통 페이지네이션 수집기 (최신순 → 과거로).
 
-    extra_payload: API 호출에 추가할 페이로드(예: `{"cat": "J"}`)로 서버 측 필터링 활용.
-    should_stop: 각 페이지 누적 후 호출하는 조기 종료 콜백 — `(all_items, oldest_dt) -> bool`.
+    Args:
+        stop_before_ym: 이 YYYYMM보다 오래된 글을 만나면 중단. None이면 연도 기반
+            종료를 하지 않는다(가입인사처럼 전 기간을 훑어야 할 때).
+        extra_payload: API 호출에 추가할 페이로드(예: `{"cat": "J"}`)로 서버 측 필터 활용.
+        should_stop: 각 페이지 누적 후 호출하는 조기 종료 콜백 — `(all_items, oldest_dt) -> bool`.
     """
     all_items: list[dict] = []
     s_t = None
-    stop_year = target_year - 1
     base_payload: dict = {"gid": GROUP_ID, "wql": 20}
     if extra_payload:
         base_payload.update(extra_payload)
 
-    for page in range(1, 200):
+    hit_cap = True  # 아래 루프가 break 없이 끝나면 페이지 한도에 닿은 것
+    for page in range(1, MAX_PAGES + 1):
         payload = dict(base_payload)
         if s_t is not None:
             payload["s_t"] = s_t
@@ -193,31 +288,42 @@ def _fetch_paginated(
             r.raise_for_status()
         except Exception as e:
             _emit(progress, f"[ERROR] {endpoint} page {page}: {e}", 0.5)
+            hit_cap = False
             break
 
         data  = r.json()
         items = data.get(list_key, [])
         if not items:
+            hit_cap = False
             break
 
         all_items.extend(items)
         _emit(progress, f"{progress_label} {page}페이지, 누적 {len(all_items)}개", min(0.4, page / 50))
 
-        # 대상 연도 이전이면 중단
+        # 대상 기간보다 오래된 글에 닿으면 중단
         oldest = items[-1]
         oldest_ts = oldest["ot"] if oldest.get("w_t") == 2000000000 else oldest["w_t"]
         oldest_dt = _ts_to_dt(oldest_ts)
-        if oldest_dt.year < stop_year:
+        if stop_before_ym is not None and ym_of(oldest_dt) < stop_before_ym:
+            hit_cap = False
             break
 
         if should_stop is not None and should_stop(all_items, oldest_dt):
+            hit_cap = False
             break
 
         if data.get("eof") == "Y" or len(items) < 20:
+            hit_cap = False
             break
 
         s_t = items[-1].get("ot") or items[-1].get("w_t")
         time.sleep(0.15)
+
+    if hit_cap:
+        # 조용한 절단은 "데이터가 없다"로 오해되므로 반드시 알린다.
+        _emit(progress,
+              f"⚠️ {progress_label}: 페이지 한도({MAX_PAGES}p, 약 {MAX_PAGES * 20}건)에 도달해 "
+              "더 과거는 받지 못했습니다. 기간을 좁혀 나눠 수집하세요.", 0.5)
 
     return all_items
 
@@ -227,24 +333,23 @@ def _fetch_paginated(
 # ═══════════════════════════════════════════════════════════════
 
 def collect_posts(
-    year: int,
-    month: Optional[int] = None,
+    start_ym: int,
+    end_ym: int,
     progress: ProgressFn = None,
     keep_unclassified: bool = False,
 ) -> list[dict]:
     """
-    게시글 수집 + 필터링.
+    게시글 수집 + 기간 필터링.
 
     필터링 규칙:
-    - cat=A (공지): 출사일 기준 (작성일 무관, 출사가 target 연/월에 있으면 포함)
-    - cat=E (후기), cat=J (가입인사): 작성일 기준
+    - cat=A (공지): **출사일** 기준 (작성일 무관 — 출사가 기간 안이면 포함)
+    - cat=E (후기), cat=J (가입인사): **작성일** 기준
 
     Args:
-        year: 대상 연도 (예: 2026)
-        month: 대상 월 (None이면 연 전체)
+        start_ym, end_ym: 대상 기간 YYYYMM (양끝 포함). 한 해 전체는 202601~202612.
         progress: 진행 콜백 fn(msg: str, pct: float)
         keep_unclassified: True면 출사일 추론 실패한 cat=A 공지를 버리지 않고
-            outing_date=None으로 포함(연/월 게이트는 작성일 기준)하고 검토 대상으로 표시.
+            outing_date=None으로 포함(기간 게이트는 작성일 기준)하고 검토 대상으로 표시.
             기본 False는 기존 동작(추론 실패 공지 제외)을 그대로 유지.
 
     Returns:
@@ -255,7 +360,9 @@ def collect_posts(
             needs_review(bool), review_reason(str)
     """
     _emit(progress, "게시글 수집 시작…", 0.0)
-    raw = _fetch_paginated("/api/articles", "cs", year, progress, "게시글")
+    raw = _fetch_paginated("/api/articles", "cs",
+                           ym_add(start_ym, -FETCH_MARGIN_MONTHS),
+                           progress, "게시글")
     _emit(progress, f"게시글 원본 {len(raw)}개 수집 완료", 0.4)
 
     posts: list[dict] = []
@@ -268,24 +375,19 @@ def collect_posts(
         if cat == "A":
             od = infer_outing_date(p["at"], p.get("c", ""), dt)
             if od is None:
+                # 출사일 추론 실패 → 작성일로 폴백 게이트
                 if not keep_unclassified:
                     continue
-                if dt.year != year:
-                    continue
-                if month is not None and dt.month != month:
+                if not in_ym_range(ym_of(dt), start_ym, end_ym):
                     continue
                 outing_date = None
                 review_reasons.append("출사일 미상")
             else:
-                if od.year != year:
-                    continue
-                if month is not None and od.month != month:
+                if not in_ym_range(ym_of(od), start_ym, end_ym):
                     continue
                 outing_date = od.isoformat()
         else:
-            if dt.year != year:
-                continue
-            if month is not None and dt.month != month:
+            if not in_ym_range(ym_of(dt), start_ym, end_ym):
                 continue
             outing_date = None
 
@@ -321,19 +423,17 @@ def collect_posts(
 # ═══════════════════════════════════════════════════════════════
 
 def collect_photos(
-    year: int,
-    month: Optional[int] = None,
+    start_ym: int,
+    end_ym: int,
     progress: ProgressFn = None,
 ) -> list[dict]:
     """
-    사진 수집 + 필터링.
+    사진 수집 + 기간 필터링 (**작성일** 기준).
 
-    작성일 기준 필터링.
     has_comment=True인 사진은 "테마 참여 예상"으로 표시.
 
     Args:
-        year: 대상 연도
-        month: 대상 월 (None이면 연 전체)
+        start_ym, end_ym: 대상 기간 YYYYMM (양끝 포함)
         progress: 진행 콜백
 
     Returns:
@@ -342,15 +442,14 @@ def collect_photos(
             has_comment, url_large, url_medium, url_small, url_thumb
     """
     _emit(progress, "사진 수집 시작…", 0.5)
-    raw = _fetch_paginated("/api/photos", "ps", year, progress, "사진")
+    # 사진은 작성일 기준이라 마진 없이 기간 시작까지만 받으면 된다.
+    raw = _fetch_paginated("/api/photos", "ps", start_ym, progress, "사진")
     _emit(progress, f"사진 원본 {len(raw)}개 수집 완료", 0.9)
 
     photos: list[dict] = []
     for p in raw:
         dt = _ts_to_dt(p["w_t"])
-        if dt.year != year:
-            continue
-        if month is not None and dt.month != month:
+        if not in_ym_range(ym_of(dt), start_ym, end_ym):
             continue
 
         pid = p["id"]
@@ -837,7 +936,9 @@ def collect_join_greetings(
         return False
 
     raw = _fetch_paginated(
-        "/api/articles", "cs", 1, progress, "가입인사",
+        # 가입인사는 분석 기간과 무관하게 전 기간을 훑는다(활성 멤버 전원 확보 시
+        # should_stop이 끊음) → 기간 기반 종료를 끈다.
+        "/api/articles", "cs", None, progress, "가입인사",
         extra_payload={"cat": "J"},
         should_stop=stop,
     )
@@ -980,15 +1081,16 @@ def collect_all_unresolved(posts: list[dict]) -> Counter:
 if __name__ == "__main__":
     import sys
 
-    year  = int(sys.argv[1]) if len(sys.argv) > 1 else 2026
-    month = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    # 사용: python -m core.collector [START_YM] [END_YM]   (예: 202509 202603)
+    start_ym = int(sys.argv[1]) if len(sys.argv) > 1 else 202601
+    end_ym   = int(sys.argv[2]) if len(sys.argv) > 2 else start_ym // 100 * 100 + 12
 
     def log(msg, pct):
         print(f"  [{pct*100:>5.1f}%] {msg}")
 
-    print(f"\n=== {GROUP_NAME} {year}{'년 전체' if month is None else f'년 {month}월'} ===\n")
-    posts  = collect_posts(year, month, progress=log)
-    photos = collect_photos(year, month, progress=log)
+    print(f"\n=== {GROUP_NAME} {period_label(start_ym, end_ym)} ===\n")
+    posts  = collect_posts(start_ym, end_ym, progress=log)
+    photos = collect_photos(start_ym, end_ym, progress=log)
 
     print(f"\n[요약]")
     print(f"  게시글: {len(posts)}개")

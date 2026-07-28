@@ -229,9 +229,9 @@ def test_excel_round_trip(tmp_path):
     }]
     master = [{"실명": "정원석", "닉네임": "원석닉", "별칭": ["원석님"]}]
 
-    blob = build_excel(posts, photos, 2026, None, master_records=master)
+    blob = build_excel(posts, photos, 202601, 202612, master_records=master)
     loaded = load_excel_bundle(blob)
-    assert loaded["year"] == 2026 and loaded["month"] is None
+    assert loaded["start_ym"] == 202601 and loaded["end_ym"] == 202612
     assert len(loaded["posts"]) == 1 and len(loaded["photos"]) == 1
     assert loaded["posts"][0]["body"] == "정원석 이하얀"
     assert loaded["posts"][0]["posted_at"] == datetime(2026, 6, 7, 12, 34, 56)
@@ -248,7 +248,7 @@ def test_excel_load_rejects_wrong_version(tmp_path):
     from openpyxl import Workbook, load_workbook
     from core.excel_builder import build_excel, load_excel_bundle
 
-    blob = build_excel([], [], 2026, None, master_records=[])
+    blob = build_excel([], [], 202601, 202612, master_records=[])
     wb = load_workbook(BytesIO(blob))
     ws = wb["_메타"]
     for row in ws.iter_rows(min_row=2):
@@ -263,6 +263,75 @@ def test_excel_load_rejects_wrong_version(tmp_path):
         assert "버전" in str(e)
     else:
         raise AssertionError("expected ValueError")
+
+
+def _make_v1_excel(year, month):
+    """v1 스키마(_메타에 year/month)를 가진 엑셀을 만들어 bytes로 반환."""
+    from io import BytesIO
+    from openpyxl import load_workbook
+    from core.excel_builder import build_excel
+
+    blob = build_excel([], [], year * 100 + 1, year * 100 + 12)
+    wb = load_workbook(BytesIO(blob))
+    ws = wb["_메타"]
+    for row in ws.iter_rows(min_row=2):
+        if row[0].value in ("schema_version", "start_ym", "end_ym"):
+            row[0].value, row[1].value = None, None
+    ws.append(["schema_version", 1])
+    ws.append(["year", year])
+    ws.append(["month", "" if month is None else month])
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_excel_v1_full_year_migrates_to_range():
+    """구 버전 엑셀(연 전체)은 업로드 시 자동으로 202601~202612로 변환."""
+    from core.excel_builder import load_excel_bundle
+
+    loaded = load_excel_bundle(_make_v1_excel(2026, None))
+    assert loaded["start_ym"] == 202601
+    assert loaded["end_ym"] == 202612
+
+
+def test_excel_v1_single_month_migrates_to_range():
+    """구 버전 엑셀(단일 월)은 그 달 하나짜리 범위로 변환."""
+    from core.excel_builder import load_excel_bundle
+
+    loaded = load_excel_bundle(_make_v1_excel(2026, 5))
+    assert loaded["start_ym"] == 202605
+    assert loaded["end_ym"] == 202605
+
+
+def test_excel_multi_year_matrix_columns_grow():
+    """다년 범위면 월 매트릭스 시트의 컬럼이 기간 길이만큼 늘어난다.
+
+    예전에는 A~O 15열 고정이라 24개월을 표현할 수 없었다.
+    """
+    from io import BytesIO
+    from openpyxl import load_workbook
+    from core.excel_builder import build_excel
+
+    blob = build_excel([], [], 202501, 202612)   # 24개월
+    wb = load_workbook(BytesIO(blob))
+    for sheet in ("🎨 월별 테마 매트릭스", "📅 월별 참석 매트릭스"):
+        header = [c.value for c in wb[sheet][4]]
+        assert len(header) == 2 + 24 + 1, (sheet, len(header))
+        assert header[2] == "2025-01" and header[-2] == "2026-12"
+        assert header[-1] in ("합계", "합계(장)")
+
+
+def test_excel_single_month_matrix_does_not_break():
+    """축이 1칸이어도 시트 생성이 깨지지 않아야 한다."""
+    from io import BytesIO
+    from openpyxl import load_workbook
+    from core.excel_builder import build_excel
+
+    blob = build_excel([], [], 202605, 202605)
+    wb = load_workbook(BytesIO(blob))
+    header = [c.value for c in wb["📅 월별 참석 매트릭스"][4]]
+    assert len(header) == 2 + 1 + 1
+    assert header[2] == "5월"
 
 
 def test_excel_load_rejects_missing_meta(tmp_path):
@@ -356,7 +425,7 @@ def test_excel_round_trip_with_members_and_resolution():
     }]
     banned = {"민민기", "이종민"}
     resolution = {"음승구": "승구", "민민기": LEFT_MEMBER, "습니다": NOT_A_NAME}
-    blob = build_excel([], [], 2026, None,
+    blob = build_excel([], [], 202601, 202612,
                        members=members, banned=banned, resolution=resolution)
     loaded = load_excel_bundle(blob)
     assert len(loaded["members"]) == 1
@@ -444,6 +513,43 @@ def test_find_duplicate_member_names():
 def test_excel_round_trip_with_join_aliases():
     from core.excel_builder import build_excel, load_excel_bundle
     aliases = {"정원석": "원석사진", "이하얀": "하얀필름"}
-    blob = build_excel([], [], 2026, None, join_aliases=aliases)
+    blob = build_excel([], [], 202601, 202612, join_aliases=aliases)
     loaded = load_excel_bundle(blob)
     assert loaded["join_aliases"] == aliases
+
+
+def test_excel_listing_sheets_keep_year_in_month_column():
+    """📝 후기글·📷 사진 시트의 '월' 열이 다년에서 연도를 잃지 않아야 한다.
+
+    `.month`만 쓰면 2025-09와 2026-03이 9/3으로 남아 그 열로 정렬·필터할 때
+    서로 다른 해가 섞인다. 앱의 같은 컬럼(reviews_table)과도 표기를 맞춘다.
+    """
+    from io import BytesIO
+    from openpyxl import load_workbook
+    from core.excel_builder import build_excel
+
+    def review(pid, posted):
+        return {"id": pid, "author": "닉", "wid": "w1", "title": f"{pid} 후기",
+                "body": "", "outing_date": None, "posted_at": posted,
+                "cat": "E", "cat_label": "후기", "category": "풍경",
+                "is_outing": False, "is_canceled": False,
+                "likes": 0, "comments": 0, "images": 0,
+                "needs_review": False, "review_reason": ""}
+
+    def photo(pid, posted):
+        return {"id": pid, "author": "닉", "wid": "w1", "posted_at": posted,
+                "likes": 0, "comments": 0, "has_comment": False,
+                "url_large": "x", "url_medium": "y", "url_small": "z", "url_thumb": "n"}
+
+    posts = [review("r1", datetime(2025, 9, 6, 9, 0)),
+             review("r2", datetime(2026, 3, 8, 9, 0))]
+    photos = [photo("p1", datetime(2025, 9, 7, 9, 0)),
+              photo("p2", datetime(2026, 3, 9, 9, 0))]
+
+    wb = load_workbook(BytesIO(build_excel(posts, photos, 202509, 202603)))
+    for sheet in ("📝 후기글", "📷 사진"):
+        ws = wb[sheet]
+        header = [c.value for c in ws[2]]
+        col = header.index("월") + 1
+        months = {ws.cell(r, col).value for r in range(3, ws.max_row + 1)}
+        assert months == {"2025-09", "2026-03"}, (sheet, months)
