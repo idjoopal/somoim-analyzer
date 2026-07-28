@@ -15,6 +15,7 @@ from core.gsheets import (
     SheetsClient,
     _is_missing_tab,
     a1_range,
+    a1_tab,
     chunk_rows,
 )
 
@@ -94,8 +95,18 @@ def _tab_of(rng: str) -> str:
     return rng.split("'")[1].replace("''", "'")
 
 
+def _start_row_of(rng: str):
+    """`'탭'!A5` → 5, `'탭'` → None(탭 전체).
+
+    구글은 이 차이를 지킨다. `'탭'!A1`로 읽으면 **A1 한 칸만** 돌려준다.
+    가짜가 이걸 뭉개면 "저장은 되는데 못 읽는" 버그가 테스트를 그냥 통과한다.
+    """
+    _, _, rest = rng.partition("!")
+    return int(rest[1:]) if rest.startswith("A") and rest[1:].isdigit() else None
+
+
 class FakeValues:
-    """없는 탭을 건드리면 400을 낸다 — 실제 API와 같아야 자가치유가 검증된다."""
+    """범위 표기를 실제 API처럼 지킨다 — 탭 전체와 단일 셀을 구분한다."""
 
     def __init__(self, parent):
         self.p = parent
@@ -104,10 +115,18 @@ class FakeValues:
         return None if tab in self.p.tabs else missing_tab_error(tab)
 
     def get(self, spreadsheetId=None, range=None):  # noqa: A002
+        self.p.read_ranges.append(range)
         if self.p.read_error:
             return FakeReq(None, self.p.read_error)
         tab = _tab_of(range)
-        return FakeReq({"values": self.p.tabs.get(tab, [])}, self._require(tab))
+        if (err := self._require(tab)):
+            return FakeReq(None, err)
+        rows = self.p.tabs[tab]
+        row = _start_row_of(range)
+        if row is not None:                    # 단일 셀 — 딱 그 칸만
+            cell = rows[row - 1][:1] if row - 1 < len(rows) and rows[row - 1] else []
+            return FakeReq({"values": [cell] if cell else []})
+        return FakeReq({"values": [list(r) for r in rows]})
 
     def update(self, spreadsheetId=None, range=None, valueInputOption=None, body=None):  # noqa: A002
         tab = _tab_of(range)
@@ -128,13 +147,18 @@ class FakeValues:
         return FakeReq({})
 
     def clear(self, spreadsheetId=None, range=None, body=None):  # noqa: A002
+        self.p.clear_ranges.append(range)
         if self.p.clear_error:
             return FakeReq(None, self.p.clear_error)
         tab = _tab_of(range)
         if (err := self._require(tab)):
             return FakeReq(None, err)
         self.p.cleared.append(tab)
-        self.p.tabs[tab] = []
+        row = _start_row_of(range)
+        if row is None:
+            self.p.tabs[tab] = []
+        elif row - 1 < len(self.p.tabs[tab]):   # 단일 셀 — 그 칸만 지워진다
+            self.p.tabs[tab][row - 1] = self.p.tabs[tab][row - 1][1:]
         return FakeReq({})
 
 
@@ -163,6 +187,7 @@ class FakeSheetsService:
         self.tabs = dict(tabs or {})
         self.read_error, self.clear_error = read_error, clear_error
         self.updates, self.appends, self.cleared, self.batch_updates = [], [], [], []
+        self.read_ranges, self.clear_ranges = [], []
 
     def sheet_id_of(self, tab: str) -> int:
         """탭마다 고유한 숫자 id — 실제 시트처럼 title과 별개의 식별자를 준다."""
@@ -293,6 +318,54 @@ def test_formatting_reuses_given_sheet_id_without_refetching():
 # ═══════════════════════════════════════════════════════════════
 # 읽기
 # ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+# 범위 표기 — 셀 하나와 탭 전체는 다르다
+#
+# 읽기·비우기에 `'탭'!A1`을 쓰면 구글은 A1 한 칸만 다룬다. 반면 쓰기는 A1에서
+# 배열만큼 펼쳐지므로 멀쩡해 보인다. 그래서 **시트에는 데이터가 다 들어갔는데
+# 앱은 하나도 못 읽는** 상태가 만들어졌다.
+# ═══════════════════════════════════════════════════════════════
+
+def test_a1_tab_has_no_cell_reference():
+    assert a1_tab("게시글") == "'게시글'"
+    assert "!" not in a1_tab("게시글")
+
+
+def test_a1_tab_escapes_single_quote():
+    assert a1_tab("i'm") == "'i''m'"
+
+
+def test_read_asks_for_the_whole_tab_not_one_cell():
+    svc = FakeSheetsService(tabs={"게시글": [["id"], ["p1"]]})
+    SheetsClient({}, service=svc).read(FILE_ID, "게시글")
+    assert svc.read_ranges == ["'게시글'"]
+
+
+def test_clear_empties_the_whole_tab_not_one_cell():
+    """A1만 비우면 새 데이터보다 아래 있던 옛 행이 그대로 남는다."""
+    svc = FakeSheetsService(tabs={"게시글": [["a"], ["b"], ["c"]]})
+    SheetsClient({}, service=svc).clear(FILE_ID, "게시글")
+    assert svc.clear_ranges == ["'게시글'"]
+    assert svc.tabs["게시글"] == []
+
+
+def test_write_then_read_round_trips_every_row():
+    """사용자가 겪은 증상 그대로 — 저장은 됐는데 분석이 '데이터 없음'이었다."""
+    svc = FakeSheetsService()
+    c = SheetsClient({}, service=svc)
+    rows = [["id", "title"]] + [[f"p{i}", f"글 {i}"] for i in range(50)]
+    c.write(FILE_ID, "게시글", rows)
+    assert c.read(FILE_ID, "게시글") == rows
+
+
+def test_write_shrinking_data_leaves_no_stale_rows():
+    svc = FakeSheetsService()
+    c = SheetsClient({}, service=svc)
+    c.write(FILE_ID, "게시글", [["h"], ["1"], ["2"], ["3"]])
+    c.write(FILE_ID, "게시글", [["h"], ["1"]])
+    assert c.read(FILE_ID, "게시글") == [["h"], ["1"]]
+
 
 def test_read_returns_rows():
     c = client(tabs={"게시글": [["id", "title"], ["p1", "글"]]})
