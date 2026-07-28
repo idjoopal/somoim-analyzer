@@ -29,8 +29,15 @@ from core.collector import (
     collect_photos,
     collect_posts,
     find_duplicate_member_names,
+    in_ym_range,
+    is_multi_year,
     match_outings_with_reviews,
+    month_axis,
     parse_join_name_aliases,
+    period_label,
+    period_tag,
+    ym_label,
+    ym_of,
 )
 from core.excel_builder import build_excel, load_excel_bundle
 
@@ -42,6 +49,29 @@ STATUS_OPTIONS = ["진행", "취소"]
 # ═══════════════════════════════════════════════════════════════
 # 순수 계산 헬퍼 (Streamlit 비의존 — 단독 테스트 가능)
 # ═══════════════════════════════════════════════════════════════
+#
+# 월별 집계는 전부 `{ym: 건수}` (ym = YYYYMM)로 모으고, 표시 직전에
+# `month_axis`가 만든 축에 맞춰 펼친다. `.month`만 쓰면 다년 범위에서
+# 2025-03과 2026-03이 한 칸에 합쳐지므로 연도를 절대 버리지 않는다.
+
+def axis_values(counts: dict[int, int], months: list[int]) -> list[int]:
+    """`{ym: 건수}` → 축 순서대로 펼친 리스트 (데이터 없는 달은 0)."""
+    return [counts.get(m, 0) for m in months]
+
+
+def axis_labels(months: list[int]) -> list[str]:
+    """월 축 라벨. 다년 범위면 `2026-03`, 한 해 안이면 `3월`."""
+    if not months:
+        return []
+    multi = is_multi_year(months[0], months[-1])
+    return [ym_label(m, multi_year=multi) for m in months]
+
+
+def post_ym(p: dict) -> int | None:
+    """공지의 시간축은 출사일 — 미상이면 None(축에 넣을 수 없음)."""
+    od = p.get("outing_date")
+    return ym_of(date.fromisoformat(od)) if od else None
+
 
 def compute_kpis(posts: list[dict], photos: list[dict]) -> dict[str, int]:
     posts_A = [p for p in posts if p["cat"] == "A"]
@@ -55,25 +85,27 @@ def compute_kpis(posts: list[dict], photos: list[dict]) -> dict[str, int]:
     }
 
 
-def monthly_table(posts: list[dict], photos: list[dict]) -> dict[str, list[int]]:
+def monthly_table(posts: list[dict], photos: list[dict]) -> dict[str, dict[int, int]]:
+    """월별 활동 집계 — `{구분: {ym: 건수}}`. 축은 호출부가 결정한다."""
     posts_A  = [p for p in posts if p["cat"] == "A"]
     active   = [p for p in posts_A if not p["is_canceled"]]
     canceled = [p for p in posts_A if p["is_canceled"]]
     reviews  = [p for p in posts if p["cat"] == "E"]
     themed   = [p for p in photos if p["has_comment"]]
 
-    def by_outing(items: list[dict]) -> list[int]:
-        out = [0] * 12
+    def by_outing(items: list[dict]) -> dict[int, int]:
+        out: Counter = Counter()
         for x in items:
-            if x["outing_date"]:
-                out[date.fromisoformat(x["outing_date"]).month - 1] += 1
-        return out
+            ym = post_ym(x)
+            if ym is not None:
+                out[ym] += 1
+        return dict(out)
 
-    def by_posted(items: list[dict]) -> list[int]:
-        out = [0] * 12
+    def by_posted(items: list[dict]) -> dict[int, int]:
+        out: Counter = Counter()
         for x in items:
-            out[x["posted_at"].month - 1] += 1
-        return out
+            out[ym_of(x["posted_at"])] += 1
+        return dict(out)
 
     return {
         "진행 출사":   by_outing(active),
@@ -118,6 +150,51 @@ def category_counts(posts: list[dict]) -> list[dict]:
                 "좋아요": sum(p["likes"] for p in sub),
             })
     return sorted(rows, key=lambda x: -x["개수"])
+
+
+def category_monthly(posts: list[dict], months: list[int], *,
+                     exclude_canceled: bool = False) -> tuple[list[dict], dict[str, int]]:
+    """출사 공지(cat=A)를 (월 × 카테고리)로 집계 — Altair long-format.
+
+    월 소스는 **출사일**(공지의 시간축). 축에 놓을 수 없는 건은 세어서 함께 돌려주고
+    호출부가 caption으로 노출한다 — 조용히 누락되면 "그 달엔 출사가 없었다"로 오해된다.
+
+    Returns:
+        (rows, skipped) — rows는 `[{"월": "2026-03", "카테고리": "인물", "공지 수": 4}, ...]`,
+        skipped는 `{"출사일 미상": n, "카테고리 미상": n, "취소 제외": n}`.
+    """
+    labels = axis_labels(months)
+    label_of = dict(zip(months, labels))
+    skipped = {"출사일 미상": 0, "카테고리 미상": 0, "취소 제외": 0}
+
+    counts: dict[tuple[int, str], int] = Counter()
+    seen_cats: set[str] = set()
+    for p in posts:
+        if p.get("cat") != "A":
+            continue
+        if exclude_canceled and p.get("is_canceled"):
+            skipped["취소 제외"] += 1
+            continue
+        ym = post_ym(p)
+        if ym is None:
+            skipped["출사일 미상"] += 1
+            continue
+        cat = p.get("category")
+        if not cat:
+            skipped["카테고리 미상"] += 1
+            continue
+        if ym not in label_of:
+            continue  # 축 밖(기간 외) — 정상 경로에선 나오지 않음
+        counts[(ym, cat)] += 1
+        seen_cats.add(cat)
+
+    # 빈 달도 0으로 채워 축이 끊기지 않게 한다.
+    ordered_cats = [c for c in ALL_CATS if c in seen_cats]
+    rows = [
+        {"월": label_of[m], "카테고리": c, "공지 수": counts.get((m, c), 0)}
+        for m in months for c in ordered_cats
+    ]
+    return rows, skipped
 
 
 def outing_user_ranking(posts: list[dict]) -> list[dict]:
@@ -166,20 +243,25 @@ def photo_user_ranking(photos: list[dict]) -> list[dict]:
     return sorted(rows, key=lambda x: -x["사진수"])
 
 
-def theme_matrix(photos: list[dict]):
-    """테마사진(댓글>0) 작성자×월 매트릭스. 활성 멤버만 집계."""
+def theme_matrix(photos: list[dict], months: list[int] | None = None):
+    """테마사진(댓글>0) 작성자×월 매트릭스. 활성 멤버만 집계.
+
+    월 키는 ym(YYYYMM). `months`를 주면 그 축의 달을 모두 채우고(없으면 빈 값),
+    생략하면 데이터에 등장한 달만 담는다.
+    """
     user_month: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     for p in photos:
         if not p.get("is_active", True):
             continue
         if p["has_comment"]:
-            user_month[p["author"]][p["posted_at"].month] += 1
+            user_month[p["author"]][ym_of(p["posted_at"])] += 1
     authors = sorted(
         user_month,
         key=lambda a: (-len(user_month[a]), -sum(user_month[a].values())),
     )
-    mon_list = {m: sorted(a for a in user_month if m in user_month[a]) for m in range(1, 13)}
-    mon_count = {m: len(mon_list[m]) for m in range(1, 13)}
+    axis = months if months is not None else sorted({m for d in user_month.values() for m in d})
+    mon_list = {m: sorted(a for a in user_month if m in user_month[a]) for m in axis}
+    mon_count = {m: len(mon_list[m]) for m in axis}
     return user_month, authors, mon_count, mon_list
 
 
@@ -192,11 +274,11 @@ def theme_participant_ranking(photos: list[dict]) -> list[dict]:
 
 
 def themed_photos_by_month(photos: list[dict]) -> dict[int, list[dict]]:
-    """댓글 달린 사진(테마사진 후보)을 월별로 모아 작성자순 정렬 — 미리보기 검증용."""
+    """댓글 달린 사진(테마사진 후보)을 월(ym)별로 모아 작성자순 정렬 — 미리보기 검증용."""
     out: dict[int, list[dict]] = defaultdict(list)
     for p in photos:
         if p["has_comment"]:
-            out[p["posted_at"].month].append(p)
+            out[ym_of(p["posted_at"])].append(p)
     for m in out:
         out[m].sort(key=lambda x: (x["author"], -x["likes"]))
     return out
@@ -229,7 +311,7 @@ def reviews_table(posts: list[dict]) -> list[dict]:
                     key=lambda x: x["posted_at"], reverse=True):
         rows.append({
             "작성일": p["posted_at"].strftime("%Y-%m-%d"),
-            "월": p["posted_at"].month,
+            "월": p["posted_at"].strftime("%Y-%m"),
             "작성자": p["author"],
             "카테고리": p["category"] or "-",
             "제목": p["title"],
@@ -314,15 +396,14 @@ def member_category_pref(posts: list[dict]) -> dict[str, Counter]:
 
 
 def attendance_monthly_matrix(posts: list[dict]):
-    """(member_month dict[name->dict[month->count]], members_sorted_by_total)"""
+    """(member_month dict[name->dict[ym->count]], members_sorted_by_total). 월 키는 YYYYMM."""
     mm: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     for n in posts:
         if n.get("cat") != "A" or not n.get("actually_held"):
             continue
-        od = n.get("outing_date")
-        if not od:
+        m = post_ym(n)
+        if m is None:
             continue
-        m = date.fromisoformat(od).month
         for name in n.get("attendees", []):
             mm[name][m] += 1
     members = sorted(mm, key=lambda x: -sum(mm[x].values()))
@@ -407,8 +488,11 @@ def build_editor_df(cat_a_sorted: list[dict]) -> pd.DataFrame:
 
 
 def apply_triage(raw_posts: list[dict], cat_a_sorted: list[dict],
-                 edited: pd.DataFrame, year: int, month: int | None) -> list[dict]:
-    """편집된 cat=A 분류를 적용하고 수집기와 동일 규칙으로 연/월 필터."""
+                 edited: pd.DataFrame, start_ym: int, end_ym: int) -> list[dict]:
+    """편집된 cat=A 분류를 적용하고, 수집기와 **같은 헬퍼**로 기간 필터.
+
+    수집기와 판정이 갈라지지 않도록 `in_ym_range`를 공유한다.
+    """
     final = [dict(p) for p in raw_posts if p["cat"] != "A"]
 
     for orig, (_, row) in zip(cat_a_sorted, edited.iterrows()):
@@ -422,9 +506,7 @@ def apply_triage(raw_posts: list[dict], cat_a_sorted: list[dict],
         if pd.isna(od):
             continue  # 출사일 미상 → 분석 제외
         od = od.date() if hasattr(od, "date") else od
-        if od.year != year:
-            continue
-        if month is not None and od.month != month:
+        if not in_ym_range(ym_of(od), start_ym, end_ym):
             continue
         p["outing_date"] = od.isoformat()
         p["needs_review"] = False
@@ -510,12 +592,14 @@ def hbar(rows: list[dict], cat_col: str, val_col: str, title: str,
     )
 
 
-def heatmap(photos: list[dict], max_authors: int = 30) -> alt.Chart | None:
-    user_month, authors, _, _ = theme_matrix(photos)
+def heatmap(photos: list[dict], months: list[int], max_authors: int = 30) -> alt.Chart | None:
+    user_month, authors, _, _ = theme_matrix(photos, months)
     authors = authors[:max_authors]
+    labels = axis_labels(months)
     long = [
-        {"작성자": a, "월": m, "장수": user_month[a].get(m, 0)}
-        for a in authors for m in range(1, 13) if user_month[a].get(m, 0) > 0
+        {"월": lab, "작성자": a, "장수": user_month[a].get(m, 0)}
+        for a in authors
+        for m, lab in zip(months, labels) if user_month[a].get(m, 0) > 0
     ]
     if not long:
         return None
@@ -524,7 +608,7 @@ def heatmap(photos: list[dict], max_authors: int = 30) -> alt.Chart | None:
         alt.Chart(df)
         .mark_rect()
         .encode(
-            x=alt.X("월:O", title="월"),
+            x=alt.X("월:O", title="월", sort=labels),
             y=alt.Y("작성자:N", sort=authors, title=None),
             color=alt.Color("장수:Q", scale=alt.Scale(scheme="purples"), legend=alt.Legend(title="장수")),
             tooltip=["작성자", "월", "장수"],
@@ -533,23 +617,44 @@ def heatmap(photos: list[dict], max_authors: int = 30) -> alt.Chart | None:
     )
 
 
-def monthly_trend_chart(monthly: dict[str, list[int]]) -> alt.Chart:
+def monthly_trend_chart(monthly: dict[str, dict[int, int]], months: list[int],
+                        title: str = "월별 활동 추이") -> alt.Chart:
+    labels = axis_labels(months)
     rows = [
-        {"월": m, "구분": label, "건수": v}
-        for label, vals in monthly.items()
-        for m, v in enumerate(vals, 1)
+        {"월": lab, "구분": label, "건수": counts.get(m, 0)}
+        for label, counts in monthly.items()
+        for m, lab in zip(months, labels)
     ]
     df = pd.DataFrame(rows)
     return (
         alt.Chart(df)
         .mark_line(point=True)
         .encode(
-            x=alt.X("월:O", title="월"),
+            x=alt.X("월:O", title="월", sort=labels),
             y=alt.Y("건수:Q", title="건수"),
             color=alt.Color("구분:N", legend=alt.Legend(title=None)),
             tooltip=["월", "구분", "건수"],
         )
-        .properties(title="월별 활동 추이", height=320)
+        .properties(title=title, height=320)
+    )
+
+
+def stacked_bar(rows: list[dict], x_col: str, y_col: str, color_col: str,
+                title: str, *, x_sort: list[str] | None = None,
+                scheme: str = "tableau10") -> alt.Chart:
+    """월별 누적 막대 — x축은 월, 색은 카테고리처럼 쌓아 올릴 구분값."""
+    df = pd.DataFrame(rows)
+    return (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X(f"{x_col}:O", title=x_col, sort=x_sort),
+            y=alt.Y(f"{y_col}:Q", title=y_col, stack="zero"),
+            color=alt.Color(f"{color_col}:N", scale=alt.Scale(scheme=scheme),
+                            legend=alt.Legend(title=None)),
+            tooltip=[x_col, color_col, y_col],
+        )
+        .properties(title=title, height=340)
     )
 
 
@@ -557,15 +662,15 @@ def monthly_trend_chart(monthly: dict[str, list[int]]) -> alt.Chart:
 # 수집 파이프라인 — 엑셀은 검토 후 생성
 # ═══════════════════════════════════════════════════════════════
 
-def collect_data(year: int, month: int | None, on_progress=None):
+def collect_data(start_ym: int, end_ym: int, on_progress=None):
     """somoim 수집. 진행 콜백이 st를 호출하므로 @st.cache_data 대신 세션 캐시 사용
     (cache_data 안에서 st 호출 시 캐시 히트 replay가 CacheReplayClosureError로 실패)."""
-    key = (year, month)
+    key = (start_ym, end_ym)
     cached = st.session_state.get("_collect_cache")
     if cached and cached["key"] == key:
         return cached["data"]
-    posts = collect_posts(year, month, progress=on_progress, keep_unclassified=True)
-    photos = collect_photos(year, month, progress=on_progress)
+    posts = collect_posts(start_ym, end_ym, progress=on_progress, keep_unclassified=True)
+    photos = collect_photos(start_ym, end_ym, progress=on_progress)
     st.session_state["_collect_cache"] = {"key": key, "data": (posts, photos)}
     return posts, photos
 
@@ -588,20 +693,20 @@ def _mark_active(items: list[dict], active_mids: set[str] | None) -> None:
         it["is_active"] = it.get("wid", "") in active_mids
 
 
-def _set_data(year: int, month: int | None, posts: list[dict], photos: list[dict],
+def _set_data(start_ym: int, end_ym: int, posts: list[dict], photos: list[dict],
               members: list[dict] | None = None,
               banned: set[str] | None = None,
               resolution: dict[str, str] | None = None,
               join_aliases: dict[str, str] | None = None) -> None:
     """수집/업로드 양쪽에서 호출. session_state['data'] 설정 + 후속 단계 키 클리어.
 
-    data 튜플: (year, month, posts, photos, members, banned, resolution, join_aliases)
+    data 튜플: (start_ym, end_ym, posts, photos, members, banned, resolution, join_aliases)
     """
     active_mids = {m["mid"] for m in (members or []) if m.get("mid")}
     _mark_active(posts, active_mids)
     _mark_active(photos, active_mids)
     st.session_state["data"] = (
-        int(year), month, posts, photos,
+        int(start_ym), int(end_ym), posts, photos,
         members or [], set(banned or set()), dict(resolution or {}),
         dict(join_aliases or {}),
     )
@@ -659,7 +764,7 @@ OPT_SKIP  = "(선택 안 함)"
 OPT_LEFT  = "🚪 탈퇴 멤버 (추적 안 함)"
 
 
-def render_resolution(year: int, month: int | None, posts: list[dict],
+def render_resolution(start_ym: int, end_ym: int, posts: list[dict],
                        photos: list[dict], members: list[dict],
                        banned: set[str], resolution_in: dict[str, str],
                        join_aliases: dict[str, str] | None = None) -> None:
@@ -750,11 +855,53 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
     master_sorted = sorted(master_names)
     options = [OPT_SKIP, OPT_LEFT] + master_sorted
 
+    # ── 이름 ❌ 일괄 처리 ─────────────────────────────────────────
+    # 노이즈 토큰(조사·일반명사)은 수십 개씩 나오는데 체크박스를 한 행씩 누르는 게
+    # 이 단계의 병목이었다. data_editor 체크박스는 드래그 채우기를 지원하지 않아
+    # 표 위에 일괄 처리 바를 둔다. 여기서 정한 값은 표의 기본값으로만 반영되고,
+    # 확정은 기존 "✅ 이 매핑으로 분석 진행" 버튼이 그대로 담당한다.
+    noise_pending: set[str] = st.session_state.setdefault("_noise_pending", set())
+    nonce = st.session_state.setdefault("_res_editor_nonce", 0)
+
+    def _bump_editor() -> None:
+        """data_editor는 key가 그대로면 이전 편집 델타를 붙들고 있어 입력 DataFrame을
+        바꿔도 반영되지 않는다. key에 nonce를 섞어 위젯을 새로 만든다."""
+        st.session_state["_res_editor_nonce"] += 1
+
+    all_names = [n for n, _ in unresolved_freq.most_common()]
+    once_names = [n for n in all_names if unresolved_freq[n] == 1]
+
+    with st.container(border=True):
+        st.markdown("**이름 ❌ 일괄 처리** — 이름이 아닌 단어를 한 번에 골라 표시합니다.")
+        picked = st.multiselect(
+            "이름 여러 개 선택 (빈도순 · 타이핑으로 검색)",
+            options=all_names, default=[], key="noise_multiselect",
+            format_func=lambda n: f"{n} ({unresolved_freq[n]}회)",
+        )
+        b1, b2, b3 = st.columns(3)
+        if b1.button("선택 ❌ 처리", width="stretch", disabled=not picked):
+            noise_pending.update(picked)
+            st.session_state["noise_multiselect"] = []
+            _bump_editor()
+            st.rerun()
+        if b2.button(f"빈도 1회 전체 ❌ ({len(once_names)}건)",
+                     width="stretch", disabled=not once_names,
+                     help="한 번만 등장한 토큰은 대개 오탈자·조사 등 노이즈입니다."):
+            noise_pending.update(once_names)
+            _bump_editor()
+            st.rerun()
+        if b3.button("❌ 전부 해제", width="stretch", disabled=not noise_pending):
+            noise_pending.clear()
+            _bump_editor()
+            st.rerun()
+        if noise_pending:
+            st.caption(f"❌ 표시 대기 {len(noise_pending)}건 — 아래 **확정 버튼**을 눌러야 저장됩니다.")
+
     rows = []
     for name, cnt in unresolved_freq.most_common():
         current = user_res.get(name)
         auto = join_aliases.get(name)
-        is_noise = current == NOT_A_NAME
+        is_noise = (current == NOT_A_NAME) or (name in noise_pending)
         if current == LEFT_MEMBER:
             default = OPT_LEFT
         elif current in master_names:
@@ -795,7 +942,7 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
         },
         column_order=["이름", "빈도", "참고", "이름 ❌", "처리"],
         hide_index=True, width="stretch", num_rows="fixed",
-        key=f"resolution_editor_{year}_{month}",
+        key=f"resolution_editor_{start_ym}_{end_ym}_{nonce}",
     )
 
     if st.button("✅ 이 매핑으로 분석 진행", type="primary"):
@@ -819,6 +966,7 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
                 new_user_res[name] = choice
         final_effective = {**join_aliases, **new_user_res}
         annotate_attendees(posts, master_names, final_effective)
+        st.session_state["_noise_pending"] = set()  # 확정됐으니 대기 상태 비움
         st.session_state["master"] = {
             "names": master_names,
             "members": members,
@@ -830,7 +978,7 @@ def render_resolution(year: int, month: int | None, posts: list[dict],
         st.rerun()
 
 
-def render_triage(year: int, month: int | None, raw_posts: list[dict],
+def render_triage(start_ym: int, end_ym: int, raw_posts: list[dict],
                    photos: list[dict], master: dict) -> None:
     st.divider()
     st.subheader("② 분류 · 참석자 검토")
@@ -869,7 +1017,7 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict],
     }
     editor_kwargs = dict(
         column_config=col_config, hide_index=True, width="stretch",
-        num_rows="fixed", key=f"editor_{year}_{month}",
+        num_rows="fixed", key=f"editor_{start_ym}_{end_ym}",
     )
 
     if n_review > 0:
@@ -896,7 +1044,7 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict],
     }
     att_kwargs = dict(
         column_config=att_config, hide_index=True, width="stretch",
-        num_rows="fixed", key=f"att_editor_{year}_{month}",
+        num_rows="fixed", key=f"att_editor_{start_ym}_{end_ym}",
     )
     if reviews:
         if n_att_review > 0:
@@ -910,17 +1058,17 @@ def render_triage(year: int, month: int | None, raw_posts: list[dict],
         st.caption("후기글이 없어 참석자 보정 단계는 건너뜁니다.")
 
     if st.button("✅ 이 분류·참석자로 분석 진행", type="primary"):
-        final_posts = apply_triage(raw_posts, cat_a_sorted, edited, year, month)
+        final_posts = apply_triage(raw_posts, cat_a_sorted, edited, start_ym, end_ym)
         apply_attendees_edits(final_posts, reviews_sorted, edited_att)
         match_outings_with_reviews(final_posts)
         members = master.get("members", []) if isinstance(master, dict) else []
         banned = master.get("banned", set()) if isinstance(master, dict) else set()
         resolution = master.get("resolution", {}) if isinstance(master, dict) else {}
         join_aliases = master.get("join_aliases", {}) if isinstance(master, dict) else {}
-        xlsx = build_excel(final_posts, photos, year, month,
+        xlsx = build_excel(final_posts, photos, start_ym, end_ym,
                            members=members, banned=banned, resolution=resolution,
                            join_aliases=join_aliases)
-        st.session_state["result"] = (year, month, final_posts, photos, xlsx,
+        st.session_state["result"] = (start_ym, end_ym, final_posts, photos, xlsx,
                                        master, members, resolution)
         st.rerun()
 
@@ -932,11 +1080,12 @@ def _ranking_df(rows: list[dict], count_col: str) -> pd.DataFrame:
     return df
 
 
-def render_results(year: int, month: int | None, posts: list[dict],
+def render_results(start_ym: int, end_ym: int, posts: list[dict],
                    photos: list[dict], xlsx: bytes, master: dict,
                    members: list[dict] | None = None,
                    resolution: dict[str, str] | None = None) -> None:
-    period = f"{year}년" + (f" {month}월" if month else " 전체")
+    period = period_label(start_ym, end_ym)
+    months = month_axis(start_ym, end_ym)
     st.divider()
     st.subheader(f"③ {period} 인사이트")
     render_basis_box(posts, photos, period)
@@ -956,28 +1105,28 @@ def render_results(year: int, month: int | None, posts: list[dict],
     )
 
     with tabs[0]:
-        _tab_overview(posts, photos)
+        _tab_overview(posts, photos, months)
     with tabs[1]:
-        _tab_outings(posts)
+        _tab_outings(posts, months)
     with tabs[2]:
-        _tab_reviews(posts)
+        _tab_reviews(posts, months)
     with tabs[3]:
-        _tab_attendance(posts, master_names or set())
+        _tab_attendance(posts, master_names or set(), months)
     with tabs[4]:
-        _tab_photos(photos)
+        _tab_photos(photos, months)
     with tabs[5]:
-        _tab_theme(photos)
+        _tab_theme(photos, months)
     with tabs[6]:
-        _tab_categories(posts)
+        _tab_categories(posts, months)
     with tabs[7]:
         _tab_users(posts, photos)
     with tabs[8]:
-        _tab_members(members or [], posts, photos, duplicates or set())
+        _tab_members(members or [], posts, photos, duplicates or set(), months)
     with tabs[9]:
         _tab_data(posts, photos)
 
 
-def _tab_overview(posts: list[dict], photos: list[dict]) -> None:
+def _tab_overview(posts: list[dict], photos: list[dict], months: list[int]) -> None:
     k = compute_kpis(posts, photos)
     c1, c2 = st.columns(2)
     with c1:
@@ -993,7 +1142,7 @@ def _tab_overview(posts: list[dict], photos: list[dict]) -> None:
                 donut({r["카테고리"]: r["개수"] for r in cats}, "카테고리 분포", scheme="set2"),
                 width="stretch",
             )
-    st.altair_chart(monthly_trend_chart(monthly_table(posts, photos)), width="stretch")
+    st.altair_chart(monthly_trend_chart(monthly_table(posts, photos), months), width="stretch")
     st.caption("월별 추이 — 출사는 출사일 기준, 후기·사진·테마사진 참가는 작성일 기준.")
 
     ex = summary_extras(posts, photos)
@@ -1014,12 +1163,13 @@ def _tab_overview(posts: list[dict], photos: list[dict]) -> None:
         st.markdown(f"**최고 인기 사진 (좋아요 기준)** 👍{tph['likes']} — {tph['author']}")
 
 
-def _tab_outings(posts: list[dict]) -> None:
+def _tab_outings(posts: list[dict], months: list[int]) -> None:
     st.markdown("#### 월별 출사 공지 (진행/취소)")
     mt = monthly_table(posts, photos=[])
     mdf = pd.DataFrame(
-        {"진행 출사": mt["진행 출사"], "취소 출사": mt["취소 출사"]},
-        index=[f"{m}월" for m in range(1, 13)],
+        {"진행 출사": axis_values(mt["진행 출사"], months),
+         "취소 출사": axis_values(mt["취소 출사"], months)},
+        index=axis_labels(months),
     )
     st.bar_chart(mdf)
     st.caption("출사일 기준 월별 집계.")
@@ -1059,7 +1209,7 @@ def _tab_outings(posts: list[dict]) -> None:
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
-def _tab_reviews(posts: list[dict]) -> None:
+def _tab_reviews(posts: list[dict], months: list[int]) -> None:
     """📝 후기 게시글 목록 — 월별 expander, 각 후기 카드에 정규화된 참석자 명단.
 
     참석자는 Stage 1에서 적용된 매핑(가입인사 자동 + 사용자 매핑)으로 마스터 닉네임에
@@ -1083,12 +1233,12 @@ def _tab_reviews(posts: list[dict]) -> None:
 
     by_month: dict[int, list[dict]] = defaultdict(list)
     for r in reviews:
-        by_month[r["posted_at"].month].append(r)
+        by_month[ym_of(r["posted_at"])].append(r)
 
-    months_sorted = sorted(by_month.keys(), reverse=True)
-    for m in months_sorted:
+    multi = is_multi_year(months[0], months[-1]) if months else True
+    for m in sorted(by_month.keys(), reverse=True):
         items = by_month[m]
-        with st.expander(f"{m}월 — 후기 {len(items)}건", expanded=False):
+        with st.expander(f"{ym_label(m, multi_year=multi)} — 후기 {len(items)}건", expanded=False):
             for r in items:
                 posted = r["posted_at"].strftime("%Y-%m-%d")
                 title = r.get("title") or ""
@@ -1120,7 +1270,7 @@ def _tab_reviews(posts: list[dict]) -> None:
                         st.text(body)
 
 
-def _tab_attendance(posts: list[dict], master: set[str]) -> None:
+def _tab_attendance(posts: list[dict], master: set[str], months: list[int]) -> None:
     st.info(
         "📝 **후기 본문에 적힌 이름 명단으로 실제 참석자를 추적합니다.** "
         "댓글이 막혀 있어도 후기는 공개이고, 본문의 실명을 멤버 마스터와 매칭합니다. "
@@ -1161,11 +1311,12 @@ def _tab_attendance(posts: list[dict], master: set[str]) -> None:
     st.markdown("#### 월별 참석 매트릭스")
     mm, members = attendance_monthly_matrix(posts)
     if members:
+        labels = axis_labels(months)
         rows = []
         for name in members[:50]:
             row = {"멤버": name, "합계": sum(mm[name].values())}
-            for m in range(1, 13):
-                row[f"{m}월"] = mm[name].get(m, 0)
+            for m, lab in zip(months, labels):
+                row[lab] = mm[name].get(m, 0)
             rows.append(row)
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     else:
@@ -1197,7 +1348,7 @@ def _tab_attendance(posts: list[dict], master: set[str]) -> None:
                 st.markdown(f"- **{d}** [{r['author']}] {r['title']} · 참석자: {att}")
 
 
-def _tab_photos(photos: list[dict]) -> None:
+def _tab_photos(photos: list[dict], months: list[int]) -> None:
     st.info(
         "💬 **댓글이 달린 사진을 '테마사진 참여'로 간주합니다.** "
         "(댓글 내용은 비공개라 사진 자체로 추정합니다)",
@@ -1224,8 +1375,9 @@ def _tab_photos(photos: list[dict]) -> None:
 
     st.markdown("#### 월별 사진 업로드")
     mt = monthly_table(posts=[], photos=photos)
-    st.bar_chart(pd.DataFrame({"사진": mt["사진"], "테마사진 참가": mt["테마사진 참가"]},
-                              index=[f"{m}월" for m in range(1, 13)]))
+    st.bar_chart(pd.DataFrame({"사진": axis_values(mt["사진"], months),
+                               "테마사진 참가": axis_values(mt["테마사진 참가"], months)},
+                              index=axis_labels(months)))
 
     st.markdown("#### 인기 사진 갤러리")
     st.caption("좋아요(lc) 상위 12장 · 👍 좋아요 / 💬 댓글 병기.")
@@ -1239,23 +1391,24 @@ def _tab_photos(photos: list[dict]) -> None:
         st.info("사진이 없습니다.")
 
 
-def _tab_theme(photos: list[dict]) -> None:
+def _tab_theme(photos: list[dict], months: list[int]) -> None:
     st.info(
         "🎨 **테마사진 = 댓글이 달린 사진(rn>0)** 입니다. 댓글 내용은 비공개라 "
         "테마 이벤트 참여를 *추정*한 값이니, 아래 월별 미리보기로 실제 테마사진인지 직접 확인하세요.",
         icon="🎨",
     )
-    user_month, authors, mon_count, mon_list = theme_matrix(photos)
+    user_month, authors, mon_count, mon_list = theme_matrix(photos, months)
     by_month = themed_photos_by_month(photos)
+    multi = is_multi_year(months[0], months[-1]) if months else True
 
     st.markdown("#### 월별 테마사진 제출 인원")
-    st.bar_chart(pd.DataFrame({"참여 인원": [mon_count[m] for m in range(1, 13)]},
-                              index=[f"{m}월" for m in range(1, 13)]))
+    st.bar_chart(pd.DataFrame({"참여 인원": [mon_count.get(m, 0) for m in months]},
+                              index=axis_labels(months)))
     st.caption("각 월을 펼치면 참여자 명단과 그 달 테마사진(댓글 달린 사진) 미리보기를 볼 수 있습니다.")
-    months_with = [m for m in range(1, 13) if mon_list[m]]
-    for m in months_with:
+    for m in [m for m in months if mon_list.get(m)]:
         ph = by_month.get(m, [])
-        with st.expander(f"{m}월 — 참여 {len(mon_list[m])}명 · 테마사진 {len(ph)}장"):
+        with st.expander(f"{ym_label(m, multi_year=multi)} — "
+                         f"참여 {len(mon_list[m])}명 · 테마사진 {len(ph)}장"):
             st.write("**참여자:** " + ", ".join(mon_list[m]))
             for i in range(0, len(ph), 5):
                 for col, p in zip(st.columns(5), ph[i:i + 5]):
@@ -1265,7 +1418,7 @@ def _tab_theme(photos: list[dict]) -> None:
                     )
 
     st.markdown("#### 테마 매트릭스")
-    ch = heatmap(photos)
+    ch = heatmap(photos, months)
     if ch is not None:
         st.altair_chart(ch, width="stretch")
     else:
@@ -1278,12 +1431,29 @@ def _tab_theme(photos: list[dict]) -> None:
         st.dataframe(_ranking_df(parts, "테마사진"), hide_index=True, width="stretch")
 
 
-def _tab_categories(posts: list[dict]) -> None:
+def _tab_categories(posts: list[dict], months: list[int]) -> None:
     st.caption("출사 공지(cat=A) 제목의 [카테고리] 태그 기준. 출사: 인물(1:1인물·1:1인물출사 포함)·인물&풍경·풍경·GN / 활동: 보정·문화.")
     rows = category_counts(posts)
     if not rows:
         st.info("분류된 카테고리가 없습니다.")
         return
+
+    st.markdown("#### 월별 카테고리 추이")
+    exclude_canceled = st.checkbox("취소(펑) 제외", value=False, key="cat_monthly_excl")
+    mrows, skipped = category_monthly(posts, months, exclude_canceled=exclude_canceled)
+    if any(r["공지 수"] for r in mrows):
+        st.altair_chart(
+            stacked_bar(mrows, "월", "공지 수", "카테고리",
+                        "월별 카테고리 분포 (출사일 기준)",
+                        x_sort=axis_labels(months)),
+            width="stretch",
+        )
+    else:
+        st.caption("월 축에 놓을 수 있는 공지가 없습니다.")
+    notes = [f"{k} {v}건" for k, v in skipped.items() if v]
+    st.caption("출사일 기준 집계." + (f" 제외: {', '.join(notes)}." if notes else ""))
+
+    st.markdown("#### 기간 전체 분포")
     st.altair_chart(
         hbar(rows, "카테고리", "개수", "카테고리별 공지 수", n=len(rows), scheme="teals"),
         width="stretch",
@@ -1334,14 +1504,15 @@ def _tab_users(posts: list[dict], photos: list[dict]) -> None:
 
 
 def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
-                  duplicates: set[str] | None = None) -> None:
+                  duplicates: set[str] | None = None,
+                  months: list[int] | None = None) -> None:
     """🧑‍🤝‍🧑 활성 멤버 현황 — 유령/휴면 분류, 신규 가입 추이, 동명이인 마킹."""
     if not members:
         st.info("멤버 정보가 없습니다. 사이드바의 **API 수집**으로 받아오면 이 탭이 채워집니다.")
         return
 
     duplicates = duplicates or find_duplicate_member_names(members)
-    cur_year = datetime.now().year
+    months = months or []
     posts_A = [p for p in posts if p.get("cat") == "A"]
     active_authors = ({p.get("author", "") for p in posts}
                        | {p.get("author", "") for p in photos})
@@ -1398,15 +1569,19 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
     else:
         st.caption("유령 멤버가 없습니다.")
 
-    st.markdown(f"#### {cur_year}년 월별 신규 가입")
-    join_month = [0] * 12
-    for m in members:
-        joined = m.get("joined_at")
-        if joined and joined.year == cur_year:
-            join_month[joined.month - 1] += 1
-    jdf = pd.DataFrame({"신규 가입": join_month},
-                        index=[f"{i+1}월" for i in range(12)])
-    st.bar_chart(jdf, height=240)
+    # 선택한 분석 기간에 맞춰 집계한다 (예전에는 datetime.now().year로 '올해'에 고정돼
+    # 과거 기간을 분석해도 늘 올해 가입만 보였다).
+    if months:
+        st.markdown(f"#### {period_label(months[0], months[-1])} 월별 신규 가입")
+        joins: Counter = Counter()
+        for m in members:
+            joined = m.get("joined_at")
+            if joined:
+                joins[ym_of(joined)] += 1
+        jdf = pd.DataFrame({"신규 가입": axis_values(joins, months)},
+                            index=axis_labels(months))
+        st.bar_chart(jdf, height=240)
+        st.caption("가입일이 분석 기간 안에 든 활성 멤버만 집계됩니다.")
 
 
 def _tab_data(posts: list[dict], photos: list[dict]) -> None:
@@ -1450,19 +1625,36 @@ def render_sidebar() -> None:
 
         if source == "API 수집":
             current_year = datetime.now().year
-            year = st.selectbox("년도", list(range(current_year, current_year - 6, -1)),
-                                 key="api_year")
-            month: int | None = None
-            if st.checkbox("월 단위 분석", key="api_month_on"):
-                month = st.selectbox("월", list(range(1, 13)), key="api_month")
-            if st.button("분석 시작", type="primary", width="stretch"):
+            years = list(range(current_year, current_year - 6, -1))
+            st.caption("분석할 기간을 시작~종료로 지정합니다. 한 달만 보려면 시작·종료를 같게 두세요.")
+            c1, c2 = st.columns(2)
+            with c1:
+                sy = st.selectbox("시작 년", years, key="api_start_y")
+                sm = st.selectbox("시작 월", list(range(1, 13)), key="api_start_m")
+            with c2:
+                ey = st.selectbox("종료 년", years, key="api_end_y")
+                em = st.selectbox("종료 월", list(range(1, 13)), index=11, key="api_end_m")
+
+            start_ym, end_ym = sy * 100 + sm, ey * 100 + em
+            valid_range = start_ym <= end_ym
+            if valid_range:
+                n_months = len(month_axis(start_ym, end_ym))
+                st.caption(f"📅 **{period_label(start_ym, end_ym)}** · {n_months}개월")
+                if n_months > 24:
+                    st.warning("기간이 길면 API 페이지 한도에 걸려 과거 일부가 누락될 수 있습니다. "
+                               "나눠서 수집한 뒤 엑셀을 각각 보관하는 편이 안전합니다.")
+            else:
+                st.error("종료가 시작보다 빠릅니다. 기간을 다시 지정하세요.")
+
+            if st.button("분석 시작", type="primary", width="stretch",
+                         disabled=not valid_range):
                 progress_bar = st.progress(0.0, text="시작 준비 중…")
                 with st.status("데이터 수집 중…", expanded=True) as status:
                     def on_progress(msg: str, pct: float) -> None:
                         progress_bar.progress(min(max(pct, 0.0), 1.0), text=msg)
                         st.write(msg)
                     try:
-                        posts, photos = collect_data(int(year), month, on_progress=on_progress)
+                        posts, photos = collect_data(start_ym, end_ym, on_progress=on_progress)
                         on_progress("멤버 목록 수집…", 0.95)
                         members, _ = collect_members()
                         banned = collect_banned_names()
@@ -1486,7 +1678,7 @@ def render_sidebar() -> None:
                                f"/ 멤버 {len(members)} / 가입인사 자동 매핑 {len(join_aliases)}"),
                         state="complete",
                     )
-                _set_data(year, month, posts, photos,
+                _set_data(start_ym, end_ym, posts, photos,
                            members=members, banned=banned, resolution=None,
                            join_aliases=join_aliases)
                 st.rerun()
@@ -1499,7 +1691,7 @@ def render_sidebar() -> None:
                 except Exception as e:  # noqa: BLE001
                     st.error(f"엑셀 파일 오류: {e}")
                 else:
-                    _set_data(bundle["year"], bundle["month"],
+                    _set_data(bundle["start_ym"], bundle["end_ym"],
                               bundle["posts"], bundle["photos"],
                               members=bundle.get("members") or [],
                               banned=bundle.get("banned") or set(),
@@ -1515,14 +1707,14 @@ def render_sidebar() -> None:
 
         # ── 이름 매핑 CSV (어느 단계에서나 노출) ──
         if "data" in st.session_state:
-            year_d, month_d, _p, _ph, _m, _b, res_uploaded, _ja = st.session_state["data"]
+            start_d, end_d, _p, _ph, _m, _b, res_uploaded, _ja = st.session_state["data"]
             current_res = (st.session_state.get("master", {}).get("resolution")
                            if isinstance(st.session_state.get("master"), dict) else None)
             export_res = current_res if current_res else res_uploaded
             st.divider()
             st.subheader("🧭 이름 매핑")
             if export_res:
-                tag = f"{year_d}" + (f"_{month_d:02d}" if month_d else "")
+                tag = period_tag(start_d, end_d)
                 st.download_button(
                     "⬇️ 매핑 CSV 저장",
                     data=_resolution_to_csv(export_res),
@@ -1540,18 +1732,17 @@ def render_sidebar() -> None:
                     st.error(f"CSV 형식 오류: {e}")
                 else:
                     # 업로드 매핑은 data 튜플에 보존하고 master/result 클리어해서 Stage 1로 재진입
-                    yr, mo, posts, photos, members, banned, _, join_aliases = st.session_state["data"]
-                    _set_data(yr, mo, posts, photos,
+                    s_ym, e_ym, posts, photos, members, banned, _, join_aliases = st.session_state["data"]
+                    _set_data(s_ym, e_ym, posts, photos,
                               members=members, banned=banned, resolution=loaded,
                               join_aliases=join_aliases)
                     st.success(f"{len(loaded)}개 매핑 적용 — 다시 ①부터 진행하세요.")
                     st.rerun()
 
         if "result" in st.session_state:
-            year_r = st.session_state["result"][0]
-            month_r = st.session_state["result"][1]
+            start_r, end_r = st.session_state["result"][0], st.session_state["result"][1]
             xlsx_r = st.session_state["result"][4]
-            tag = f"{year_r}" + (f"_{month_r:02d}" if month_r else "")
+            tag = period_tag(start_r, end_r)
             st.divider()
             st.subheader("💾 다운로드")
             st.download_button(
@@ -1567,8 +1758,9 @@ def render_sidebar() -> None:
             st.divider()
             if st.button("🔄 처음으로", width="stretch"):
                 for k in ("data", "master", "result", "_collect_cache",
-                          "api_year", "api_month", "api_month_on", "excel_upload",
-                          "resolution_csv_upload"):
+                          "api_start_y", "api_start_m", "api_end_y", "api_end_m",
+                          "excel_upload", "resolution_csv_upload",
+                          "_noise_pending", "_res_editor_nonce", "noise_multiselect"):
                     st.session_state.pop(k, None)
                 st.rerun()
 
@@ -1587,15 +1779,15 @@ def main() -> None:
         )
         return
 
-    year, month, posts, photos, members, banned, resolution_uploaded, join_aliases = \
+    start_ym, end_ym, posts, photos, members, banned, resolution_uploaded, join_aliases = \
         st.session_state["data"]
 
     if "result" in st.session_state:
         render_results(*st.session_state["result"])
     elif "master" in st.session_state:
-        render_triage(year, month, posts, photos, st.session_state["master"])
+        render_triage(start_ym, end_ym, posts, photos, st.session_state["master"])
     else:
-        render_resolution(year, month, posts, photos, members,
+        render_resolution(start_ym, end_ym, posts, photos, members,
                            banned, resolution_uploaded, join_aliases)
 
 

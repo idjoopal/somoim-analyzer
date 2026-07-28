@@ -6,8 +6,10 @@
 외부 의존: openpyxl
 
 주요 함수:
-- build_excel(posts, photos, year, month=None) -> bytes
-- save_excel(posts, photos, year, month=None, path=...) -> str
+- build_excel(posts, photos, start_ym, end_ym) -> bytes
+- save_excel(posts, photos, start_ym, end_ym, path=...) -> str
+
+기간은 YYYYMM 정수 쌍이며, 월별 매트릭스 시트의 컬럼 수는 기간 길이에 따라 늘어난다.
 """
 
 from __future__ import annotations
@@ -24,7 +26,10 @@ from openpyxl.formatting.rule import DataBarRule
 from openpyxl.chart import BarChart, Reference
 from openpyxl.chart.series import SeriesLabel
 
-from .collector import GROUP_NAME, OUTING_CATS, NON_OUTING_CATS, find_duplicate_member_names  # noqa: F401
+from .collector import (  # noqa: F401
+    GROUP_NAME, OUTING_CATS, NON_OUTING_CATS, find_duplicate_member_names,
+    is_multi_year, month_axis, period_label, period_tag, ym_label, ym_of,
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -35,7 +40,9 @@ from .collector import GROUP_NAME, OUTING_CATS, NON_OUTING_CATS, find_duplicate_
 # (인사이트 다시 보기) + (원본 데이터 재분석)이 가능하게 한다.
 # 숨김 시트는 Excel에서 시트 탭 우클릭 → 숨기기 취소로 노출 가능.
 
-EXCEL_SCHEMA_VERSION = 1
+# v2: 메타가 (year, month) 대신 (start_ym, end_ym) 기간 쌍을 저장.
+# v1 엑셀은 load_excel_bundle이 읽을 때 자동으로 범위로 변환한다(하위 호환).
+EXCEL_SCHEMA_VERSION = 2
 
 BASE_POST_KEYS: list[str] = [
     "id", "author", "wid", "title", "body", "outing_date", "posted_at",
@@ -116,8 +123,8 @@ def _title_band(ws, text, cols, row=1, height=36, bg=None, size=14):
 def build_excel(
     posts: list[dict],
     photos: list[dict],
-    year: int,
-    month: Optional[int] = None,
+    start_ym: int,
+    end_ym: int,
     master_records: Optional[list[dict]] = None,
     members: Optional[list[dict]] = None,
     banned: Optional[set[str]] = None,
@@ -147,7 +154,8 @@ def build_excel(
     (숨김) _메타, _원본_게시글, _원본_사진, _멤버마스터, _멤버, _탈퇴멤버,
             _이름매핑, _가입인사매핑 — 각 인자 전달 시
     """
-    period_label = f"{year}년" + (f" {month}월" if month else "")
+    label = period_label(start_ym, end_ym)
+    months = month_axis(start_ym, end_ym)
 
     posts_A = [p for p in posts if p["cat"] == "A"]
     posts_E = [p for p in posts if p["cat"] == "E"]
@@ -161,27 +169,28 @@ def build_excel(
 
     _build_sheet_dashboard(wb, posts, posts_A, posts_E, posts_active,
                            posts_canceled, photos, photos_with_cmt,
-                           year, month, period_label)
+                           months, label)
     user_stats, sorted_users = _build_sheet_post_stats(wb, posts)
     _build_sheet_outings(wb, posts_A)
     _build_sheet_reviews(wb, posts_E)
     _build_sheet_photos(wb, photos)
-    user_month, mon_user_count, sorted_authors = _build_sheet_theme_matrix(wb, photos, photos_with_cmt)
+    user_month, mon_user_count, sorted_authors = _build_sheet_theme_matrix(
+        wb, photos, photos_with_cmt, months)
     photo_stats, sorted_photo_users = _build_sheet_photo_stats(wb, photos)
-    _build_sheet_categories(wb, posts_A)
+    _build_sheet_categories(wb, posts_A, months)
     _build_sheet_insights(wb, posts, posts_A, posts_E, posts_active,
                           posts_canceled, photos, photos_with_cmt,
                           user_stats, sorted_users,
                           user_month, mon_user_count, sorted_authors,
                           photo_stats, sorted_photo_users,
-                          period_label)
+                          label, months)
     _build_sheet_outing_attendees(wb, posts_A, posts_E)
     _build_sheet_member_attendance(wb, posts_A)
-    _build_sheet_monthly_matrix(wb, posts_A)
+    _build_sheet_monthly_matrix(wb, posts_A, months)
     if members:
         _build_sheet_member_overview(wb, members, posts, photos, posts_A)
 
-    _build_sheet_meta(wb, year, month)
+    _build_sheet_meta(wb, start_ym, end_ym)
     _build_sheet_raw_posts(wb, posts)
     _build_sheet_raw_photos(wb, photos)
     if master_records is not None:
@@ -203,8 +212,8 @@ def build_excel(
 def save_excel(
     posts: list[dict],
     photos: list[dict],
-    year: int,
-    month: Optional[int] = None,
+    start_ym: int,
+    end_ym: int,
     path: Optional[str] = None,
     master_records: Optional[list[dict]] = None,
     members: Optional[list[dict]] = None,
@@ -214,9 +223,8 @@ def save_excel(
 ) -> str:
     """엑셀을 파일로 저장. 경로 미지정시 기본 이름 사용."""
     if path is None:
-        period = f"{year}" + (f"_{month:02d}" if month else "")
-        path = f"다감노_{period}_분석.xlsx"
-    data = build_excel(posts, photos, year, month,
+        path = f"다감노_{period_tag(start_ym, end_ym)}_분석.xlsx"
+    data = build_excel(posts, photos, start_ym, end_ym,
                        master_records=master_records,
                        members=members, banned=banned, resolution=resolution,
                        join_aliases=join_aliases)
@@ -246,14 +254,14 @@ def _to_cell(value, key: str = "") -> object:
     return str(value)
 
 
-def _build_sheet_meta(wb: Workbook, year: int, month: Optional[int]) -> None:
+def _build_sheet_meta(wb: Workbook, start_ym: int, end_ym: int) -> None:
     ws = wb.create_sheet("_메타")
     ws.sheet_state = "hidden"
     ws.append(["key", "value"])
     rows = [
         ("schema_version", EXCEL_SCHEMA_VERSION),
-        ("year", int(year)),
-        ("month", "" if month is None else int(month)),
+        ("start_ym", int(start_ym)),
+        ("end_ym", int(end_ym)),
         ("saved_at", datetime.now().isoformat(timespec="seconds")),
     ]
     for k, v in rows:
@@ -441,9 +449,11 @@ def _build_sheet_member_overview(
 def load_excel_bundle(data: bytes) -> dict:
     """엑셀 bytes에서 숨김 시트의 원본 데이터를 복원.
 
+    v1(year/month) 엑셀도 읽어서 자동으로 기간 쌍으로 변환한다.
+
     Returns:
         {
-          "year": int, "month": int|None,
+          "start_ym": int, "end_ym": int,
           "posts":  list[dict],
           "photos": list[dict],
           "master": list[dict],     # legacy(_멤버마스터) — 비어있을 수 있음
@@ -452,7 +462,7 @@ def load_excel_bundle(data: bytes) -> dict:
           "resolution": dict[str,str],  # _이름매핑 (이름→처리)
         }
     Raises:
-        ValueError — 메타 시트 없음/버전 불일치/필수 시트 누락.
+        ValueError — 메타 시트 없음/지원하지 않는 버전/필수 시트 누락.
     """
     from openpyxl import load_workbook
     wb = load_workbook(BytesIO(data), data_only=True)
@@ -462,14 +472,7 @@ def load_excel_bundle(data: bytes) -> dict:
             raise ValueError(f"이 엑셀에는 원본 데이터({name})가 포함돼 있지 않습니다.")
 
     meta = _read_meta(wb["_메타"])
-    if meta.get("schema_version") != EXCEL_SCHEMA_VERSION:
-        raise ValueError(
-            f"지원하지 않는 엑셀 버전: {meta.get('schema_version')} "
-            f"(지원={EXCEL_SCHEMA_VERSION})"
-        )
-    year = int(meta["year"])
-    month_val = meta.get("month")
-    month: Optional[int] = int(month_val) if month_val not in (None, "", 0) else None
+    start_ym, end_ym = _meta_period(meta)
 
     posts = _read_raw(wb["_원본_게시글"], BASE_POST_KEYS, _BOOL_POST_KEYS)
     photos = _read_raw(wb["_원본_사진"], BASE_PHOTO_KEYS, _BOOL_PHOTO_KEYS)
@@ -480,9 +483,30 @@ def load_excel_bundle(data: bytes) -> dict:
     join_aliases = (_read_join_aliases(wb["_가입인사매핑"])
                     if "_가입인사매핑" in wb.sheetnames else {})
 
-    return {"year": year, "month": month, "posts": posts, "photos": photos,
+    return {"start_ym": start_ym, "end_ym": end_ym, "posts": posts, "photos": photos,
             "master": master, "members": members, "banned": banned,
             "resolution": resolution, "join_aliases": join_aliases}
+
+
+def _meta_period(meta: dict) -> tuple[int, int]:
+    """`_메타`에서 기간을 읽는다 — v2는 직독, v1은 year/month를 범위로 변환.
+
+    v1은 "한 해" 또는 "한 해의 한 달"만 표현할 수 있었으므로
+    month가 있으면 그 달 하나(202605~202605), 없으면 그 해 전체(202601~202612).
+    """
+    ver = meta.get("schema_version")
+    if ver == EXCEL_SCHEMA_VERSION:
+        return int(meta["start_ym"]), int(meta["end_ym"])
+    if ver == 1:
+        year = int(meta["year"])
+        mv = meta.get("month")
+        month = int(mv) if mv not in (None, "", 0) else None
+        if month is None:
+            return year * 100 + 1, year * 100 + 12
+        return year * 100 + month, year * 100 + month
+    raise ValueError(
+        f"지원하지 않는 엑셀 버전: {ver} (지원=1, {EXCEL_SCHEMA_VERSION})"
+    )
 
 
 def _read_meta(ws) -> dict:
@@ -609,13 +633,17 @@ def _read_join_aliases(ws) -> dict[str, str]:
 
 def _build_sheet_dashboard(wb, posts, posts_A, posts_E, posts_active,
                            posts_canceled, photos, photos_with_cmt,
-                           year, month, period_label):
+                           months, label):
     ws = wb.create_sheet("📊 대시보드")
     ws.sheet_view.showGridLines = False
+    n = len(months)
+    multi = is_multi_year(months[0], months[-1]) if months else False
+    # KPI 카드가 12칸(A~L)을 쓰므로 헤더 폭은 최소 12칸을 유지한다.
+    span = max(12, n + 1)
 
-    _title_band(ws, f"📸 {GROUP_NAME} {period_label} 활동 대시보드", 12, height=40, size=16)
-    ws.merge_cells("A2:L2")
-    ws["A2"] = f"추출일: {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  기간: {period_label}"
+    _title_band(ws, f"📸 {GROUP_NAME} {label} 활동 대시보드", span, height=40, size=16)
+    ws.merge_cells(f"A2:{get_column_letter(span)}2")
+    ws["A2"] = f"추출일: {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  기간: {label}"
     ws["A2"].font = Font(name="Arial", size=10, color="888888")
     ws["A2"].alignment = _center()
     ws.row_dimensions[2].height = 18
@@ -648,7 +676,7 @@ def _build_sheet_dashboard(wb, posts, posts_A, posts_E, posts_active,
         ws.cell(5, c_idx).alignment = _center()
 
     # 월별 추이
-    ws.merge_cells("A8:L8")
+    ws.merge_cells(f"A8:{get_column_letter(span)}8")
     ws["A8"] = "📅 월별 활동 현황"
     ws["A8"].font = Font(name="Arial", bold=True, size=12)
     ws["A8"].fill = _fill(C["HDR_LIGHT"])
@@ -658,21 +686,24 @@ def _build_sheet_dashboard(wb, posts, posts_A, posts_E, posts_active,
 
     row_h = 10
     ws.cell(row_h, 1).value = "구분"
-    for i, m in enumerate(range(1, 13)):
-        ws.cell(row_h, i+2).value = f"{m}월"
-    _style_header_row(ws, row_h, 1, 13)
+    for i, m in enumerate(months):
+        ws.cell(row_h, i+2).value = ym_label(m, multi_year=multi)
+    _style_header_row(ws, row_h, 1, n + 1)
     ws.row_dimensions[row_h].height = 22
 
     def mon_outing(items, m):
         return sum(1 for x in items
-                   if x["outing_date"] and date.fromisoformat(x["outing_date"]).month == m)
+                   if x["outing_date"] and ym_of(date.fromisoformat(x["outing_date"])) == m)
+
+    def mon_posted(items, m):
+        return sum(1 for p in items if ym_of(p["posted_at"]) == m)
 
     row_data = [
-        ("진행 출사", [mon_outing(posts_active, m)   for m in range(1, 13)], C["ACCENT_GRN"]),
-        ("취소 출사", [mon_outing(posts_canceled, m) for m in range(1, 13)], C["ACCENT_RED"]),
-        ("후기글",   [sum(1 for p in posts_E if p["posted_at"].month == m) for m in range(1, 13)], "2E75B6"),
-        ("사진",     [sum(1 for p in photos  if p["posted_at"].month == m) for m in range(1, 13)], "ED7D31"),
-        ("테마 예상", [sum(1 for p in photos_with_cmt if p["posted_at"].month == m) for m in range(1, 13)], C["ACCENT_PRP"]),
+        ("진행 출사", [mon_outing(posts_active, m)   for m in months], C["ACCENT_GRN"]),
+        ("취소 출사", [mon_outing(posts_canceled, m) for m in months], C["ACCENT_RED"]),
+        ("후기글",   [mon_posted(posts_E, m)         for m in months], "2E75B6"),
+        ("사진",     [mon_posted(photos, m)          for m in months], "ED7D31"),
+        ("테마 예상", [mon_posted(photos_with_cmt, m) for m in months], C["ACCENT_PRP"]),
     ]
     for i, (label, vals, bg) in enumerate(row_data):
         r = row_h + 1 + i
@@ -696,15 +727,18 @@ def _build_sheet_dashboard(wb, posts, posts_A, posts_E, posts_active,
     chart.title = "월별 출사 공지 (진행/취소)"
     chart.y_axis.title = "건수"; chart.x_axis.title = "월"
     chart.style = 10; chart.width = 22; chart.height = 11
-    cats_ref = Reference(ws, min_col=2, max_col=13, min_row=row_h, max_row=row_h)
-    for i, label in enumerate(["진행 출사", "취소 출사"], 1):
-        data = Reference(ws, min_col=2, max_col=13, min_row=row_h+i, max_row=row_h+i)
+    cats_ref = Reference(ws, min_col=2, max_col=n+1, min_row=row_h, max_row=row_h)
+    for i, series_label in enumerate(["진행 출사", "취소 출사"], 1):
+        data = Reference(ws, min_col=2, max_col=n+1, min_row=row_h+i, max_row=row_h+i)
         chart.add_data(data)
-        chart.series[-1].title = SeriesLabel(v=label)
+        chart.series[-1].title = SeriesLabel(v=series_label)
     chart.set_categories(cats_ref)
     ws.add_chart(chart, "A17")
 
-    _set_col_widths(ws, {"A": 14, **{get_column_letter(i): 6 for i in range(2, 14)}})
+    # 다년이면 라벨이 "2026-03"이라 6칸으로는 좁다.
+    _set_col_widths(ws, {"A": 14,
+                         **{get_column_letter(i): (9 if multi else 6)
+                            for i in range(2, max(14, n + 2))}})
 
 
 def _build_sheet_post_stats(wb, posts):
@@ -890,81 +924,116 @@ def _build_sheet_photos(wb, photos):
     _set_col_widths(ws, {"A":16,"B":5,"C":10,"D":7,"E":7,"F":9,"G":40,"H":62,"I":62})
 
 
-def _build_sheet_theme_matrix(wb, photos, photos_with_cmt):
-    ws = wb.create_sheet("🎨 월별 테마 매트릭스")
-    ws.sheet_view.showGridLines = False
-    _title_band(ws, "🎨 월별 테마 참여 예상 매트릭스", 15, height=32, size=13)
+def _build_month_matrix_sheet(wb, *, sheet_name, title, legend, key_header,
+                              count_header, total_header, keys, key_month,
+                              months, mark_fill, mark_color,
+                              footer_label, footer_values, footer_total,
+                              footer_fill, col_width):
+    """`키 × 월` 매트릭스 시트를 그린다 (🎨 테마 / 📅 참석 공용 템플릿).
 
-    ws.merge_cells("A2:O2")
-    ws["A2"] = "▣ : 해당 월에 댓글 받은 사진을 1장 이상 업로드 (테마 이벤트 참여 가능성)"
+    컬럼 수는 기간 길이(`len(months)`)에 따라 늘어난다 — 예전에는 A~O 15열로
+    고정돼 있어 다년 범위를 표현할 수 없었다.
+
+    레이아웃: 1=키, 2=개수, 3..3+n-1=월, 3+n=합계 (총 n+3열)
+    집계는 호출부가 하고 이 함수는 **그리기만** 한다(테마 쪽 집계는 인사이트 시트가 재사용).
+    """
+    n = len(months)
+    last_col = n + 3
+    multi = is_multi_year(months[0], months[-1]) if months else False
+
+    ws = wb.create_sheet(sheet_name)
+    ws.sheet_view.showGridLines = False
+    _title_band(ws, title, last_col, height=32, size=13)
+
+    ws.merge_cells(f"A2:{get_column_letter(last_col)}2")
+    ws["A2"] = legend
     ws["A2"].font = Font(name="Arial", size=10, italic=True, color="666666")
     ws["A2"].alignment = _left()
     ws.row_dimensions[2].height = 22
 
+    header_row = 4
+    ws.cell(header_row, 1).value = key_header
+    ws.cell(header_row, 2).value = count_header
+    for i, m in enumerate(months):
+        ws.cell(header_row, 3 + i).value = ym_label(m, multi_year=multi)
+    ws.cell(header_row, last_col).value = total_header
+    _style_header_row(ws, header_row, 1, last_col)
+    ws.row_dimensions[header_row].height = 22
+    ws.freeze_panes = "C5"   # 옆으로 길어져도 키 열은 계속 보이게
+
+    r = header_row
+    for key in keys:
+        r += 1
+        per_month = key_month[key]
+        active_months = sum(1 for m in months if per_month.get(m, 0) > 0)
+        ws.cell(r, 1).value = key
+        ws.cell(r, 2).value = active_months
+        for i, m in enumerate(months):
+            ws.cell(r, 3 + i).value = per_month.get(m, 0)
+        ws.cell(r, last_col).value = sum(per_month.get(m, 0) for m in months)
+        bg = C["GRAY_LIGHT"] if r % 2 == 0 else C["WHITE"]
+        for c in range(1, last_col + 1):
+            cell = ws.cell(r, c)
+            cell.font = _body_font(bold=(c == 1))
+            cell.alignment = _left() if c == 1 else _center()
+            cell.border = _thin_border()
+            cell.fill = _fill(bg)
+            if 3 <= c < last_col and isinstance(cell.value, int) and cell.value > 0:
+                cell.fill = _fill(mark_fill)
+                cell.font = Font(name="Arial", size=10, bold=True, color=mark_color)
+                cell.value = f"▣ {cell.value}"
+        ws.row_dimensions[r].height = 20
+
+    if keys:
+        r += 1
+        ws.cell(r, 1).value = footer_label
+        ws.cell(r, 2).value = "—"
+        for i, m in enumerate(months):
+            ws.cell(r, 3 + i).value = footer_values.get(m, 0)
+        ws.cell(r, last_col).value = footer_total
+        for c in range(1, last_col + 1):
+            cell = ws.cell(r, c)
+            cell.font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+            cell.fill = _fill(footer_fill)
+            cell.alignment = _center()
+            cell.border = _thin_border()
+        ws.row_dimensions[r].height = 22
+
+    # 다년이면 "2026-03" 라벨이라 한 칸 더 넓게.
+    month_w = max(col_width, 9) if multi else col_width
+    _set_col_widths(ws, {"A": 12, "B": 9,
+                         **{get_column_letter(3 + i): month_w for i in range(n)},
+                         get_column_letter(last_col): 9})
+    return ws
+
+
+def _build_sheet_theme_matrix(wb, photos, photos_with_cmt, months):
     user_month: dict = defaultdict(lambda: defaultdict(int))
     for p in photos_with_cmt:
-        user_month[p["author"]][p["posted_at"].month] += 1
+        user_month[p["author"]][ym_of(p["posted_at"])] += 1
 
     mon_user_count: dict = defaultdict(int)
     for author, mons_d in user_month.items():
         for m in mons_d:
             mon_user_count[m] += 1
 
-    def participate_months(author):
-        return len(user_month[author])
     sorted_authors = sorted(
         user_month.keys(),
-        key=lambda a: (-participate_months(a), -sum(user_month[a].values())),
+        key=lambda a: (-len(user_month[a]), -sum(user_month[a].values())),
     )
 
-    ws.append([])
-    header_row = 4
-    ws.cell(header_row, 1).value = "작성자"
-    ws.cell(header_row, 2).value = "참여월수"
-    for i, m in enumerate(range(1, 13)):
-        ws.cell(header_row, 3+i).value = f"{m}월"
-    ws.cell(header_row, 15).value = "합계(장)"
-    _style_header_row(ws, header_row, 1, 15)
-    ws.row_dimensions[header_row].height = 22
-    ws.freeze_panes = "C5"
-
-    for author in sorted_authors:
-        r = ws.max_row + 1
-        mons_d = user_month[author]
-        pm = participate_months(author)
-        total_photos = sum(mons_d.values())
-        ws.append([author, pm] + [mons_d.get(m, 0) for m in range(1, 13)] + [total_photos])
-        bg = C["GRAY_LIGHT"] if r % 2 == 0 else C["WHITE"]
-        for c in range(1, 16):
-            cell = ws.cell(r, c)
-            cell.font = _body_font(bold=(c == 1))
-            cell.alignment = _left() if c == 1 else _center()
-            cell.border = _thin_border()
-            cell.fill = _fill(bg)
-            if 3 <= c <= 14 and isinstance(cell.value, int) and cell.value > 0:
-                cell.fill = _fill(C["THEME"])
-                cell.font = Font(name="Arial", size=10, bold=True, color=C["ACCENT_PRP"])
-                cell.value = f"▣ {cell.value}"
-        ws.row_dimensions[r].height = 20
-
-    # 월별 합계 행
-    r = ws.max_row + 1
-    ws.cell(r, 1).value = "월별 참여자 수"
-    ws.cell(r, 2).value = "—"
-    for i, m in enumerate(range(1, 13)):
-        ws.cell(r, 3+i).value = mon_user_count.get(m, 0)
-    ws.cell(r, 15).value = len(photos_with_cmt)
-    for c in range(1, 16):
-        cell = ws.cell(r, c)
-        cell.font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
-        cell.fill = _fill(C["ACCENT_PRP"])
-        cell.alignment = _center()
-        cell.border = _thin_border()
-    ws.row_dimensions[r].height = 22
-
-    _set_col_widths(ws, {"A":12, "B":9,
-                         **{get_column_letter(i): 7 for i in range(3, 15)},
-                         "O":9})
+    _build_month_matrix_sheet(
+        wb,
+        sheet_name="🎨 월별 테마 매트릭스",
+        title="🎨 월별 테마 참여 예상 매트릭스",
+        legend="▣ : 해당 월에 댓글 받은 사진을 1장 이상 업로드 (테마 이벤트 참여 가능성)",
+        key_header="작성자", count_header="참여월수", total_header="합계(장)",
+        keys=sorted_authors, key_month=user_month, months=months,
+        mark_fill=C["THEME"], mark_color=C["ACCENT_PRP"],
+        footer_label="월별 참여자 수", footer_values=mon_user_count,
+        footer_total=len(photos_with_cmt), footer_fill=C["ACCENT_PRP"],
+        col_width=7,
+    )
     return user_month, mon_user_count, sorted_authors
 
 
@@ -1017,8 +1086,11 @@ def _build_sheet_photo_stats(wb, photos):
     return photo_stats, sorted_photo_users
 
 
-def _build_sheet_categories(wb, posts_A):
-    """🏷️ 카테고리 분포 — UI 🏷️ 카테고리 탭 미러. 출사 공지 제목 `[태그]` 기준."""
+def _build_sheet_categories(wb, posts_A, months):
+    """🏷️ 카테고리 분포 — UI 🏷️ 카테고리 탭 미러. 출사 공지 제목 `[태그]` 기준.
+
+    기간 전체 분포(위) + 카테고리 × 월 추이(아래)를 한 시트에 담는다.
+    """
     ws = wb.create_sheet("🏷️ 카테고리")
     ws.sheet_view.showGridLines = False
     _title_band(ws, "🏷️ 카테고리 분포 — 출사 공지 제목의 [태그] 기준", 5,
@@ -1071,13 +1143,77 @@ def _build_sheet_categories(wb, posts_A):
 
     _set_col_widths(ws, {"A": 14, "B": 7, "C": 9, "D": 8, "E": 8, "F": 12})
 
+    # ── 카테고리 × 월 (출사일 기준) ──────────────────────────────
+    _append_category_monthly_block(ws, posts_A, months,
+                                   start_row=2 + len(rows) + 2)
+
+
+def _append_category_monthly_block(ws, posts_A, months, *, start_row):
+    """🏷️ 카테고리 시트 하단에 `카테고리 × 월` 블록을 이어 붙인다.
+
+    새 시트를 만들지 않는 이유: 시트 번호 체계(모듈 docstring)와 README를
+    전부 재편해야 하므로. 값은 정수로 유지해 차트를 붙일 수 있게 한다.
+    """
+    n = len(months)
+    if not n:
+        return
+    multi = is_multi_year(months[0], months[-1])
+    last_col = n + 2  # 1=카테고리, 2..n+1=월, n+2=합계
+
+    per_cat: dict = defaultdict(lambda: defaultdict(int))
+    for p in posts_A:
+        od = p.get("outing_date")
+        cat = p.get("category")
+        if not od or not cat:
+            continue  # 출사일/카테고리 미상은 월 축에 놓을 수 없음
+        per_cat[cat][ym_of(date.fromisoformat(od))] += 1
+    if not per_cat:
+        return
+
+    r = start_row
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=last_col)
+    ws.cell(r, 1).value = "📅 카테고리 × 월 (출사일 기준 · 출사일/카테고리 미상 제외)"
+    ws.cell(r, 1).font = Font(name="Arial", bold=True, size=12)
+    ws.cell(r, 1).fill = _fill(C["HDR_LIGHT"])
+    ws.cell(r, 1).alignment = _left()
+    ws.row_dimensions[r].height = 22
+
+    r += 1
+    ws.cell(r, 1).value = "카테고리"
+    for i, m in enumerate(months):
+        ws.cell(r, 2 + i).value = ym_label(m, multi_year=multi)
+    ws.cell(r, last_col).value = "합계"
+    _style_header_row(ws, r, 1, last_col, bg=C["HDR_MID"])
+    ws.row_dimensions[r].height = 22
+
+    ordered = sorted(per_cat, key=lambda c: -sum(per_cat[c].values()))
+    for cat in ordered:
+        r += 1
+        ws.cell(r, 1).value = cat
+        for i, m in enumerate(months):
+            ws.cell(r, 2 + i).value = per_cat[cat].get(m, 0)
+        ws.cell(r, last_col).value = sum(per_cat[cat].values())
+        bg = C["OUTING"] if cat in OUTING_CATS else C["REVIEW"]
+        for c in range(1, last_col + 1):
+            cell = ws.cell(r, c)
+            cell.font = _body_font(bold=(c == 1))
+            cell.fill = _fill(bg)
+            cell.border = _thin_border()
+            cell.alignment = _left() if c == 1 else _center()
+        ws.row_dimensions[r].height = 20
+
+    for i in range(n):
+        col = get_column_letter(2 + i)
+        ws.column_dimensions[col].width = 9 if multi else 7
+    ws.column_dimensions[get_column_letter(last_col)].width = 9
+
 
 def _build_sheet_insights(wb, posts, posts_A, posts_E, posts_active, posts_canceled,
                           photos, photos_with_cmt,
                           user_stats, sorted_users,
                           user_month, mon_user_count, sorted_authors,
                           photo_stats, sorted_photo_users,
-                          period_label):
+                          label, months):
     ws = wb.create_sheet("💡 인사이트")
     ws.sheet_view.showGridLines = False
     ws.column_dimensions["A"].width = 3
@@ -1086,7 +1222,7 @@ def _build_sheet_insights(wb, posts, posts_A, posts_E, posts_active, posts_cance
     ws.column_dimensions["D"].width = 22
 
     ws.merge_cells("B1:D1")
-    ws["B1"] = f"💡 {GROUP_NAME} {period_label} 주요 인사이트"
+    ws["B1"] = f"💡 {GROUP_NAME} {label} 주요 인사이트"
     ws["B1"].font = _hdr_font(16, True)
     ws["B1"].fill = _fill(C["HDR_DARK"])
     ws["B1"].alignment = _center()
@@ -1130,7 +1266,7 @@ def _build_sheet_insights(wb, posts, posts_A, posts_E, posts_active, posts_cance
                 f"{len(posts_canceled)}건 ({len(posts_canceled)/len(posts_A)*100:.1f}%)",
                 "전체 공지 대비", r, "warn")
     r = row("사진 업로드", f"{len(photos)}장",
-            f"월 평균 {len(photos)/12:.0f}장" if len(photos) else "—", r)
+            f"월 평균 {len(photos)/max(1, len(months)):.0f}장" if len(photos) else "—", r)
     if photos:
         r = row("테마 예상",
                 f"{len(photos_with_cmt)}장 ({len(photos_with_cmt)/len(photos)*100:.1f}%)",
@@ -1161,7 +1297,8 @@ def _build_sheet_insights(wb, posts, posts_A, posts_E, posts_active, posts_cance
                 "여러 달에 걸쳐 참여", r, "theme")
     if mon_user_count:
         hot = max(mon_user_count, key=mon_user_count.get)
-        r = row("가장 활발한 달", f"{hot}월", f"{mon_user_count[hot]}명 참여", r, "good")
+        hot_label = ym_label(hot, multi_year=is_multi_year(months[0], months[-1]) if months else True)
+        r = row("가장 활발한 달", hot_label, f"{mon_user_count[hot]}명 참여", r, "good")
 
     r += 1
     r = section("⑤ 카테고리 트렌드 (출사 공지 기준)", r)
@@ -1348,25 +1485,14 @@ def _build_sheet_member_attendance(wb, posts_A):
     _set_col_widths(ws, widths)
 
 
-def _build_sheet_monthly_matrix(wb, posts_A):
-    ws = wb.create_sheet("📅 월별 참석 매트릭스")
-    ws.sheet_view.showGridLines = False
-    _title_band(ws, "📅 월별 참석 매트릭스 — 멤버 × 월", 15, height=32, size=13)
-
-    ws.merge_cells("A2:O2")
-    ws["A2"] = "▣ : 해당 월 출사 후기에서 참석자로 매칭됨"
-    ws["A2"].font = Font(name="Arial", size=10, italic=True, color="666666")
-    ws["A2"].alignment = _left()
-    ws.row_dimensions[2].height = 22
-
-    from collections import defaultdict
+def _build_sheet_monthly_matrix(wb, posts_A, months):
     mm: dict = defaultdict(lambda: defaultdict(int))
     total_per_month: dict = defaultdict(int)
-    for n in posts_A:
-        if not n.get("actually_held") or not n.get("outing_date"):
+    for notice in posts_A:
+        if not notice.get("actually_held") or not notice.get("outing_date"):
             continue
-        m = date.fromisoformat(n["outing_date"]).month
-        for name in n.get("attendees", []):
+        m = ym_of(date.fromisoformat(notice["outing_date"]))
+        for name in notice.get("attendees", []):
             mm[name][m] += 1
             total_per_month[m] += 1
 
@@ -1376,53 +1502,15 @@ def _build_sheet_monthly_matrix(wb, posts_A):
                        -sum(mm[a].values())),
     )
 
-    header_row = 4
-    ws.cell(header_row, 1).value = "멤버"
-    ws.cell(header_row, 2).value = "참석월수"
-    for i, m in enumerate(range(1, 13)):
-        ws.cell(header_row, 3 + i).value = f"{m}월"
-    ws.cell(header_row, 15).value = "합계"
-    _style_header_row(ws, header_row, 1, 15)
-    ws.row_dimensions[header_row].height = 22
-    ws.freeze_panes = "C5"
-
-    for member in sorted_members:
-        r = ws.max_row + 1
-        months = mm[member]
-        pm = sum(1 for m in months if months[m] > 0)
-        total = sum(months.values())
-        ws.append([member, pm] + [months.get(m, 0) for m in range(1, 13)] + [total])
-        bg = C["GRAY_LIGHT"] if r % 2 == 0 else C["WHITE"]
-        for c in range(1, 16):
-            cell = ws.cell(r, c)
-            cell.font = _body_font(bold=(c == 1))
-            cell.alignment = _left() if c == 1 else _center()
-            cell.border = _thin_border()
-            cell.fill = _fill(bg)
-            if 3 <= c <= 14 and isinstance(cell.value, int) and cell.value > 0:
-                cell.fill = _fill(C["OUTING"])
-                cell.font = Font(name="Arial", size=10, bold=True, color=C["ACCENT_GRN"])
-                cell.value = f"▣ {cell.value}"
-        ws.row_dimensions[r].height = 20
-
-    # 월별 합계 행
-    if sorted_members:
-        r = ws.max_row + 1
-        ws.cell(r, 1).value = "월별 참석 연인원"
-        ws.cell(r, 2).value = "—"
-        for i, m in enumerate(range(1, 13)):
-            ws.cell(r, 3 + i).value = total_per_month.get(m, 0)
-        ws.cell(r, 15).value = sum(total_per_month.values())
-        for c in range(1, 16):
-            cell = ws.cell(r, c)
-            cell.font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
-            cell.fill = _fill(C["ACCENT_GRN"])
-            cell.alignment = _center()
-            cell.border = _thin_border()
-        ws.row_dimensions[r].height = 22
-
-    widths = {"A": 12, "B": 9}
-    for i in range(12):
-        widths[get_column_letter(3 + i)] = 8
-    widths["O"] = 9
-    _set_col_widths(ws, widths)
+    _build_month_matrix_sheet(
+        wb,
+        sheet_name="📅 월별 참석 매트릭스",
+        title="📅 월별 참석 매트릭스 — 멤버 × 월",
+        legend="▣ : 해당 월 출사 후기에서 참석자로 매칭됨",
+        key_header="멤버", count_header="참석월수", total_header="합계",
+        keys=sorted_members, key_month=mm, months=months,
+        mark_fill=C["OUTING"], mark_color=C["ACCENT_GRN"],
+        footer_label="월별 참석 연인원", footer_values=total_per_month,
+        footer_total=sum(total_per_month.values()), footer_fill=C["ACCENT_GRN"],
+        col_width=8,
+    )
