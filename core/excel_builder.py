@@ -928,7 +928,7 @@ def _build_sheet_reviews(wb, posts_E):
     for p in sorted(posts_E, key=lambda x: x["posted_at"], reverse=True):
         r = ws.max_row + 1
         ws.append([
-            p["posted_at"].strftime("%Y-%m-%d"), p["posted_at"].month,
+            p["posted_at"].strftime("%Y-%m-%d"), p["posted_at"].strftime("%Y-%m"),
             p["author"], p["category"] or "-",
             "출사" if p["is_outing"] else "활동",
             p["title"], p["likes"], p["comments"],
@@ -960,7 +960,7 @@ def _build_sheet_photos(wb, photos):
         r = ws.max_row + 1
         ws.append([
             p["posted_at"].strftime("%Y-%m-%d %H:%M"),
-            p["posted_at"].month,
+            p["posted_at"].strftime("%Y-%m"),
             p["author"], p["likes"], p["comments"],
             "🎨 예상" if p["has_comment"] else "",
             p["id"], p["url_large"], p["url_thumb"],

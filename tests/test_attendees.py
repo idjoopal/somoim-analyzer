@@ -516,3 +516,40 @@ def test_excel_round_trip_with_join_aliases():
     blob = build_excel([], [], 202601, 202612, join_aliases=aliases)
     loaded = load_excel_bundle(blob)
     assert loaded["join_aliases"] == aliases
+
+
+def test_excel_listing_sheets_keep_year_in_month_column():
+    """📝 후기글·📷 사진 시트의 '월' 열이 다년에서 연도를 잃지 않아야 한다.
+
+    `.month`만 쓰면 2025-09와 2026-03이 9/3으로 남아 그 열로 정렬·필터할 때
+    서로 다른 해가 섞인다. 앱의 같은 컬럼(reviews_table)과도 표기를 맞춘다.
+    """
+    from io import BytesIO
+    from openpyxl import load_workbook
+    from core.excel_builder import build_excel
+
+    def review(pid, posted):
+        return {"id": pid, "author": "닉", "wid": "w1", "title": f"{pid} 후기",
+                "body": "", "outing_date": None, "posted_at": posted,
+                "cat": "E", "cat_label": "후기", "category": "풍경",
+                "is_outing": False, "is_canceled": False,
+                "likes": 0, "comments": 0, "images": 0,
+                "needs_review": False, "review_reason": ""}
+
+    def photo(pid, posted):
+        return {"id": pid, "author": "닉", "wid": "w1", "posted_at": posted,
+                "likes": 0, "comments": 0, "has_comment": False,
+                "url_large": "x", "url_medium": "y", "url_small": "z", "url_thumb": "n"}
+
+    posts = [review("r1", datetime(2025, 9, 6, 9, 0)),
+             review("r2", datetime(2026, 3, 8, 9, 0))]
+    photos = [photo("p1", datetime(2025, 9, 7, 9, 0)),
+              photo("p2", datetime(2026, 3, 9, 9, 0))]
+
+    wb = load_workbook(BytesIO(build_excel(posts, photos, 202509, 202603)))
+    for sheet in ("📝 후기글", "📷 사진"):
+        ws = wb[sheet]
+        header = [c.value for c in ws[2]]
+        col = header.index("월") + 1
+        months = {ws.cell(r, col).value for r in range(3, ws.max_row + 1)}
+        assert months == {"2025-09", "2026-03"}, (sheet, months)
