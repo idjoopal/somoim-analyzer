@@ -442,6 +442,97 @@ class FakeDriveStore:
         return f"ID_{title}", False
 
 
+class TwoFileClient:
+    """파일 id별로 탭을 나눠 갖는 가짜 — raw와 보정이 한 클라이언트를 공유한다.
+
+    한 dict에 몰아 넣으면 두 시트의 탭이 섞여, "raw를 읽어 보정을 채운다"는
+    경로를 검증할 수 없다.
+    """
+
+    def __init__(self, files=None):
+        self.files = {f: {t: [list(r) for r in rows] for t, rows in tabs.items()}
+                      for f, tabs in (files or {}).items()}
+
+    def _t(self, file_id):
+        return self.files.setdefault(file_id, {})
+
+    def ensure_tabs(self, file_id, tabs):
+        t = self._t(file_id)
+        made = [x for x in tabs if x not in t]
+        for x in made:
+            t[x] = []
+        return made
+
+    def read(self, file_id, tab):
+        return [list(r) for r in self._t(file_id).get(tab, [])]
+
+    def write(self, file_id, tab, rows):
+        self._t(file_id)[tab] = [list(r) for r in rows]
+
+    def append(self, file_id, tab, rows):
+        self._t(file_id).setdefault(tab, []).extend([list(r) for r in rows])
+
+    def sheet_ids(self, file_id):
+        return {t: 100 + i for i, t in enumerate(self._t(file_id))}
+
+    def set_header_notes(self, *a, **kw): pass
+    def set_validation(self, *a, **kw): pass
+    def freeze_header(self, *a, **kw): pass
+    def rename_tab(self, *a, **kw): return False
+
+
+def _raw_with_members():
+    return TwoFileClient({f"ID_{RAW_TITLE}": {
+        "멤버": [["mid", "mn", "is_admin", "joined_at", "last_visit", "os", "push"]]
+                + [[m["mid"], m["mn"], "", "", "", "", ""] for m in MEMBERS],
+        "가입인사매핑": [["실명", "닉네임"], ["정원석", "원석사진"]],
+    }})
+
+
+def test_opening_the_app_seeds_the_roster_without_collecting():
+    """멤버 명단은 raw에서 파생된다 — API 재수집을 기다릴 이유가 없다.
+
+    이게 안 되면 사용자는 헤더만 있는 빈 탭을 보게 된다(실제로 그랬다).
+    """
+    c = _raw_with_members()
+    _, fix = open_stores(FakeDriveStore(), c)
+
+    rows = c.read(fix.file_id, TAB_MEMBER_NAMES)
+    assert rows[0] == MEMBER_NAME_COLS
+    assert [r[1] for r in rows[1:]] == ["나무", "바다", "원석사진"]   # 닉네임 순
+    assert {r[1]: r[2] for r in rows[1:]}["원석사진"] == "정원석"      # 가입인사 반영
+
+
+def test_reopening_does_not_duplicate_or_overwrite_the_roster():
+    c = _raw_with_members()
+    _, fix = open_stores(FakeDriveStore(), c)
+    for row in c.files[fix.file_id][TAB_MEMBER_NAMES][1:]:
+        if row[1] == "나무":
+            row[2] = "김나무"
+
+    open_stores(FakeDriveStore(), c)                     # 앱을 다시 열었다
+    rows = c.read(fix.file_id, TAB_MEMBER_NAMES)
+    assert len(rows) == 1 + len(MEMBERS)
+    assert {r[1]: r[2] for r in rows[1:]}["나무"] == "김나무"
+
+
+def test_new_member_shows_up_on_the_next_open():
+    c = _raw_with_members()
+    fix_id = f"ID_{CORRECTION_TITLE}"
+    open_stores(FakeDriveStore(), c)
+    c.files[f"ID_{RAW_TITLE}"]["멤버"].append(["m9", "신입", "", "", "", "", ""])
+
+    open_stores(FakeDriveStore(), c)
+    assert "신입" in [r[1] for r in c.read(fix_id, TAB_MEMBER_NAMES)[1:]]
+
+
+def test_empty_raw_leaves_the_roster_alone():
+    """수집 전이라 멤버가 없으면 헤더만 — 빈 행을 만들어 두면 안 된다."""
+    c = TwoFileClient()
+    _, fix = open_stores(FakeDriveStore(), c)
+    assert c.read(fix.file_id, TAB_MEMBER_NAMES) == [MEMBER_NAME_COLS]
+
+
 def test_open_stores_finds_by_name_when_no_ids_given():
     drive = FakeDriveStore()
     raw, fix = open_stores(drive, FakeClient())

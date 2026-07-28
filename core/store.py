@@ -693,8 +693,12 @@ class CorrectionStore:
     def __init__(self, client, file_id: str):
         self.c, self.file_id = client, file_id
 
-    def ensure(self, master_names=None) -> None:
-        """탭과 헤더를 만들고 안내를 갱신한다.
+    def ensure(self, master_names=None, members=None, join_aliases=None) -> None:
+        """탭·헤더를 만들고, 멤버 명단을 깔고, 안내를 갱신한다.
+
+        **멤버 명단은 여기서 깐다.** raw에 이미 있는 데이터에서 파생되는 것이라
+        API 재수집을 기다릴 이유가 없다 — 앱을 여는 것만으로 채울 준비가 돼야
+        보정 1단계를 바로 시작할 수 있다.
 
         이미 내용이 있으면 헤더도 건드리지 않는다. 안내(사용법 탭·메모·드롭다운·
         헤더 고정)는 사용자가 입력한 셀에 닿지 않으므로 매번 갱신한다.
@@ -707,6 +711,9 @@ class CorrectionStore:
                           (TAB_ATTENDEE_FIX, ATTENDEE_FIX_COLS)):
             if not self.c.read(self.file_id, tab):
                 self.c.write(self.file_id, tab, [cols])
+        if members:
+            self.seed({TAB_MEMBER_NAMES:
+                       member_name_candidates(members, join_aliases)})
         self.write_guide(master_names)
 
     def migrate(self) -> None:
@@ -800,11 +807,13 @@ def open_stores(drive_store, client, raw_file_id=None,
     fix_id = correction_file_id or drive_store.find_or_create(CORRECTION_TITLE)[0]
     raw, fix = RawStore(client, raw_id), CorrectionStore(client, fix_id)
     raw.ensure()
-    # 멤버 명단을 넘겨야 이름 드롭다운이 **수집 없이도** 걸린다.
-    # 예전에는 `seed()`에서만 걸려서 수집한 적 없으면 목록이 비어 있었다.
+    # raw를 읽어 멤버 명단과 이름 드롭다운을 **수집 없이도** 채운다.
+    # 둘 다 이미 저장된 데이터에서 파생되므로 API를 다시 부를 이유가 없다.
     try:
-        members = raw.load().get("members") or []
-    except Exception:  # noqa: BLE001 — 드롭다운은 부가 기능이다
-        members = []
-    fix.ensure({m["mn"] for m in members if m.get("mn")})
+        cur = raw.load()
+        members, join_aliases = cur.get("members") or [], cur.get("join_aliases") or {}
+    except Exception:  # noqa: BLE001 — raw를 못 읽어도 보정 시트는 열려야 한다
+        members, join_aliases = [], {}
+    fix.ensure({m["mn"] for m in members if m.get("mn")},
+               members=members, join_aliases=join_aliases)
     return raw, fix
