@@ -121,11 +121,14 @@ class FakeSpreadsheets:
         return FakeValues(self.p)
 
     def get(self, spreadsheetId=None, fields=None):
-        return FakeReq({"sheets": [{"properties": {"title": t}} for t in self.p.tabs]})
+        return FakeReq({"sheets": [
+            {"properties": {"title": t, "sheetId": self.p.sheet_id_of(t)}}
+            for t in self.p.tabs]})
 
     def batchUpdate(self, spreadsheetId=None, body=None):  # noqa: N802
         for req in body["requests"]:
-            self.p.tabs.setdefault(req["addSheet"]["properties"]["title"], [])
+            if "addSheet" in req:
+                self.p.tabs.setdefault(req["addSheet"]["properties"]["title"], [])
         self.p.batch_updates.append(body)
         return FakeReq({})
 
@@ -135,6 +138,10 @@ class FakeSheetsService:
         self.tabs = dict(tabs or {})
         self.read_error, self.clear_error = read_error, clear_error
         self.updates, self.appends, self.cleared, self.batch_updates = [], [], [], []
+
+    def sheet_id_of(self, tab: str) -> int:
+        """탭마다 고유한 숫자 id — 실제 시트처럼 title과 별개의 식별자를 준다."""
+        return 100 + list(self.tabs).index(tab)
 
     def spreadsheets(self):
         return FakeSpreadsheets(self)
@@ -163,6 +170,99 @@ def test_ensure_tabs_noop_when_all_present():
     svc = FakeSheetsService(tabs={"게시글": [], "사진": []})
     assert SheetsClient({}, service=svc).ensure_tabs(FILE_ID, ["게시글"]) == []
     assert svc.batch_updates == []             # 요청 자체를 보내지 않아야 한다
+
+
+# ═══════════════════════════════════════════════════════════════
+# 서식 — 사람이 채우는 시트를 쓰기 좋게
+# ═══════════════════════════════════════════════════════════════
+
+def _reqs(svc) -> list[dict]:
+    return [r for b in svc.batch_updates for r in b["requests"]]
+
+
+def test_sheet_ids_maps_title_to_numeric_id():
+    """서식·메모·드롭다운은 title이 아니라 sheetId로 지정한다."""
+    svc = FakeSheetsService(tabs={"이름매핑": [], "공지보정": []})
+    assert SheetsClient({}, service=svc).sheet_ids(FILE_ID) == {
+        "이름매핑": 100, "공지보정": 101}
+
+
+def test_validation_is_not_strict_so_new_nicknames_can_be_typed():
+    """목록에 없는 새 닉네임을 입력조차 못 하게 막으면 보정이 불가능해진다."""
+    svc = FakeSheetsService(tabs={"이름매핑": []})
+    SheetsClient({}, service=svc).set_validation(
+        FILE_ID, "이름매핑", 1, ["원석사진", "__LEFT__", "__NOISE__"])
+
+    rule = _reqs(svc)[0]["setDataValidation"]["rule"]
+    assert rule["strict"] is False
+    assert rule["showCustomUi"] is True        # 드롭다운 화살표가 보여야 한다
+    assert [v["userEnteredValue"] for v in rule["condition"]["values"]] == [
+        "원석사진", "__LEFT__", "__NOISE__"]
+
+
+def test_validation_targets_the_right_column_and_skips_header():
+    svc = FakeSheetsService(tabs={"이름매핑": []})
+    SheetsClient({}, service=svc).set_validation(FILE_ID, "이름매핑", 1, ["a"])
+
+    rng = _reqs(svc)[0]["setDataValidation"]["range"]
+    assert rng["sheetId"] == 100
+    assert rng["startRowIndex"] == 1           # 헤더에는 걸지 않는다
+    assert (rng["startColumnIndex"], rng["endColumnIndex"]) == (1, 2)
+
+
+def test_validation_on_unknown_tab_is_noop():
+    """탭이 아직 없다고 죽으면 안 된다 — 서식은 부가 기능이다."""
+    svc = FakeSheetsService(tabs={"이름매핑": []})
+    SheetsClient({}, service=svc).set_validation(FILE_ID, "없는탭", 1, ["a"])
+    assert svc.batch_updates == []
+
+
+def test_validation_with_empty_list_is_noop():
+    svc = FakeSheetsService(tabs={"이름매핑": []})
+    SheetsClient({}, service=svc).set_validation(FILE_ID, "이름매핑", 1, [])
+    assert svc.batch_updates == []
+
+
+def test_header_notes_attach_to_header_row_without_changing_text():
+    """헤더 텍스트는 파싱 키다 — 설명은 메모로만 붙일 수 있다."""
+    svc = FakeSheetsService(tabs={"공지보정": []})
+    SheetsClient({}, service=svc).set_header_notes(
+        FILE_ID, "공지보정", {0: "게시글 id입니다", 3: "YYYY-MM-DD"})
+
+    cells = [r["updateCells"] for r in _reqs(svc)]
+    assert [c["fields"] for c in cells] == ["note", "note"]      # 값은 안 건드린다
+    assert [c["rows"][0]["values"][0]["note"] for c in cells] == [
+        "게시글 id입니다", "YYYY-MM-DD"]
+    assert all(c["range"]["endRowIndex"] == 1 for c in cells)    # 1행만
+
+
+def test_header_notes_empty_sends_nothing():
+    svc = FakeSheetsService(tabs={"공지보정": []})
+    SheetsClient({}, service=svc).set_header_notes(FILE_ID, "공지보정", {})
+    assert svc.batch_updates == []
+
+
+def test_freeze_header_pins_first_row():
+    svc = FakeSheetsService(tabs={"이름매핑": [], "공지보정": []})
+    SheetsClient({}, service=svc).freeze_header(FILE_ID, "공지보정")
+
+    req = _reqs(svc)[0]["updateSheetProperties"]
+    assert req["properties"]["sheetId"] == 101
+    assert req["properties"]["gridProperties"]["frozenRowCount"] == 1
+    assert req["fields"] == "gridProperties.frozenRowCount"
+
+
+def test_formatting_reuses_given_sheet_id_without_refetching():
+    """탭마다 sheetId를 다시 조회하면 시트 하나 꾸미는 데 요청이 몇 배로 는다."""
+    svc = FakeSheetsService(tabs={"이름매핑": []})
+
+    class NoGet(FakeSpreadsheets):
+        def get(self, spreadsheetId=None, fields=None):
+            raise AssertionError("sheet_id를 줬으면 다시 조회하면 안 된다")
+
+    svc.spreadsheets = lambda: NoGet(svc)
+    SheetsClient({}, service=svc).freeze_header(FILE_ID, "이름매핑", sheet_id=7)
+    assert _reqs(svc)[0]["updateSheetProperties"]["properties"]["sheetId"] == 7
 
 
 # ═══════════════════════════════════════════════════════════════

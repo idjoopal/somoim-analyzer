@@ -1456,8 +1456,10 @@ def _run_collection(raw_store, fix_store, start_ym: int, end_ym: int) -> None:
             bar.progress(min(max(pct, 0.0), 1.0), text=msg)
             st.write(msg)
         try:
+            field_report: dict = {}
             posts = collect_posts(start_ym, end_ym, progress=on_progress,
-                                  keep_unclassified=True)
+                                  keep_unclassified=True,
+                                  field_report=field_report)
             photos = collect_photos(start_ym, end_ym, progress=on_progress)
             on_progress("멤버 목록 수집…", 0.92)
             members, _ = collect_members()
@@ -1473,13 +1475,16 @@ def _run_collection(raw_store, fix_store, start_ym: int, end_ym: int) -> None:
             totals = raw_store.save(posts=posts, photos=photos, members=members,
                                     banned=banned, join_aliases=join_aliases,
                                     period=(start_ym, end_ym))
+            raw_store.save_field_report(field_report)
 
             on_progress("보정 후보 정리…", 0.99)
             annotate_attendees(posts, active_mns,
                                {**join_aliases,
                                 **_resolution_of(fix_store.load())})
-            added = fix_store.seed(correction_candidates(
-                posts, dict(collect_all_unresolved(posts)), fix_store.load()))
+            added = fix_store.seed(
+                correction_candidates(posts, dict(collect_all_unresolved(posts)),
+                                      fix_store.load()),
+                master_names=active_mns)
         except Exception as e:  # noqa: BLE001
             status.update(label="수집 실패", state="error")
             st.error("수집 중 오류가 발생했습니다. (API·네트워크·구글 권한 확인)")

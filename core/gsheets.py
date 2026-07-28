@@ -266,6 +266,83 @@ class SheetsClient:
             raise GSheetsError(_explain(e, "탭 생성")) from e
         return missing
 
+    def sheet_ids(self, file_id: str) -> dict[str, int]:
+        """탭 이름 → sheetId(숫자). 서식·메모·드롭다운은 전부 sheetId로 지정한다."""
+        try:
+            meta = self._service.spreadsheets().get(
+                spreadsheetId=file_id, fields="sheets.properties(title,sheetId)",
+            ).execute()
+        except Exception as e:  # noqa: BLE001
+            raise GSheetsError(_explain(e, "탭 정보 읽기")) from e
+        return {s["properties"]["title"]: s["properties"]["sheetId"]
+                for s in meta.get("sheets", [])}
+
+    # ── 서식 (사람이 쓰는 시트를 쓰기 좋게) ──────────────────────
+    def _batch(self, file_id: str, requests: list[dict], action: str) -> None:
+        if not requests:
+            return
+        try:
+            self._service.spreadsheets().batchUpdate(
+                spreadsheetId=file_id, body={"requests": requests},
+            ).execute()
+        except Exception as e:  # noqa: BLE001
+            raise GSheetsError(_explain(e, action)) from e
+
+    def set_header_notes(self, file_id: str, tab: str, notes: dict[int, str],
+                         sheet_id: Optional[int] = None) -> None:
+        """헤더 셀에 메모를 단다 (마우스를 올리면 뜸).
+
+        헤더 **텍스트**는 파싱 키라 못 바꾸므로, 설명은 메모로 붙인다.
+        """
+        sid = sheet_id if sheet_id is not None else self.sheet_ids(file_id).get(tab)
+        if sid is None:
+            return
+        self._batch(file_id, [{
+            "updateCells": {
+                "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+                          "startColumnIndex": col, "endColumnIndex": col + 1},
+                "rows": [{"values": [{"note": note}]}],
+                "fields": "note",
+            }
+        } for col, note in sorted(notes.items())], f"'{tab}' 메모 설정")
+
+    def set_validation(self, file_id: str, tab: str, col: int, values: list[str],
+                       strict: bool = False, sheet_id: Optional[int] = None) -> None:
+        """열에 드롭다운을 건다. 설명을 읽게 하는 것보다 잘못 넣을 수 없게 하는 게 낫다.
+
+        `strict=False`(경고만)가 기본이다 — 목록에 없는 새 닉네임을 입력조차
+        못 하게 막으면 곤란하다.
+        """
+        sid = sheet_id if sheet_id is not None else self.sheet_ids(file_id).get(tab)
+        if sid is None or not values:
+            return
+        self._batch(file_id, [{
+            "setDataValidation": {
+                "range": {"sheetId": sid, "startRowIndex": 1,
+                          "startColumnIndex": col, "endColumnIndex": col + 1},
+                "rule": {
+                    "condition": {"type": "ONE_OF_LIST",
+                                  "values": [{"userEnteredValue": str(v)} for v in values]},
+                    "showCustomUi": True,
+                    "strict": bool(strict),
+                },
+            }
+        }], f"'{tab}' 드롭다운 설정")
+
+    def freeze_header(self, file_id: str, tab: str,
+                      sheet_id: Optional[int] = None) -> None:
+        """헤더 행 고정 — 아래로 스크롤해도 무슨 열인지 보이게."""
+        sid = sheet_id if sheet_id is not None else self.sheet_ids(file_id).get(tab)
+        if sid is None:
+            return
+        self._batch(file_id, [{
+            "updateSheetProperties": {
+                "properties": {"sheetId": sid,
+                               "gridProperties": {"frozenRowCount": 1}},
+                "fields": "gridProperties.frozenRowCount",
+            }
+        }], f"'{tab}' 헤더 고정")
+
     # ── 읽기 ────────────────────────────────────────────────────
     def read(self, file_id: str, tab: str) -> list[list]:
         """탭 전체를 2차원 배열로. 탭이 없으면 빈 리스트.

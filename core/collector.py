@@ -329,6 +329,70 @@ def _fetch_paginated(
 
 
 # ═══════════════════════════════════════════════════════════════
+# API 응답 진단
+# ═══════════════════════════════════════════════════════════════
+#
+# 비공식 API라 응답 스펙 문서가 없다. 우리가 쓰는 키만 꺼내 쓰다 보니
+# **무엇을 안 쓰고 있는지**를 모른다 — 첨부 이미지 id가 오는지, 본문이
+# 전문인지 미리보기인지도 추측만 가능하다. 그래서 실제 응답을 요약해 남긴다.
+
+# collect_posts가 원본 항목에서 실제로 읽는 키
+CONSUMED_POST_KEYS = {"id", "at", "c", "cat", "wn", "wid", "lc", "rn", "ic", "w_t", "ot"}
+
+_SAMPLE_MAX = 120   # 예시 값이 길면 잘라 둔다(본문이 통째로 들어오면 시트가 터진다)
+
+
+def summarize_raw_fields(raw_items: list[dict],
+                         consumed: Optional[set[str]] = None) -> list[dict]:
+    """원본 응답에 실제로 담겨 온 필드를 요약.
+
+    반환 각 행: `{필드, 사용중, 건수, 예시, 비고}`
+    사용하지 않는 키가 이미지 id 같은 쓸 만한 정보를 담고 있는지 눈으로 확인하는 용도.
+    """
+    consumed = CONSUMED_POST_KEYS if consumed is None else consumed
+    counts: Counter = Counter()
+    sample: dict[str, str] = {}
+    for item in raw_items or []:
+        if not isinstance(item, dict):
+            continue
+        for k, v in item.items():
+            counts[k] += 1
+            if k not in sample and v not in (None, "", [], {}):
+                s = str(v)
+                sample[k] = s if len(s) <= _SAMPLE_MAX else s[:_SAMPLE_MAX] + "…"
+    return [
+        {"필드": k, "사용중": "예" if k in consumed else "",
+         "건수": n, "예시": sample.get(k, ""),
+         "비고": "" if k in consumed else "미사용 — 쓸 만한지 확인"}
+        for k, n in counts.most_common()
+    ]
+
+
+def summarize_body_lengths(raw_items: list[dict], key: str = "c") -> dict:
+    """본문 길이 분포 — API가 본문을 잘라 주는지 판별한다.
+
+    핵심은 `최빈길이_건수`다. 서로 다른 글 수백 개가 **정확히 같은 길이**라면
+    그건 우연이 아니라 잘린 것이다. 잘린 본문은 참석자 추출·출사일 추론의
+    입력이라 분석 정확도에 직접 영향을 준다.
+    """
+    lens = [len(str(it.get(key) or "")) for it in (raw_items or [])
+            if isinstance(it, dict)]
+    if not lens:
+        return {"건수": 0}
+    ordered = sorted(lens)
+    top_len, top_n = Counter(lens).most_common(1)[0]
+    return {
+        "건수": len(lens),
+        "최소": ordered[0],
+        "중앙": ordered[len(ordered) // 2],
+        "최대": ordered[-1],
+        "최빈길이": top_len,
+        "최빈길이_건수": top_n,
+        "잘림_의심": top_n >= 3 and top_len == ordered[-1],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
 # 게시글 수집
 # ═══════════════════════════════════════════════════════════════
 
@@ -337,6 +401,7 @@ def collect_posts(
     end_ym: int,
     progress: ProgressFn = None,
     keep_unclassified: bool = False,
+    field_report: Optional[dict] = None,
 ) -> list[dict]:
     """
     게시글 수집 + 기간 필터링.
@@ -351,6 +416,8 @@ def collect_posts(
         keep_unclassified: True면 출사일 추론 실패한 cat=A 공지를 버리지 않고
             outing_date=None으로 포함(기간 게이트는 작성일 기준)하고 검토 대상으로 표시.
             기본 False는 기존 동작(추론 실패 공지 제외)을 그대로 유지.
+        field_report: dict를 주면 원본 응답 요약(`fields`·`body`)을 채워 넣는다.
+            추가 API 호출 없이 이미 받은 응답을 그대로 들여다본다.
 
     Returns:
         list of dict with keys:
@@ -364,6 +431,10 @@ def collect_posts(
                            ym_add(start_ym, -FETCH_MARGIN_MONTHS),
                            progress, "게시글")
     _emit(progress, f"게시글 원본 {len(raw)}개 수집 완료", 0.4)
+
+    if field_report is not None:
+        field_report["fields"] = summarize_raw_fields(raw)
+        field_report["body"] = summarize_body_lengths(raw)
 
     posts: list[dict] = []
     for p in raw:

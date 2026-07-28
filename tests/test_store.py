@@ -8,13 +8,19 @@ from datetime import date, datetime
 
 import pytest
 
-from core.collector import LEFT_MEMBER, NOT_A_NAME
+from core.collector import (
+    ALL_CATS, LEFT_MEMBER, NOT_A_NAME,
+    summarize_body_lengths, summarize_raw_fields,
+)
 from core.store import (
     ATTENDEE_FIX_COLS,
     NAME_MAP_COLS,
     POST_FIX_COLS,
     POST_KEYS,
+    FIELD_COLS,
     TAB_ATTENDEE_FIX,
+    TAB_FIELDS,
+    TAB_GUIDE,
     TAB_HISTORY,
     TAB_NAME_MAP,
     TAB_POST_FIX,
@@ -44,6 +50,19 @@ class FakeClient:
     def __init__(self, tabs=None):
         self.tabs = {k: [list(r) for r in v] for k, v in (tabs or {}).items()}
         self.cleared, self.appended = [], []
+        self.notes, self.validations, self.frozen = {}, [], []
+
+    def sheet_ids(self, file_id):
+        return {t: 100 + i for i, t in enumerate(self.tabs)}
+
+    def set_header_notes(self, file_id, tab, notes, sheet_id=None):
+        self.notes[tab] = dict(notes)
+
+    def set_validation(self, file_id, tab, col, values, strict=False, sheet_id=None):
+        self.validations.append((tab, col, list(values)))
+
+    def freeze_header(self, file_id, tab, sheet_id=None):
+        self.frozen.append(tab)
 
     def ensure_tabs(self, file_id, tabs):
         made = [t for t in tabs if t not in self.tabs]
@@ -412,6 +431,82 @@ def test_correction_store_ensure_writes_headers_once():
     assert len(c.tabs[TAB_NAME_MAP]) == 2            # 헤더로 덮어쓰지 않음
 
 
+# ═══════════════════════════════════════════════════════════════
+# 보정 시트 가이드 — 설명 없는 보정 시트는 채울 수가 없다
+# ═══════════════════════════════════════════════════════════════
+
+def test_ensure_creates_usage_tab_with_the_three_special_values():
+    c = FakeClient()
+    CorrectionStore(c, "F").ensure()
+
+    text = "\n".join(r[0] for r in c.tabs[TAB_GUIDE])
+    assert LEFT_MEMBER in text and NOT_A_NAME in text
+    assert "YYYY-MM-DD" in text                  # 출사일 형식
+    assert "빈칸" in text                         # 빈칸 = 아직 보정 안 함
+
+
+def test_ensure_notes_every_column_of_every_tab():
+    """설명 없는 칸이 하나라도 있으면 거기서 막힌다."""
+    c = FakeClient()
+    CorrectionStore(c, "F").ensure()
+
+    for tab, cols in ((TAB_NAME_MAP, NAME_MAP_COLS),
+                      (TAB_POST_FIX, POST_FIX_COLS),
+                      (TAB_ATTENDEE_FIX, ATTENDEE_FIX_COLS)):
+        assert sorted(c.notes[tab]) == list(range(len(cols))), tab
+        assert all(c.notes[tab].values()), tab
+        assert tab in c.frozen
+
+
+def test_ensure_without_members_still_offers_category_and_bool_dropdowns():
+    """멤버 명단은 수집 전엔 없지만 카테고리·TRUE/FALSE는 항상 고정이다."""
+    c = FakeClient()
+    CorrectionStore(c, "F").ensure()
+
+    by_col = {(t, col): v for t, col, v in c.validations}
+    assert by_col[(TAB_POST_FIX, 2)] == list(ALL_CATS)
+    assert by_col[(TAB_POST_FIX, 4)] == ["TRUE", "FALSE"]
+    assert (TAB_NAME_MAP, 1) not in by_col       # 목록이 비면 걸지 않는다
+
+
+def test_name_dropdown_lists_members_plus_special_values():
+    c = FakeClient()
+    CorrectionStore(c, "F").ensure(master_names={"정원석", "나무"})
+
+    values = dict(((t, col), v) for t, col, v in c.validations)[(TAB_NAME_MAP, 1)]
+    assert values == ["나무", "정원석", LEFT_MEMBER, NOT_A_NAME]
+
+
+def test_seed_refreshes_name_dropdown_with_current_members():
+    """멤버가 새로 들어오면 목록도 따라와야 한다 — 목록은 seed마다 갱신된다."""
+    c = FakeClient()
+    store = CorrectionStore(c, "F")
+    store.ensure(master_names={"정원석"})
+    c.validations.clear()
+
+    store.seed({TAB_NAME_MAP: [["가나다", "", 1, ""]]}, master_names={"정원석", "신입"})
+    assert dict(((t, col), v) for t, col, v in c.validations)[(TAB_NAME_MAP, 1)] == [
+        "신입", "정원석", LEFT_MEMBER, NOT_A_NAME]
+
+
+def test_guide_does_not_touch_user_filled_rows():
+    """안내를 갱신한다고 사람이 채운 값이 사라지면 안 된다."""
+    c = FakeClient({TAB_NAME_MAP: [NAME_MAP_COLS, ["가나다", "정원석", 1, "확인함"]]})
+    CorrectionStore(c, "F").ensure(master_names={"정원석"})
+    assert c.tabs[TAB_NAME_MAP][1] == ["가나다", "정원석", 1, "확인함"]
+
+
+def test_formatting_failure_never_blocks_corrections():
+    """서식은 부가 기능이다 — 실패해도 보정 시트 자체는 쓸 수 있어야 한다."""
+    class NoFormatting(FakeClient):
+        def sheet_ids(self, file_id):
+            raise RuntimeError("이 시트에는 서식 권한이 없다")
+
+    c = NoFormatting()
+    CorrectionStore(c, "F").ensure()
+    assert c.tabs[TAB_NAME_MAP] == [NAME_MAP_COLS]
+
+
 def test_pending_count_counts_unfilled_rows():
     c = FakeClient({
         TAB_NAME_MAP: [NAME_MAP_COLS, ["a", "정원석", 1, ""], ["b", "", 1, ""]],
@@ -419,3 +514,90 @@ def test_pending_count_counts_unfilled_rows():
         TAB_ATTENDEE_FIX: [ATTENDEE_FIX_COLS, ["r1", "제목", "정원석", ""]],
     })
     assert CorrectionStore(c, "F").pending_count() == 2   # b, p1
+
+
+# ═══════════════════════════════════════════════════════════════
+# API 응답 진단 — 본문 잘림을 잡아내는 것이 목적
+# ═══════════════════════════════════════════════════════════════
+
+def test_body_lengths_flags_truncation():
+    """서로 다른 글이 정확히 같은 길이에서 끝나면 우연이 아니라 잘린 것이다."""
+    raw = [{"c": "가" * 500} for _ in range(50)]
+    rep = summarize_body_lengths(raw)
+    assert rep["잘림_의심"] is True
+    assert rep["최빈길이"] == 500 and rep["최빈길이_건수"] == 50
+
+
+def test_body_lengths_does_not_flag_natural_variation():
+    raw = [{"c": "가" * n} for n in range(10, 400, 7)]
+    assert summarize_body_lengths(raw)["잘림_의심"] is False
+
+
+def test_body_lengths_ignores_short_duplicates_at_the_top():
+    """긴 글이 따로 있으면 짧은 글이 겹치는 건 잘림이 아니다."""
+    raw = [{"c": "짧음"} for _ in range(20)] + [{"c": "가" * 5000}]
+    assert summarize_body_lengths(raw)["잘림_의심"] is False
+
+
+def test_body_lengths_empty_input():
+    assert summarize_body_lengths([])["건수"] == 0
+
+
+def test_summarize_raw_fields_marks_unused_keys():
+    """쓰지 않는 키가 이미지 id 같은 걸 담고 있는지 눈에 띄어야 한다."""
+    raw = [{"id": "p1", "c": "본문", "imgs": "111,222", "unknown": 7}]
+    by_field = {r["필드"]: r for r in summarize_raw_fields(raw)}
+    assert by_field["c"]["사용중"] == "예"
+    assert by_field["imgs"]["사용중"] == ""
+    assert "미사용" in by_field["imgs"]["비고"]
+    assert by_field["imgs"]["예시"] == "111,222"
+
+
+def test_summarize_raw_fields_truncates_long_samples():
+    """예시에 본문이 통째로 들어가면 시트가 감당하지 못한다."""
+    sample = [r for r in summarize_raw_fields([{"c": "가" * 5000}])
+              if r["필드"] == "c"][0]["예시"]
+    assert len(sample) < 200 and sample.endswith("…")
+
+
+def test_summarize_raw_fields_counts_occurrences():
+    raw = [{"id": "1", "imgs": "a"}, {"id": "2"}, {"id": "3", "imgs": "b"}]
+    by_field = {r["필드"]: r for r in summarize_raw_fields(raw)}
+    assert by_field["id"]["건수"] == 3
+    assert by_field["imgs"]["건수"] == 2
+
+
+def test_summarize_raw_fields_skips_empty_values_for_sample():
+    """빈 값이 먼저 와도 실제 값이 예시로 잡혀야 쓸모가 있다."""
+    raw = [{"imgs": ""}, {"imgs": None}, {"imgs": "111"}]
+    got = [r for r in summarize_raw_fields(raw) if r["필드"] == "imgs"][0]
+    assert got["예시"] == "111"
+
+
+def test_field_report_tab_leads_with_body_length():
+    c = FakeClient()
+    store = RawStore(c, "F")
+    store.ensure()
+    store.save_field_report({
+        "body": {"건수": 50, "최소": 500, "중앙": 500, "최대": 500,
+                 "최빈길이": 500, "최빈길이_건수": 50, "잘림_의심": True},
+        "fields": [{"필드": "imgs", "사용중": "", "건수": 12,
+                    "예시": "111", "비고": "미사용 — 쓸 만한지 확인"}],
+    })
+    rows = c.tabs[TAB_FIELDS]
+    assert rows[0] == FIELD_COLS
+    assert rows[1][0] == "(본문 길이)"          # 가장 먼저 눈에 들어와야 한다
+    assert "잘림 의심" in rows[1][4]
+    assert rows[2][0] == "imgs"
+
+
+def test_field_report_replaces_previous_run():
+    """진단은 최신 수집 기준이어야 한다 — 옛 결과가 섞이면 오판한다."""
+    c = FakeClient()
+    store = RawStore(c, "F")
+    store.save_field_report({"fields": [{"필드": "옛것", "사용중": "", "건수": 1,
+                                         "예시": "", "비고": ""}]})
+    store.save_field_report({"fields": [{"필드": "새것", "사용중": "", "건수": 1,
+                                         "예시": "", "비고": ""}]})
+    fields = [r[0] for r in c.tabs[TAB_FIELDS][1:]]
+    assert fields == ["새것"]
