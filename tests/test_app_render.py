@@ -186,3 +186,12 @@ def test_stage1_editor_key_changes_so_checkboxes_refresh():
     before = at.session_state["_res_editor_nonce"]
     [b for b in at.button if "빈도 1회 전체" in b.label][0].click().run()
     assert at.session_state["_res_editor_nonce"] > before
+
+
+def test_gsheets_ui_hidden_without_secrets():
+    """[gsheets] 미설정이면 소스 라디오에 '구글 시트'가 뜨지 않고 앱은 그대로 동작한다."""
+    at = AppTest.from_file(APP, default_timeout=TIMEOUT)
+    at.run()
+    assert not at.exception, [str(e) for e in at.exception]
+    options = list(at.radio[0].options)
+    assert options == ["API 수집", "엑셀 업로드"], options

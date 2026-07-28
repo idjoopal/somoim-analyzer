@@ -710,7 +710,9 @@ def _set_data(start_ym: int, end_ym: int, posts: list[dict], photos: list[dict],
         members or [], set(banned or set()), dict(resolution or {}),
         dict(join_aliases or {}),
     )
-    for k in ("master", "result"):
+    # 이전 분석의 잔재를 지운다 — 특히 _gsheet_url을 남기면 새 기간을 분석한 뒤에도
+    # 옛 시트 링크가 "내보내기 완료"처럼 보인다.
+    for k in ("master", "result", "_gsheet_url", "_noise_pending"):
         st.session_state.pop(k, None)
 
 
@@ -1614,12 +1616,57 @@ def _tab_data(posts: list[dict], photos: list[dict]) -> None:
 # 메인 UI
 # ═══════════════════════════════════════════════════════════════
 
+def _gsheets_conf() -> dict | None:
+    """secrets의 [gsheets] 설정. 없으면 None (관련 UI를 통째로 숨긴다)."""
+    try:
+        conf = st.secrets.get("gsheets")
+    except Exception:  # noqa: BLE001 — secrets 파일 자체가 없으면 예외가 난다
+        return None
+    if not conf or not conf.get("credentials"):
+        return None
+    return dict(conf)
+
+
+def _gsheets_configured() -> bool:
+    return _gsheets_conf() is not None
+
+
+def _gsheets_store():
+    """설정된 자격증명으로 Drive 스토어를 만든다. 실패 시 GSheetsError."""
+    conf = _gsheets_conf() or {}
+    from core.gsheets import GoogleSheetsStore, parse_credentials
+    return GoogleSheetsStore(
+        parse_credentials(conf.get("credentials")),
+        folder_id=conf.get("folder_id"),
+    )
+
+
+def _load_bundle_into_session(bundle: dict, what: str) -> None:
+    """복원한 번들을 세션에 싣고 성공 메시지 후 rerun (엑셀·구글 시트 공용)."""
+    _set_data(bundle["start_ym"], bundle["end_ym"],
+              bundle["posts"], bundle["photos"],
+              members=bundle.get("members") or [],
+              banned=bundle.get("banned") or set(),
+              resolution=bundle.get("resolution") or {},
+              join_aliases=bundle.get("join_aliases") or {})
+    st.success(
+        f"{what} · 게시글 {len(bundle['posts'])} / 사진 {len(bundle['photos'])} "
+        f"· 멤버 {len(bundle.get('members') or [])} "
+        f"· 매핑 {len(bundle.get('resolution') or {})} "
+        f"· 가입인사 자동 {len(bundle.get('join_aliases') or {})}"
+    )
+    st.rerun()
+
+
 def render_sidebar() -> None:
-    """사이드바: 데이터 소스(API/엑셀 업로드) + 매핑 CSV + 엑셀 다운로드 + 처음으로."""
+    """사이드바: 데이터 소스(API/엑셀/구글 시트) + 매핑 CSV + 다운로드 + 처음으로."""
     with st.sidebar:
         st.subheader("📥 데이터 소스")
+        sources = ["API 수집", "엑셀 업로드"]
+        if _gsheets_configured():
+            sources.append("구글 시트")
         source = st.radio(
-            "입력 방법", ["API 수집", "엑셀 업로드"],
+            "입력 방법", sources,
             horizontal=True, key="data_source", label_visibility="collapsed",
         )
 
@@ -1682,6 +1729,20 @@ def render_sidebar() -> None:
                            members=members, banned=banned, resolution=None,
                            join_aliases=join_aliases)
                 st.rerun()
+        elif source == "구글 시트":
+            st.caption("이 앱에서 **구글 시트로 내보낸** 분석을 주소로 불러옵니다. "
+                       "엑셀과 같은 데이터라 API 호출은 없습니다.")
+            url = st.text_input("구글 시트 주소", key="gsheet_url",
+                                placeholder="https://docs.google.com/spreadsheets/d/.../edit")
+            if url and st.button("📥 불러오기", type="primary", width="stretch"):
+                with st.spinner("구글 시트에서 내려받는 중…"):
+                    try:
+                        xlsx = _gsheets_store().download(url)
+                        bundle = load_excel_bundle(xlsx)
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"구글 시트 불러오기 실패: {e}")
+                    else:
+                        _load_bundle_into_session(bundle, "구글 시트 로드")
         else:
             st.caption("이전에 받은 **분석 엑셀**을 올리면 API 호출 없이 즉시 분석합니다.")
             f = st.file_uploader("엑셀 파일 (.xlsx)", type=["xlsx"], key="excel_upload")
@@ -1691,19 +1752,7 @@ def render_sidebar() -> None:
                 except Exception as e:  # noqa: BLE001
                     st.error(f"엑셀 파일 오류: {e}")
                 else:
-                    _set_data(bundle["start_ym"], bundle["end_ym"],
-                              bundle["posts"], bundle["photos"],
-                              members=bundle.get("members") or [],
-                              banned=bundle.get("banned") or set(),
-                              resolution=bundle.get("resolution") or {},
-                              join_aliases=bundle.get("join_aliases") or {})
-                    st.success(
-                        f"엑셀 로드 · 게시글 {len(bundle['posts'])} / 사진 {len(bundle['photos'])} "
-                        f"· 멤버 {len(bundle.get('members') or [])} "
-                        f"· 매핑 {len(bundle.get('resolution') or {})} "
-                        f"· 가입인사 자동 {len(bundle.get('join_aliases') or {})}"
-                    )
-                    st.rerun()
+                    _load_bundle_into_session(bundle, "엑셀 로드")
 
         # ── 이름 매핑 CSV (어느 단계에서나 노출) ──
         if "data" in st.session_state:
@@ -1754,13 +1803,37 @@ def render_sidebar() -> None:
             )
             st.caption("이 엑셀을 다음에 그대로 업로드하면 API 호출 없이 같은 분석을 다시 볼 수 있어요.")
 
+            if _gsheets_configured():
+                if st.button("📤 구글 시트로 내보내기", width="stretch"):
+                    with st.spinner("구글 시트로 올리는 중…"):
+                        try:
+                            from core.gsheets import default_title
+                            store = _gsheets_store()
+                            file_id, url = store.upload(xlsx_r, default_title(tag))
+                            if not (_gsheets_conf() or {}).get("folder_id"):
+                                # 서비스 계정 소유 파일은 폴더 지정이 없으면
+                                # 링크 공유를 켜야 사용자가 열 수 있다.
+                                store.share_anyone_reader(file_id)
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"구글 시트 내보내기 실패: {e}")
+                        else:
+                            st.session_state["_gsheet_url"] = url
+                if st.session_state.get("_gsheet_url"):
+                    st.success("구글 시트로 내보냈습니다.")
+                    st.link_button("🔗 시트 열기", st.session_state["_gsheet_url"],
+                                   width="stretch")
+                    st.code(st.session_state["_gsheet_url"], language=None)
+                    st.caption("이 주소를 **데이터 소스 → 구글 시트**에 붙여넣으면 "
+                               "다시 불러올 수 있습니다.")
+
         if "data" in st.session_state:
             st.divider()
             if st.button("🔄 처음으로", width="stretch"):
                 for k in ("data", "master", "result", "_collect_cache",
                           "api_start_y", "api_start_m", "api_end_y", "api_end_m",
                           "excel_upload", "resolution_csv_upload",
-                          "_noise_pending", "_res_editor_nonce", "noise_multiselect"):
+                          "_noise_pending", "_res_editor_nonce", "noise_multiselect",
+                          "gsheet_url", "_gsheet_url"):
                     st.session_state.pop(k, None)
                 st.rerun()
 

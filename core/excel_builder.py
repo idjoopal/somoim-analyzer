@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from io import BytesIO
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from collections import defaultdict
 from typing import Optional
 
@@ -521,6 +521,65 @@ def _read_meta(ws) -> dict:
     return out
 
 
+# 셀 값이 어떤 타입으로 돌아오든 파이프라인이 기대하는 타입으로 되돌린다.
+#
+# openpyxl로 우리가 쓴 파일을 그대로 읽으면 datetime이 나오지만, 구글 시트를
+# 거쳐 오면(xlsx → Sheets → xlsx) 같은 셀이 문자열이나 엑셀 serial로 바뀔 수
+# 있다. 그대로 흘리면 다운스트림의 `p["posted_at"].month`가 런타임에 터진다.
+_EXCEL_EPOCH = datetime(1899, 12, 30)   # 엑셀 serial 1 = 1900-01-01
+_DT_KEYS = {"posted_at"}
+_ISO_DATE_KEYS = {"outing_date"}
+
+
+def _coerce_dt(v) -> Optional[datetime]:
+    """datetime | date | ISO 문자열 | 엑셀 serial → datetime (실패 시 None)."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        try:
+            return _EXCEL_EPOCH + timedelta(days=float(v))
+        except (OverflowError, ValueError):
+            return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00").replace("/", "-"))
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _coerce_iso_date(v) -> Optional[str]:
+    """date | datetime | 문자열 | 엑셀 serial → `"YYYY-MM-DD"` (실패 시 None).
+
+    출사일은 ISO 문자열로 저장되는데, 시트가 날짜로 자동 인식해 되돌려주면
+    datetime이 되어 `date.fromisoformat()`이 깨진다.
+    """
+    dt = _coerce_dt(v)
+    return dt.date().isoformat() if dt else None
+
+
+def _normalize_record(rec: dict) -> dict:
+    """복원한 한 행의 날짜 필드를 파이프라인 기대 타입으로 맞춘다."""
+    for k in _DT_KEYS:
+        if k in rec:
+            rec[k] = _coerce_dt(rec[k])
+    for k in _ISO_DATE_KEYS:
+        if k in rec:
+            rec[k] = _coerce_iso_date(rec[k])
+    return rec
+
+
 def _read_raw(ws, keys: list[str], bool_keys: set[str]) -> list[dict]:
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
@@ -540,7 +599,7 @@ def _read_raw(ws, keys: list[str], bool_keys: set[str]) -> list[dict]:
             rec[k] = v
         for k in keys:
             rec.setdefault(k, "" if k == "review_reason" else None)
-        out.append(rec)
+        out.append(_normalize_record(rec))
     return out
 
 
