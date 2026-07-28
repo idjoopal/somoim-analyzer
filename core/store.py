@@ -38,7 +38,9 @@ TAB_MEMBERS = "멤버"
 TAB_BANNED = "탈퇴멤버"
 TAB_JOIN_ALIASES = "가입인사매핑"
 TAB_HISTORY = "_수집이력"
-RAW_TABS = [TAB_POSTS, TAB_PHOTOS, TAB_MEMBERS, TAB_BANNED, TAB_JOIN_ALIASES, TAB_HISTORY]
+TAB_FIELDS = "_원본필드"
+RAW_TABS = [TAB_POSTS, TAB_PHOTOS, TAB_MEMBERS, TAB_BANNED, TAB_JOIN_ALIASES,
+            TAB_HISTORY, TAB_FIELDS]
 
 TAB_NAME_MAP = "이름매핑"
 TAB_POST_FIX = "공지보정"
@@ -57,6 +59,7 @@ PHOTO_KEYS = [
 ]
 MEMBER_KEYS = ["mid", "mn", "is_admin", "joined_at", "last_visit", "os", "push"]
 HISTORY_KEYS = ["수집시각", "시작월", "종료월", "게시글", "사진", "멤버"]
+FIELD_COLS = ["필드", "사용중", "건수", "예시", "비고"]
 
 NAME_MAP_COLS = ["이름토큰", "처리", "빈도", "비고"]
 POST_FIX_COLS = ["공지 id", "제목", "카테고리", "출사일", "취소", "제외", "비고"]
@@ -431,6 +434,28 @@ class RawStore:
 
         return {"게시글": len(merged_posts), "사진": len(merged_photos),
                 "멤버": len(merged_members)}
+
+    def save_field_report(self, report: dict) -> None:
+        """API 응답 요약을 `_원본필드` 탭에 덮어쓴다 (진단용, 매 수집 최신으로 교체).
+
+        본문 길이 분포를 맨 위에 둔다 — 서로 다른 글 수백 개가 정확히 같은 길이면
+        API가 본문을 잘라 주는 것이고, 그러면 참석자 추출·출사일 추론이 절반만
+        보고 판단한다는 뜻이라 가장 먼저 알아야 한다.
+        """
+        rows = [FIELD_COLS]
+        body = report.get("body") or {}
+        if body.get("건수"):
+            note = ("⚠️ 잘림 의심 — 서로 다른 글이 같은 길이에서 끊깁니다"
+                    if body.get("잘림_의심") else "")
+            rows.append([
+                "(본문 길이)", "", body["건수"],
+                f"최소 {body['최소']} / 중앙 {body['중앙']} / 최대 {body['최대']} · "
+                f"가장 흔한 길이 {body['최빈길이']}자가 {body['최빈길이_건수']}건",
+                note,
+            ])
+        for r in report.get("fields") or []:
+            rows.append([r.get(c, "") for c in FIELD_COLS])
+        self.c.write(self.file_id, TAB_FIELDS, rows)
 
 
 class CorrectionStore:

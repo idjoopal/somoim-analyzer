@@ -8,13 +8,18 @@ from datetime import date, datetime
 
 import pytest
 
-from core.collector import LEFT_MEMBER, NOT_A_NAME
+from core.collector import (
+    LEFT_MEMBER, NOT_A_NAME,
+    summarize_body_lengths, summarize_raw_fields,
+)
 from core.store import (
     ATTENDEE_FIX_COLS,
     NAME_MAP_COLS,
     POST_FIX_COLS,
     POST_KEYS,
+    FIELD_COLS,
     TAB_ATTENDEE_FIX,
+    TAB_FIELDS,
     TAB_HISTORY,
     TAB_NAME_MAP,
     TAB_POST_FIX,
@@ -419,3 +424,90 @@ def test_pending_count_counts_unfilled_rows():
         TAB_ATTENDEE_FIX: [ATTENDEE_FIX_COLS, ["r1", "제목", "정원석", ""]],
     })
     assert CorrectionStore(c, "F").pending_count() == 2   # b, p1
+
+
+# ═══════════════════════════════════════════════════════════════
+# API 응답 진단 — 본문 잘림을 잡아내는 것이 목적
+# ═══════════════════════════════════════════════════════════════
+
+def test_body_lengths_flags_truncation():
+    """서로 다른 글이 정확히 같은 길이에서 끝나면 우연이 아니라 잘린 것이다."""
+    raw = [{"c": "가" * 500} for _ in range(50)]
+    rep = summarize_body_lengths(raw)
+    assert rep["잘림_의심"] is True
+    assert rep["최빈길이"] == 500 and rep["최빈길이_건수"] == 50
+
+
+def test_body_lengths_does_not_flag_natural_variation():
+    raw = [{"c": "가" * n} for n in range(10, 400, 7)]
+    assert summarize_body_lengths(raw)["잘림_의심"] is False
+
+
+def test_body_lengths_ignores_short_duplicates_at_the_top():
+    """긴 글이 따로 있으면 짧은 글이 겹치는 건 잘림이 아니다."""
+    raw = [{"c": "짧음"} for _ in range(20)] + [{"c": "가" * 5000}]
+    assert summarize_body_lengths(raw)["잘림_의심"] is False
+
+
+def test_body_lengths_empty_input():
+    assert summarize_body_lengths([])["건수"] == 0
+
+
+def test_summarize_raw_fields_marks_unused_keys():
+    """쓰지 않는 키가 이미지 id 같은 걸 담고 있는지 눈에 띄어야 한다."""
+    raw = [{"id": "p1", "c": "본문", "imgs": "111,222", "unknown": 7}]
+    by_field = {r["필드"]: r for r in summarize_raw_fields(raw)}
+    assert by_field["c"]["사용중"] == "예"
+    assert by_field["imgs"]["사용중"] == ""
+    assert "미사용" in by_field["imgs"]["비고"]
+    assert by_field["imgs"]["예시"] == "111,222"
+
+
+def test_summarize_raw_fields_truncates_long_samples():
+    """예시에 본문이 통째로 들어가면 시트가 감당하지 못한다."""
+    sample = [r for r in summarize_raw_fields([{"c": "가" * 5000}])
+              if r["필드"] == "c"][0]["예시"]
+    assert len(sample) < 200 and sample.endswith("…")
+
+
+def test_summarize_raw_fields_counts_occurrences():
+    raw = [{"id": "1", "imgs": "a"}, {"id": "2"}, {"id": "3", "imgs": "b"}]
+    by_field = {r["필드"]: r for r in summarize_raw_fields(raw)}
+    assert by_field["id"]["건수"] == 3
+    assert by_field["imgs"]["건수"] == 2
+
+
+def test_summarize_raw_fields_skips_empty_values_for_sample():
+    """빈 값이 먼저 와도 실제 값이 예시로 잡혀야 쓸모가 있다."""
+    raw = [{"imgs": ""}, {"imgs": None}, {"imgs": "111"}]
+    got = [r for r in summarize_raw_fields(raw) if r["필드"] == "imgs"][0]
+    assert got["예시"] == "111"
+
+
+def test_field_report_tab_leads_with_body_length():
+    c = FakeClient()
+    store = RawStore(c, "F")
+    store.ensure()
+    store.save_field_report({
+        "body": {"건수": 50, "최소": 500, "중앙": 500, "최대": 500,
+                 "최빈길이": 500, "최빈길이_건수": 50, "잘림_의심": True},
+        "fields": [{"필드": "imgs", "사용중": "", "건수": 12,
+                    "예시": "111", "비고": "미사용 — 쓸 만한지 확인"}],
+    })
+    rows = c.tabs[TAB_FIELDS]
+    assert rows[0] == FIELD_COLS
+    assert rows[1][0] == "(본문 길이)"          # 가장 먼저 눈에 들어와야 한다
+    assert "잘림 의심" in rows[1][4]
+    assert rows[2][0] == "imgs"
+
+
+def test_field_report_replaces_previous_run():
+    """진단은 최신 수집 기준이어야 한다 — 옛 결과가 섞이면 오판한다."""
+    c = FakeClient()
+    store = RawStore(c, "F")
+    store.save_field_report({"fields": [{"필드": "옛것", "사용중": "", "건수": 1,
+                                         "예시": "", "비고": ""}]})
+    store.save_field_report({"fields": [{"필드": "새것", "사용중": "", "건수": 1,
+                                         "예시": "", "비고": ""}]})
+    fields = [r[0] for r in c.tabs[TAB_FIELDS][1:]]
+    assert fields == ["새것"]
