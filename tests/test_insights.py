@@ -6,6 +6,12 @@
 
 from datetime import date, datetime
 
+from core.store import (
+    TAB_ATTENDEE_FIX,
+    TAB_MEMBER_NAMES,
+    TAB_NAME_MAP,
+    TAB_POST_FIX,
+)
 from streamlit_app import (
     avg_attendance_trend,
     co_attendance,
@@ -50,43 +56,36 @@ def _by_item(rows):
     return {r["항목"]: r["건수"] for r in rows}
 
 
-def test_clean_data_reports_nothing_pending():
-    rows = confidence_report(
-        [notice("n1", attendees=["나무"]), review("r1", attendees=["나무"])],
-        [member("m1", "나무")], {"나무": "김나무"})
-    assert all(r["건수"] == 0 for r in rows)
+def test_counts_come_from_the_sheet_not_a_second_guess():
+    """화면과 시트가 어긋나면 안 된다.
+
+    예전에는 여기서 판정을 다시 써서 시딩 조건과 조금씩 달랐다. 그래서
+    "참석자 보정 7건 필요"라고 떠 있는데 **시트에는 헤더밖에 없어** 무엇을
+    해야 할지 알 수 없는 상태가 됐다. 이제 미기입 행 수를 그대로 쓴다.
+    """
+    got = _by_item(confidence_report([], {
+        TAB_MEMBER_NAMES: 3, TAB_ATTENDEE_FIX: 7,
+        TAB_NAME_MAP: 2, TAB_POST_FIX: 1,
+    }))
+    assert got["실명 미기입 멤버"] == 3
+    assert got["참석자 못 뽑은 후기"] == 7
+    assert got["해소 안 된 이름"] == 2
+    assert got["검토 대상 공지"] == 1
 
 
-def test_counts_each_kind_of_gap():
-    posts = [
-        notice("n1", outing_date=None),                  # 출사일 미상
-        notice("n2", needs_review=True),                 # 검토 대상
-        review("r1", attendees=[]),                      # 참석자 못 뽑음
-        review("r2", attendees=["나무"], matched=None),   # 고아 후기
-    ]
-    got = _by_item(confidence_report(posts, [member("m1", "나무")], {}))
-    assert got["출사일 미상 공지"] == 1
-    assert got["분류 검토 대상 공지"] == 1
-    assert got["참석자 못 뽑은 후기"] == 1
-    assert got["공지와 안 이어진 후기"] == 1
-    assert got["실명 미기입 멤버"] == 1
+def test_empty_sheet_means_nothing_pending():
+    assert all(r["건수"] == 0 for r in confidence_report([], {}))
 
 
-def test_review_flagged_for_correction_counts_even_with_names():
-    """참석자가 있어도 검토 표시가 있으면 아직 확정된 게 아니다."""
-    posts = [review("r1", attendees=["나무"], attendees_needs_review=True)]
-    assert _by_item(confidence_report(posts, [], {}))["참석자 못 뽑은 후기"] == 1
-
-
-def test_filled_real_names_drop_out_of_the_count():
-    """`real_names`는 앱에서 닉네임 키로 온다 (`real_by_nickname`)."""
-    members = [member("m1", "나무"), member("m2", "바다")]
-    assert _by_item(confidence_report([], members, {"나무": "김나무"}))["실명 미기입 멤버"] == 1
+def test_orphan_reviews_are_counted_from_posts():
+    """시트에 자리가 없는 유일한 항목 — 사람이 채울 게 아니라 사실 통보다."""
+    posts = [review("r1", matched=None), review("r2", matched="n1")]
+    assert _by_item(confidence_report(posts, {}))["공지와 안 이어진 후기"] == 1
 
 
 def test_every_row_says_where_to_fix_it():
     """숫자만 보여 주고 어디를 채우라는 말이 없으면 쓸모가 없다."""
-    for r in confidence_report([], [], {}):
+    for r in confidence_report([], {}):
         assert r["어디서"] and r["설명"]
 
 

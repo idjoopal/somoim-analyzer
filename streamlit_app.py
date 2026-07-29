@@ -494,37 +494,35 @@ def activity_ranking(posts: list[dict], photos: list[dict]) -> list[dict]:
 # 그래서 무엇이 얼마나 비어 있는지를 결과 화면 맨 앞에 세운다.
 # ═══════════════════════════════════════════════════════════════
 
-def confidence_report(posts: list[dict], members: list[dict] | None = None,
-                      real_names: dict | None = None) -> list[dict]:
+def confidence_report(posts: list[dict],
+                      pending: dict[str, int] | None = None) -> list[dict]:
     """보정이 필요한 항목을 종류별로. 각 행은 `{항목, 건수, 어디서, 설명}`.
 
-    사이드바의 미기입 수와 **같은 판정**을 쓴다 — 두 곳이 다른 숫자를 말하면
-    사용자는 어느 쪽을 믿어야 할지 알 수 없다.
+    **건수는 보정 시트의 미기입 행 수를 그대로 쓴다.** 여기서 판정을 다시
+    쓰면 시딩 조건과 조금씩 어긋나, 화면은 "7건 필요"라는데 시트에는 아무것도
+    없는 상태가 된다(실제로 그랬다). 사이드바와도 같은 숫자를 보게 된다.
+
+    고아 후기만 시트에 자리가 없어 여기서 센다 — 사람이 채울 것이 아니라
+    매칭이 안 됐다는 사실 자체를 알리는 항목이다.
     """
-    notices = [p for p in posts if p.get("cat") == "A"]
-    reviews = [p for p in posts if p.get("cat") == "E"]
-    members = members or []
-
-    no_date = [p for p in notices if not p.get("outing_date")]
-    flagged = [p for p in notices if p.get("needs_review")]
-    no_att = [p for p in reviews if p.get("attendees_needs_review")
-              or not p.get("attendees")]
-    orphans = orphan_reviews(posts)
-    # `real_names`는 `real_by_nickname` 결과 — **닉네임 키**다. 표시용으로 실명이
-    # 붙은 members가 올 수 있으므로 원래 닉네임으로 대조한다.
-    named = set(real_names or {})
-    no_real = [m for m in members if m.get("mn") and _raw_nick(m) not in named]
-
+    from core.store import (TAB_ATTENDEE_FIX, TAB_MEMBER_NAMES, TAB_NAME_MAP,
+                            TAB_POST_FIX)
+    pending = pending or {}
     return [
-        {"항목": "실명 미기입 멤버", "건수": len(no_real), "어디서": "이름매핑1",
+        {"항목": "실명 미기입 멤버", "건수": pending.get(TAB_MEMBER_NAMES, 0),
+         "어디서": TAB_MEMBER_NAMES,
          "설명": "실명을 채우면 후기 본문의 이름이 자동으로 멤버와 이어집니다"},
-        {"항목": "참석자 못 뽑은 후기", "건수": len(no_att), "어디서": "참석자보정",
+        {"항목": "참석자 못 뽑은 후기", "건수": pending.get(TAB_ATTENDEE_FIX, 0),
+         "어디서": TAB_ATTENDEE_FIX,
          "설명": "본문이 잘려 오면 뒤쪽 참석자가 통째로 빠집니다"},
-        {"항목": "출사일 미상 공지", "건수": len(no_date), "어디서": "공지보정",
-         "설명": "출사일이 없으면 월별 집계에서 빠집니다"},
-        {"항목": "분류 검토 대상 공지", "건수": len(flagged), "어디서": "공지보정",
-         "설명": "카테고리·출사일을 자동으로 확정하지 못한 공지"},
-        {"항목": "공지와 안 이어진 후기", "건수": len(orphans), "어디서": "—",
+        {"항목": "해소 안 된 이름", "건수": pending.get(TAB_NAME_MAP, 0),
+         "어디서": TAB_NAME_MAP,
+         "설명": "실명 명단으로도 멤버와 이어지지 않은 이름 (오타·탈퇴자 등)"},
+        {"항목": "검토 대상 공지", "건수": pending.get(TAB_POST_FIX, 0),
+         "어디서": TAB_POST_FIX,
+         "설명": "출사일·카테고리를 자동으로 확정하지 못한 공지"},
+        {"항목": "공지와 안 이어진 후기", "건수": len(orphan_reviews(posts)),
+         "어디서": "—",
          "설명": "짝이 될 출사 공지를 못 찾은 후기 (참석 집계에서 빠짐)"},
     ]
 
@@ -937,7 +935,7 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
                    photos: list[dict], master: dict,
                    members: list[dict] | None = None,
                    applied: dict[str, int] | None = None,
-                   real_names: dict | None = None,
+                   pending: dict[str, int] | None = None,
                    correction_url: str | None = None) -> None:
     period = period_label(start_ym, end_ym)
     months = month_axis(start_ym, end_ym)
@@ -960,8 +958,7 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
     )
 
     with tabs[0]:
-        _tab_overview(posts, photos, months, members or [], real_names,
-                      correction_url)
+        _tab_overview(posts, photos, months, pending, correction_url)
     with tabs[1]:
         _tab_outings(posts, months)
     with tabs[2]:
@@ -976,15 +973,14 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
         _tab_members(members or [], posts, photos, duplicates or set(), months)
 
 
-def render_confidence(posts: list[dict], members: list[dict],
-                      real_names: dict | None,
+def render_confidence(posts: list[dict], pending: dict[str, int] | None,
                       correction_url: str | None = None) -> None:
     """이 숫자를 얼마나 믿어도 되는지 — 결과 화면의 맨 앞.
 
     본문이 잘려 들어오는 탓에 참석자가 비어 있을 수 있다. **진짜 없는 것과
     아직 안 채운 것을 구분할 수 없으면** 결과를 잘못 읽는다.
     """
-    rows = confidence_report(posts, members, real_names)
+    rows = confidence_report(posts, pending)
     pending = [r for r in rows if r["건수"]]
     if not pending:
         st.success("보정이 필요한 항목이 없습니다. 아래 숫자를 그대로 보셔도 됩니다.", icon="✅")
@@ -1003,10 +999,9 @@ def render_confidence(posts: list[dict], members: list[dict],
 
 
 def _tab_overview(posts: list[dict], photos: list[dict], months: list[int],
-                  members: list[dict] | None = None,
-                  real_names: dict | None = None,
+                  pending: dict[str, int] | None = None,
                   correction_url: str | None = None) -> None:
-    render_confidence(posts, members or [], real_names, correction_url)
+    render_confidence(posts, pending, correction_url)
     st.divider()
 
     k = compute_kpis(posts, photos)
@@ -1601,10 +1596,9 @@ def render_sidebar(stores, analysis: dict | None) -> None:
                    "분석에 반영되고, 다시 수집해도 그대로 유지됩니다.")
         st.link_button("📕 보정 시트 열기", sheet_url(fix_store.file_id),
                        width="stretch")
-        try:
-            pending = fix_store.pending_count()
-        except Exception:  # noqa: BLE001
-            pending = None
+        # 분석할 때 이미 센 값을 그대로 쓴다 — 여기서 다시 읽으면 시트를 한 번 더
+        # 부르는 데다, 두 숫자가 갈라질 여지가 생긴다.
+        pending = (analysis or {}).get("pending")
         if pending is not None:
             from core.store import TAB_MEMBER_NAMES
             # 실명이 먼저다 — 채우고 나면 나머지 후보 자체가 줄어든다.
@@ -1700,6 +1694,8 @@ def _run_collection(raw_store, fix_store, start_ym: int, end_ym: int) -> None:
                                 **real_name_resolution(
                                     corrections.get("member_names") or {}, members),
                                 **_resolution_of(corrections)})
+            # 시딩은 앱을 열 때도 돈다(`seed_and_count`). 여기서는 방금 받은
+            # 데이터로 바로 반영해 수집 직후에 후보를 볼 수 있게 한다.
             added = fix_store.seed(
                 correction_candidates(posts, dict(collect_all_unresolved(posts)),
                                       corrections, members=members,
@@ -1739,12 +1735,46 @@ def load_analysis(stores) -> dict | None:
     raw_store, fix_store = stores
     with st.spinner("구글 시트에서 데이터를 읽는 중…"):
         try:
-            analysis = build_analysis(raw_store.load(), fix_store.load())
+            raw = raw_store.load()
+            corrections = fix_store.load()
+            analysis = build_analysis(raw, corrections)
         except Exception as e:  # noqa: BLE001
             st.error(f"구글 시트를 읽지 못했습니다: {e}")
             return None
+        analysis["pending"] = seed_and_count(fix_store, raw, corrections, analysis)
     st.session_state["_analysis"] = analysis
     return analysis
+
+
+def seed_and_count(fix_store, raw: dict, corrections: dict,
+                   analysis: dict) -> dict[str, int]:
+    """보정 후보를 시트에 채워 넣고 미기입 수를 돌려준다.
+
+    **수집이 아니라 앱을 열 때 한다.** 후보는 이미 저장된 raw에서 파생되는
+    것이라 API를 다시 부를 이유가 없다. 예전에는 수집 때만 시딩해서, 수집이
+    중간에 실패하면 "보정 n건 필요"라고만 뜨고 **정작 시트에는 아무것도 없어
+    무엇을 해야 할지 알 수 없었다.**
+
+    미기입 수도 여기서 돌려준다 — 화면과 사이드바가 **시트라는 한 곳**을
+    보게 해서 두 숫자가 갈라지지 않도록.
+    """
+    from core.store import correction_candidates
+
+    try:
+        fix_store.seed(
+            correction_candidates(
+                analysis["posts"],
+                dict(collect_all_unresolved(analysis["posts"])),
+                corrections,
+                members=raw.get("members") or [],
+                join_aliases=raw.get("join_aliases") or {},
+            ),
+            master_names=analysis["master"].get("names"),
+        )
+        return fix_store.pending_count()
+    except Exception as e:  # noqa: BLE001 — 시딩 실패가 분석을 막아서는 안 된다
+        st.warning(f"보정 후보를 시트에 채우지 못했습니다: {e}", icon="✍️")
+        return {}
 
 
 def main() -> None:
@@ -1782,7 +1812,7 @@ def main() -> None:
                    analysis["master"],
                    members=relabel_names(analysis["members"], real),
                    applied=analysis["applied"],
-                   real_names=real,
+                   pending=analysis.get("pending"),
                    correction_url=sheet_url(stores[1].file_id) if stores else None)
 
 

@@ -14,6 +14,7 @@ from core.store import (
     POST_FIX_COLS,
     POST_KEYS,
     TAB_ATTENDEE_FIX,
+    TAB_MEMBER_NAMES,
     TAB_HISTORY,
     TAB_NAME_MAP,
     TAB_POST_FIX,
@@ -194,6 +195,34 @@ def test_existing_data_renders_without_collecting():
     assert "📋 데이터" not in labels          # 구글 시트로 대체됨
     assert "🎨 테마사진" not in labels        # 📷 사진에 합침
     assert "👤 사용자" not in labels          # 📊 개요에 흡수
+
+
+def test_opening_the_app_fills_the_correction_sheet():
+    """"보정 n건 필요"라고만 뜨고 시트는 비어 있으면 무엇을 할지 알 수 없다.
+
+    실제로 그랬다 — 시딩이 수집 때만 돌아서, 수집이 중간에 실패하면 화면은
+    건수를 말하는데 시트에는 헤더밖에 없었다. 후보는 이미 저장된 raw에서
+    파생되므로 앱을 여는 것만으로 채워져야 한다.
+    """
+    raw, fix = make_stores(MULTI_YEAR, PHOTOS)
+    at = run(stores=(raw, fix))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    # 멤버 실명은 raw 멤버에서 바로 나온다 — 반드시 깔려 있어야 한다.
+    roster = fix.c.tabs[TAB_MEMBER_NAMES]
+    assert len(roster) > 1, "이름매핑1이 헤더뿐이면 채울 곳이 없다"
+
+
+def test_panel_count_matches_what_is_actually_in_the_sheet():
+    """화면 숫자와 시트 내용이 어긋나면 사용자는 아무것도 할 수 없다."""
+    raw, fix = make_stores(MULTI_YEAR, PHOTOS)
+    at = run(stores=(raw, fix))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    pending = at.session_state["_analysis"]["pending"]
+    for tab, n in pending.items():
+        rows = fix.c.tabs.get(tab, [])
+        assert n <= max(len(rows) - 1, 0), f"{tab}: 화면 {n}건 vs 시트 {len(rows) - 1}행"
 
 
 def test_multi_year_range_renders():
