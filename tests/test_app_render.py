@@ -351,3 +351,17 @@ def test_store_open_failure_shows_message_instead_of_crashing():
     at.run()
     assert not at.exception, [str(e) for e in at.exception]
     assert any("JSON" in e.value for e in at.error)
+
+
+def test_hidden_theme_photos_are_reachable_regardless_of_period():
+    """숨긴 사진 목록은 "내가 뭘 숨겼나"이지 기간별 뷰가 아니다.
+
+    기간으로 자르면 다른 기간에서 해제한 사진을 앱에서 되돌릴 수 없게 되고,
+    보정 시트를 손으로 열어야만 복구할 수 있다.
+    """
+    raw, fix = make_stores(MULTI_YEAR, PHOTOS)
+    at = run(stores=(raw, fix))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    ids = {str(p["id"]) for p in at.session_state["_all_photos"]}
+    assert ids == {"p1", "p2", "p3"}, "기간 밖 사진이 빠지면 되돌릴 수 없다"

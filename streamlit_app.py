@@ -1994,8 +1994,10 @@ def main() -> None:
     from core.store import relabel_names
     real = analysis.get("real_names")
     # 테마 해제한 사진은 has_comment=False라 월별 미리보기에 안 나온다.
-    # 되돌리려면 전체 목록과 해제된 id가 필요하다.
-    st.session_state["_all_photos"] = photos
+    # 되돌리려면 해제된 id와 사진이 필요한데, **기간으로 자르면 안 된다** —
+    # 다른 기간에서 해제한 것을 되돌릴 수 없게 된다. "내가 뭘 숨겼나"는
+    # 기간별 뷰가 아니다.
+    st.session_state["_all_photos"] = relabel_names(analysis["photos"], real)
     st.session_state["_theme_excluded"] = {
         pid for pid, off in (analysis.get("photo_flags") or {}).items() if off}
     render_results(view[0], view[1],
