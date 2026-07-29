@@ -87,6 +87,17 @@ def photo(pid, posted, has_comment=True):
 MEMBERS = [["mid", "mn", "is_admin", "joined_at", "last_visit", "os", "push"],
            ["w1", "닉", "FALSE", "2025-08-01 00:00:00", "2026-03-01 00:00:00", "iOS", "TRUE"]]
 
+def greeting(pid, wid, posted):
+    return {
+        "id": pid, "author": "닉", "wid": wid, "title": "가입인사",
+        "body": "잘 부탁드립니다", "outing_date": None, "posted_at": posted,
+        "cat": "J", "cat_label": "가입인사", "category": None,
+        "is_outing": False, "is_canceled": False,
+        "likes": 0, "comments": 0, "images": 0,
+        "needs_review": False, "review_reason": "",
+    }
+
+
 MULTI_YEAR = [
     notice("a", "2025-09-05"),
     notice("b", "2025-12-20", category="인물"),
@@ -95,6 +106,8 @@ MULTI_YEAR = [
     notice("e", "2026-01-11", canceled=True),
     review("r1", datetime(2025, 9, 6, 9, 0)),
     review("r2", datetime(2026, 3, 8, 9, 0)),
+    greeting("j1", "w1", datetime(2025, 9, 2, 9, 0)),    # 지금도 멤버
+    greeting("j2", "gone", datetime(2026, 1, 5, 9, 0)),  # 나간 사람
 ]
 PHOTOS = [
     photo("p1", datetime(2025, 9, 7, 9, 0)),
@@ -381,3 +394,16 @@ def test_excel_export_is_hidden_while_the_builder_is_out_of_sync():
     labels = [b.label for b in at.sidebar.button] + \
              [b.label for b in at.sidebar.download_button]
     assert not any("엑셀" in x or "내보내기" in x for x in labels)
+
+
+def test_members_tab_counts_joiners_who_already_left():
+    """멤버 목록에는 나간 사람이 없다 — 가입인사로 세야 실제 가입 수가 나온다."""
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    from streamlit_app import joiner_retention
+    analysis = at.session_state["_analysis"]
+    rows = joiner_retention(analysis["posts"], analysis["members"],
+                            [202509, 202601])
+    assert rows[0]["잔류"] == 1        # w1은 멤버 목록에 있다
+    assert rows[1]["이탈"] == 1        # gone은 없다

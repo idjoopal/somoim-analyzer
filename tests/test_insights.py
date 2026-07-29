@@ -291,3 +291,79 @@ def test_no_flags_means_no_work():
     photos = [themed("p1")]
     assert apply_photo_corrections(photos, {}) == 0
     assert photos[0]["has_comment"] is True
+
+
+# ═══════════════════════════════════════════════════════════════
+# 가입인사 기준 정착·이탈
+#
+# 멤버 목록은 지금 남아 있는 사람뿐이라 거기서 센 월별 가입은 이탈이 많았던
+# 달일수록 작아 보인다 — 정반대로 읽힌다. 가입인사는 사람이 나가도 남는다.
+# ═══════════════════════════════════════════════════════════════
+
+def greeting(pid, wid, author="닉", posted=None):
+    return {"id": pid, "cat": "J", "wid": wid, "author": author,
+            "posted_at": posted or datetime(2026, 3, 5),
+            "title": "가입인사", "body": "잘 부탁드립니다"}
+
+
+def test_departed_joiner_is_counted_even_though_they_left():
+    """이게 존재 이유다 — 멤버 목록으로는 나간 사람을 셀 수 없다."""
+    from streamlit_app import joiner_retention
+    posts = [greeting("j1", "w1"), greeting("j2", "w2")]
+    rows = joiner_retention(posts, [member("w1", "남은사람")], [202603])
+    assert rows[0] == {"월": "3월", "가입": 2, "잔류": 1, "이탈": 1}
+
+
+def test_retention_matches_by_user_id_not_nickname():
+    """닉네임으로 맞추면 닉네임을 바꾼 사람이 나간 것으로 잡힌다."""
+    from streamlit_app import joiner_retention
+    posts = [greeting("j1", "w1", author="옛닉네임")]
+    rows = joiner_retention(posts, [member("w1", "새닉네임")], [202603])
+    assert rows[0]["잔류"] == 1 and rows[0]["이탈"] == 0
+
+
+def test_months_without_greetings_are_zero_not_missing():
+    from streamlit_app import joiner_retention
+    rows = joiner_retention([greeting("j1", "w1")], [member("w1", "닉")],
+                            [202602, 202603])
+    assert [r["가입"] for r in rows] == [0, 1]
+
+
+def test_only_join_greetings_count():
+    """공지·후기 작성자는 가입 이벤트가 아니다."""
+    from streamlit_app import joiner_retention
+    posts = [greeting("j1", "w1"), notice("n1", "2026-03-01"), review("r1")]
+    assert joiner_retention(posts, [member("w1", "닉")], [202603])[0]["가입"] == 1
+
+
+def test_without_a_member_list_retention_is_not_guessed():
+    """멤버를 모르면 전원 잔류로 보이는데, 그건 사실이 아니라 무지다."""
+    from streamlit_app import joiner_retention
+    assert joiner_retention([greeting("j1", "w1")], [], [202603]) == []
+
+
+def test_departed_list_shows_how_long_they_stayed():
+    """인사만 쓰고 사라진 것과 한참 활동하다 나간 것은 뜻이 전혀 다르다."""
+    from streamlit_app import departed_joiners
+    posts = [greeting("j1", "w9", author="떠난사람", posted=datetime(2026, 1, 1)),
+             {"id": "n1", "cat": "A", "wid": "w9", "author": "떠난사람",
+              "posted_at": datetime(2026, 3, 11)}]
+    rows = departed_joiners(posts, [], [member("w1", "남은사람")])
+    assert rows[0]["멤버"] == "떠난사람"
+    assert rows[0]["활동 기간(일)"] == 69
+
+
+def test_departed_list_excludes_current_members():
+    from streamlit_app import departed_joiners
+    posts = [greeting("j1", "w1", author="남은사람")]
+    assert departed_joiners(posts, [], [member("w1", "남은사람")]) == []
+
+
+def test_last_activity_includes_photos():
+    """사진만 올리고 글은 안 쓰는 사람도 있다."""
+    from streamlit_app import departed_joiners
+    posts = [greeting("j1", "w9", posted=datetime(2026, 1, 1))]
+    photos = [{"id": "p1", "wid": "w9", "author": "닉",
+               "posted_at": datetime(2026, 2, 10)}]
+    rows = departed_joiners(posts, photos, [member("w1", "다른사람")])
+    assert rows[0]["마지막 활동"] == "2026-02-10"

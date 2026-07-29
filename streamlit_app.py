@@ -678,6 +678,73 @@ def dormant_members(posts: list[dict], members: list[dict],
     return sorted(rows, key=lambda r: r["마지막 참석"])
 
 
+# ═══════════════════════════════════════════════════════════════
+# 가입인사 기준 정착·이탈
+#
+# 멤버 목록(`members`)은 **지금 남아 있는 사람**뿐이라, 거기서 센 월별 가입은
+# "그 달에 가입해서 아직 남아 있는 사람 수"다. 나간 사람은 애초에 목록에
+# 없으므로 **이탈이 많았던 달일수록 가입이 적어 보인다** — 정반대로 읽힌다.
+#
+# 가입인사는 사람이 나가도 글이 남는다. 이 모임은 가입인사를 쓰지 않으면
+# 12시간 안에 강퇴하므로, **가입인사 작성자 = 제대로 가입한 사람의 명단**이다.
+# ═══════════════════════════════════════════════════════════════
+
+def joiner_retention(posts: list[dict], members: list[dict],
+                     months: list[int]) -> list[dict]:
+    """월별 `{월, 가입, 잔류, 이탈}`. 가입인사(cat=J) 작성자 기준.
+
+    잔류 판정은 **작성자 `wid` ↔ 현재 멤버 `mid`** 로 한다. 닉네임으로 맞추면
+    닉네임을 바꾼 사람이 나간 것으로 잡힌다.
+    """
+    active = {str(m.get("mid")) for m in members or [] if m.get("mid")}
+    if not active:
+        return []
+    label_of = dict(zip(months, axis_labels(months)))
+    rows = {m: {"월": label_of[m], "가입": 0, "잔류": 0, "이탈": 0} for m in months}
+    for p in posts:
+        if p.get("cat") != "J" or not p.get("posted_at"):
+            continue
+        m = ym_of(p["posted_at"])
+        if m not in rows:
+            continue
+        rows[m]["가입"] += 1
+        rows[m]["잔류" if str(p.get("wid")) in active else "이탈"] += 1
+    return [rows[m] for m in months]
+
+
+def departed_joiners(posts: list[dict], photos: list[dict],
+                     members: list[dict]) -> list[dict]:
+    """가입인사를 썼지만 지금 멤버 목록에 없는 사람 — 나간 사람.
+
+    마지막 활동일을 함께 낸다. 가입인사만 쓰고 사라졌는지, 한참 활동하다
+    나갔는지는 뜻이 전혀 다르다.
+    """
+    active = {str(m.get("mid")) for m in members or [] if m.get("mid")}
+    if not active:
+        return []
+
+    last: dict[str, datetime] = {}
+    for it in list(posts) + list(photos):
+        wid, at = str(it.get("wid")), it.get("posted_at")
+        if wid and at and at > last.get(wid, datetime.min):
+            last[wid] = at
+
+    rows = []
+    for p in posts:
+        wid = str(p.get("wid"))
+        if p.get("cat") != "J" or not wid or wid in active:
+            continue
+        seen = last.get(wid)
+        joined = p.get("posted_at")
+        rows.append({
+            "멤버": p.get("author") or "—",
+            "가입인사": joined.strftime("%Y-%m-%d") if joined else "—",
+            "마지막 활동": seen.strftime("%Y-%m-%d") if seen else "—",
+            "활동 기간(일)": (seen - joined).days if seen and joined else None,
+        })
+    return sorted(rows, key=lambda r: r["가입인사"], reverse=True)
+
+
 def newcomer_settling(members: list[dict], posts: list[dict],
                       since_ym: int | None = None) -> tuple[list[dict], int]:
     """가입 후 첫 참석까지 걸린 기간. `(행 목록, 제외한 인원 수)`.
@@ -1641,15 +1708,44 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
     # 과거 기간을 분석해도 늘 올해 가입만 보였다).
     if months:
         st.markdown(f"#### {period_label(months[0], months[-1])} 월별 신규 가입")
-        joins: Counter = Counter()
-        for m in members:
-            joined = m.get("joined_at")
-            if joined:
-                joins[ym_of(joined)] += 1
-        jdf = pd.DataFrame({"신규 가입": axis_values(joins, months)},
-                            index=axis_labels(months))
-        st.bar_chart(jdf, height=240)
-        st.caption("가입일이 분석 기간 안에 든 활성 멤버만 집계됩니다.")
+        retention = joiner_retention(posts, members, months)
+        joined_total = sum(r["가입"] for r in retention)
+        if joined_total:
+            st.caption("**가입인사 기준**입니다. 이 모임은 가입인사를 쓰지 않으면 "
+                       "12시간 안에 강퇴하므로, 가입인사가 곧 제대로 가입한 사람의 "
+                       "명단입니다. 인사 글은 사람이 나가도 남아 있어 **이탈까지 셀 수 "
+                       "있습니다.**")
+            df = pd.DataFrame(retention).set_index("월")
+            st.bar_chart(df[["잔류", "이탈"]], height=240)
+            left = sum(r["이탈"] for r in retention)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("가입", f"{joined_total}명")
+            c2.metric("잔류", f"{joined_total - left}명")
+            c3.metric("이탈", f"{left}명",
+                      delta=f"-{round(left / joined_total * 100, 1)}%",
+                      delta_color="inverse")
+
+            gone = departed_joiners(posts, photos, members)
+            if gone:
+                with st.expander(f"나간 멤버 {len(gone)}명 — 가입인사는 썼지만 지금 없음"):
+                    st.caption("**활동 기간**이 짧으면 인사만 쓰고 사라진 것이고, "
+                               "길면 한참 활동하다 나간 것입니다 — 뜻이 전혀 다릅니다.")
+                    st.dataframe(pd.DataFrame(gone), hide_index=True,
+                                 width="stretch", height=280)
+        else:
+            # 폴백: 현재 멤버의 가입일. **나간 사람이 빠져 있어 과소 집계된다.**
+            joins: Counter = Counter()
+            for m in members:
+                joined = m.get("joined_at")
+                if joined:
+                    joins[ym_of(joined)] += 1
+            st.bar_chart(pd.DataFrame({"신규 가입": axis_values(joins, months)},
+                                      index=axis_labels(months)), height=240)
+            st.warning(
+                "이 기간에 수집된 가입인사가 없어 **현재 멤버의 가입일**로 셌습니다. "
+                "나간 사람은 멤버 목록에 없으므로 **실제보다 적게 나오고, 이탈이 "
+                "많았던 달일수록 더 적어 보입니다.** 해당 기간을 수집하면 가입인사 "
+                "기준으로 바뀝니다.", icon="⚠️")
 
     # 유령 멤버는 *전 기간* 0건만 잡는다 — 활동하다 끊긴 사람은 여기서 본다.
     st.markdown("#### 최근 조용해진 멤버")
