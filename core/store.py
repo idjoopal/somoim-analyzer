@@ -73,6 +73,15 @@ NAME_MAP_COLS = ["이름토큰", "처리", "빈도", "비고"]
 POST_FIX_COLS = ["공지 id", "제목", "카테고리", "출사일", "취소", "제외", "비고"]
 ATTENDEE_FIX_COLS = ["후기 id", "제목", "참석자", "비고"]
 
+# 탭 → 헤더. `ensure`와 `seed`가 같은 정의를 봐야 한다 — 헤더 없는 탭에 행을
+# 붙이면 다음 읽기에서 첫 행이 헤더로 오인돼 그 항목이 매번 다시 추가된다.
+CORRECTION_COLS = {
+    TAB_MEMBER_NAMES: MEMBER_NAME_COLS,
+    TAB_NAME_MAP: NAME_MAP_COLS,
+    TAB_POST_FIX: POST_FIX_COLS,
+    TAB_ATTENDEE_FIX: ATTENDEE_FIX_COLS,
+}
+
 _BOOL_KEYS = {"is_outing", "is_canceled", "needs_review", "has_comment",
               "is_admin", "push"}
 _DT_KEYS = {"posted_at", "joined_at", "last_visit"}
@@ -727,10 +736,7 @@ class CorrectionStore:
         """
         self.migrate()
         self.c.ensure_tabs(self.file_id, CORRECTION_TABS)
-        for tab, cols in ((TAB_MEMBER_NAMES, MEMBER_NAME_COLS),
-                          (TAB_NAME_MAP, NAME_MAP_COLS),
-                          (TAB_POST_FIX, POST_FIX_COLS),
-                          (TAB_ATTENDEE_FIX, ATTENDEE_FIX_COLS)):
+        for tab, cols in CORRECTION_COLS.items():
             if not self.c.read(self.file_id, tab):
                 self.c.write(self.file_id, tab, [cols])
         if members:
@@ -789,6 +795,10 @@ class CorrectionStore:
         added: dict[str, int] = {}
         for tab, rows in candidates.items():
             existing = self.c.read(self.file_id, tab)
+            if not existing and tab in CORRECTION_COLS:
+                # 헤더부터 세운다. 없으면 첫 후보 행이 헤더로 오인돼 매번 다시 붙는다.
+                self.c.write(self.file_id, tab, [CORRECTION_COLS[tab]])
+                existing = self.c.read(self.file_id, tab)
             new_rows = missing_rows(existing, rows)
             if new_rows:
                 self.c.append(self.file_id, tab, new_rows)
