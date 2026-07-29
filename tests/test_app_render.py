@@ -49,6 +49,13 @@ class FakeClient:
     def append(self, file_id, tab, rows):
         self.tabs.setdefault(tab, []).extend([list(r) for r in rows])
 
+    def write_row(self, file_id, tab, row, row_index=1):
+        rows = self.tabs.setdefault(tab, [])
+        while len(rows) < row_index:
+            rows.append([])
+        cur = rows[row_index - 1]
+        rows[row_index - 1] = list(row) + list(cur[len(row):])
+
 
 def notice(pid, outing_date, category="풍경", canceled=False, posted=None):
     return {
@@ -524,3 +531,55 @@ def test_discarding_clears_the_checkbox_widgets():
     assert state["_theme_pending"] == {}
     assert "thm_p2" not in state          # 켜진 채 남으면 되살아난다
     assert state["thm_p3"] is False       # 바꾼 적 없는 것은 건드리지 않는다
+
+
+# ═══════════════════════════════════════════════════════════════
+# 본문 잘림 안내
+# ═══════════════════════════════════════════════════════════════
+
+def _long_review(pid, posted, body):
+    r = review(pid, posted)
+    r["body"] = body
+    return r
+
+
+CUT = "가" * 120
+TRUNCATED = [
+    notice("a", "2026-03-05"),
+    _long_review("r1", datetime(2026, 3, 6, 9, 0), CUT),
+    _long_review("r2", datetime(2026, 3, 7, 9, 0), CUT),
+    _long_review("r3", datetime(2026, 3, 8, 9, 0), CUT),
+    _long_review("r4", datetime(2026, 3, 9, 9, 0), "닉 다녀왔습니다"),
+]
+
+
+def test_truncated_bodies_are_called_out_in_the_review_detail():
+    """길이를 안 보여 주면, 명단이 짧은 게 진짜인지 잘린 탓인지 알 수 없다."""
+    at = run(stores=make_stores(TRUNCATED, []))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    warnings = [w.value for w in at.warning]
+    assert any("120자" in w and "빠졌을 수 있습니다" in w for w in warnings)
+    assert at.session_state["_analysis"]["body_cut"] == 120
+
+
+def test_intact_data_says_nothing_about_truncation():
+    """벽이 없으면 조용해야 한다 — 거짓 경고는 진짜 경고를 죽인다."""
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    assert not at.exception, [str(e) for e in at.exception]
+    assert at.session_state["_analysis"]["body_cut"] is None
+    assert not any("잘림" in w.value or "빠졌을 수" in w.value for w in at.warning)
+
+
+def test_truncated_reviews_are_seeded_into_the_attendee_sheet():
+    """화면에서 "고쳐야 한다"고만 하고 시트에 줄이 없으면 할 일을 알 수 없다."""
+    raw, fix = make_stores(TRUNCATED, [])
+    at = run(stores=(raw, fix))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    rows = fix.c.tabs[TAB_ATTENDEE_FIX]
+    assert rows[0] == ATTENDEE_FIX_COLS
+    seeded = {r[0]: r for r in rows[1:]}
+    assert {"r1", "r2", "r3"} <= set(seeded), "잘린 후기가 후보에 없다"
+    assert seeded["r1"][5] == 120                     # 본문길이
+    assert seeded["r1"][6] == "⚠️ 잘림 의심"

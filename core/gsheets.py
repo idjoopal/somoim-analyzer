@@ -479,6 +479,18 @@ class SheetsClient:
             self._write_chunk(file_id, tab, a1_range(tab, start), chunk)
             start += len(chunk)
 
+    def write_row(self, file_id: str, tab: str, row: list,
+                  row_index: int = 1) -> None:
+        """한 행만 덮어쓴다 — 나머지 행은 건드리지 않는다.
+
+        `write`는 탭을 통째로 비우고 다시 쓴다. 헤더 한 줄 넓히자고 사람이
+        채운 수백 행을 지웠다 다시 넣는 것은 위험 대비 얻는 것이 없다.
+        `values.update`는 시작 셀에서 준 배열 크기만큼만 퍼지므로 그 행만 닿는다.
+        """
+        if not row:
+            return
+        self._write_chunk(file_id, tab, a1_range(tab, row_index), [list(row)])
+
     def append(self, file_id: str, tab: str, rows: list[list]) -> None:
         """탭 끝에 행을 덧붙인다 (기존 내용 보존)."""
         if not rows:

@@ -10,7 +10,7 @@ import pytest
 
 from core.collector import (
     ALL_CATS, LEFT_MEMBER, NOT_A_NAME, OUTING_CATS,
-    summarize_body_lengths, summarize_raw_fields,
+    body_cut_length, summarize_body_lengths, summarize_raw_fields,
 )
 from core.store import (
     CORRECTION_TITLE,
@@ -38,6 +38,7 @@ from core.store import (
     coerce_bool,
     coerce_dt,
     coerce_iso_date,
+    attendee_fix_rows,
     correction_candidates,
     display_name,
     dropdowns,
@@ -52,6 +53,7 @@ from core.store import (
     records_to_rows,
     resolution_from_corrections,
     rows_to_records,
+    truncated_body_length,
     upsert,
 )
 
@@ -94,6 +96,15 @@ class FakeClient:
     def append(self, file_id, tab, rows):
         self.appended.append((tab, len(rows)))
         self.tabs.setdefault(tab, []).extend([list(r) for r in rows])
+
+    def write_row(self, file_id, tab, row, row_index=1):
+        # 실제 `values.update`처럼 **그 행만** 닿는다. 통째로 다시 쓰는
+        # `write`와 다르다는 것을 가짜도 지켜야 헤더 넓히기가 검증된다.
+        rows = self.tabs.setdefault(tab, [])
+        while len(rows) < row_index:
+            rows.append([])
+        cur = rows[row_index - 1]
+        rows[row_index - 1] = list(row) + list(cur[len(row):])
 
 
 def post(pid, cat="A", **kw):
@@ -503,6 +514,13 @@ class TwoFileClient:
 
     def append(self, file_id, tab, rows):
         self._t(file_id).setdefault(tab, []).extend([list(r) for r in rows])
+
+    def write_row(self, file_id, tab, row, row_index=1):
+        rows = self._t(file_id).setdefault(tab, [])
+        while len(rows) < row_index:
+            rows.append([])
+        cur = rows[row_index - 1]
+        rows[row_index - 1] = list(row) + list(cur[len(row):])
 
     def sheet_ids(self, file_id):
         return {t: 100 + i for i, t in enumerate(self._t(file_id))}
@@ -1096,3 +1114,93 @@ def test_kicked_member_is_accepted_as_a_left_marker():
     """`__LEFT__`는 탈퇴와 강퇴를 모두 담는다."""
     assert resolution_from_corrections({"names": {"가": "강퇴"}}) == {"가": LEFT_MEMBER}
     assert resolution_from_corrections({"names": {"나": "탈퇴"}}) == {"나": LEFT_MEMBER}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 본문 잘림 — 참석자 보정이 왜 필요한지 알려 주는 근거
+# ═══════════════════════════════════════════════════════════════
+
+def test_body_cut_length_finds_the_wall():
+    """서로 다른 글이 정확히 같은 길이에서 끝나고 그보다 긴 글이 없으면 잘린 것."""
+    assert body_cut_length([12, 40, 120, 120, 120, 87]) == 120
+
+
+def test_body_cut_length_stays_quiet_without_a_wall():
+    """가장 긴 글 하나는 그냥 가장 긴 글이다 — 잘렸다고 말하면 거짓 경고다."""
+    assert body_cut_length([12, 40, 87, 120]) is None
+    assert body_cut_length([]) is None
+    assert body_cut_length([0, 0, 0]) is None       # 빈 본문은 길이가 아니다
+
+
+def test_body_cut_length_survives_a_pile_of_empty_bodies():
+    """최빈값으로 재면 빈 본문이 많을 때 **잘리고 있는데 아니라고 답한다.**
+
+    공지처럼 본문이 없는 글이 잘린 후기보다 많은 것은 흔한 일이다.
+    """
+    assert body_cut_length([0] * 50 + [120, 120, 120]) == 120
+
+
+def test_truncated_reviews_become_correction_candidates():
+    """이름을 뽑았어도 본문이 잘렸으면 그 명단이 전부라는 근거가 없다."""
+    long_body = "가" * 120
+    posts = [
+        post("r1", cat="E", body=long_body, attendees=["나무"],
+             attendees_needs_review=False),
+        post("r2", cat="E", body=long_body, attendees=["바다"],
+             attendees_needs_review=False),
+        post("r3", cat="E", body=long_body, attendees=["하늘"],
+             attendees_needs_review=False),
+        post("r4", cat="E", body="짧은 후기", attendees=["구름"],
+             attendees_needs_review=False),
+    ]
+    rows = attendee_fix_rows(posts)
+    assert [r[0] for r in rows] == ["r1", "r2", "r3"], "온전한 후기는 부르지 않는다"
+    assert rows[0][4] == "나무"          # 추출된 참석자를 미리 채운다
+    assert rows[0][5] == 120             # 본문길이
+    assert rows[0][6] == "⚠️ 잘림 의심"
+
+
+def test_intact_review_that_lost_its_names_still_becomes_a_candidate():
+    """잘림만 보면, 이름을 못 뽑은 짧은 후기를 놓친다."""
+    rows = attendee_fix_rows([post("r9", cat="E", body="짧다", attendees=[],
+                                   attendees_needs_review=True)])
+    assert [r[0] for r in rows] == ["r9"]
+    assert rows[0][4] == ""              # 뽑힌 이름이 없다
+    assert rows[0][6] == "온전"           # 본문 탓이 아니라는 것을 밝힌다
+
+
+def test_confirmed_reviews_drop_out_of_the_candidates():
+    """`참석자`를 채워 확인했으면 다시 부르지 않는다 — 그래야 건수가 줄어든다."""
+    long_body = "가" * 120
+    posts = [post(f"r{i}", cat="E", body=long_body, attendees=["나무"],
+                  attendees_needs_review=False) for i in range(3)]
+    rows = attendee_fix_rows(posts, done_att={"r0": ["나무"]})
+    assert [r[0] for r in rows] == ["r1", "r2"]
+
+
+def test_body_cut_is_measured_over_every_post_not_just_reviews():
+    """공지도 같은 API에서 오므로 벽을 재는 표본에 함께 들어간다."""
+    posts = [post("a", body="가" * 120), post("b", body="가" * 120),
+             post("c", cat="E", body="가" * 120)]
+    assert truncated_body_length(posts) == 120
+
+
+def test_widening_the_header_keeps_what_people_typed():
+    """이미 쓰던 시트의 옛 헤더를 넓히되, 아래 행은 손대지 않는다."""
+    old_head = ["후기 id", "제목", "참석자", "비고"]
+    c = FakeClient({TAB_ATTENDEE_FIX: [old_head, ["r1", "후기", "나무, 바다", "확인함"]]})
+    CorrectionStore(c, "F").widen_headers()
+
+    rows = c.tabs[TAB_ATTENDEE_FIX]
+    assert rows[0] == ATTENDEE_FIX_COLS
+    assert rows[1] == ["r1", "후기", "나무, 바다", "확인함"], "사람이 채운 행은 그대로"
+    # 넓힌 뒤에도 같은 값이 같은 이름으로 읽혀야 한다.
+    assert rows_to_records(rows)[0]["참석자"] == "나무, 바다"
+
+
+def test_widening_leaves_an_unfamiliar_header_alone():
+    """앞 열 이름이 다르면 우리가 아는 시트가 아니다 — 건드리면 뜻이 어긋난다."""
+    weird = ["후기 id", "누가 갔나"]
+    c = FakeClient({TAB_ATTENDEE_FIX: [weird, ["r1", "나무"]]})
+    CorrectionStore(c, "F").widen_headers()
+    assert c.tabs[TAB_ATTENDEE_FIX][0] == weird

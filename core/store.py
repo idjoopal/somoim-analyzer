@@ -26,7 +26,9 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
-from .collector import ALL_CATS, LEFT_MEMBER, NOT_A_NAME, OUTING_CATS
+from .collector import (
+    ALL_CATS, LEFT_MEMBER, NOT_A_NAME, OUTING_CATS, body_cut_length,
+)
 
 # ── 파일·탭 이름 (고정 — URL을 붙여넣지 않고 이름으로 찾는다) ──
 RAW_TITLE = "다감노_raw"
@@ -73,7 +75,11 @@ FIELD_COLS = ["필드", "사용중", "건수", "예시", "비고"]
 MEMBER_NAME_COLS = ["멤버 id", "닉네임", "실명", "비고"]
 NAME_MAP_COLS = ["이름토큰", "처리", "빈도", "비고"]
 POST_FIX_COLS = ["공지 id", "제목", "카테고리", "출사일", "취소", "제외", "비고"]
-ATTENDEE_FIX_COLS = ["후기 id", "제목", "참석자", "비고"]
+# 참고 열은 **뒤에만** 붙인다. 중간에 끼우면 이미 채워 둔 값이 다른 열 이름
+# 아래로 밀려 뜻이 조용히 바뀐다 — 사람이 채운 보정이 통째로 어긋나는 것이라
+# 되돌릴 방법이 없다. `pending_count`가 `참석자`를 3번째 열로 세는 것도 같은 이유.
+ATTENDEE_FIX_COLS = ["후기 id", "제목", "참석자", "비고",
+                     "추출된 참석자", "본문길이", "본문상태"]
 PHOTO_FIX_COLS = ["사진 id", "작성자", "테마아님", "비고"]
 
 # 탭 → 헤더. `ensure`와 `seed`가 같은 정의를 봐야 한다 — 헤더 없는 탭에 행을
@@ -362,6 +368,54 @@ def filter_excluded(posts: list[dict]) -> list[dict]:
     return [p for p in posts if not p.get("excluded")]
 
 
+BODY_CUT = "⚠️ 잘림 의심"
+BODY_WHOLE = "온전"
+
+
+def truncated_body_length(posts: Optional[list[dict]]) -> Optional[int]:
+    """저장된 게시글에서 본문이 잘리는 길이를 알아낸다. 안 잘렸으면 None.
+
+    **기간을 자르기 전 전체 게시글**로 재야 한다. 한 달만 놓고 보면 표본이
+    모자라 벽이 안 보이고, 달마다 다른 답이 나온다.
+    """
+    return body_cut_length(len(str(p.get("body") or "")) for p in posts or [])
+
+
+def attendee_fix_rows(posts: list[dict], done_att: Optional[dict] = None,
+                      cut: Optional[int] = None) -> list[list]:
+    """`참석자보정` 후보 행.
+
+    후보에 드는 조건이 둘이다.
+
+    ① 참석자를 못 뽑았거나 작성자가 명단에 없는 후기 (`attendees_needs_review`)
+    ② **본문이 잘린 후기** — 이름을 뽑긴 했어도 뒤쪽이 통째로 안 왔으니
+       그 명단이 전부라고 볼 근거가 없다.
+
+    ②는 사람이 원문을 봐야만 판단이 되므로, 앱이 뽑은 명단·본문 길이·잘림
+    여부를 **미리 채워** 둔다. 그래야 "더 적어야 하는지, 지금이 맞는지"를
+    시트만 보고 고를 수 있다. 맞다고 판단했으면 `추출된 참석자`를 `참석자`에
+    그대로 붙여 넣어 확인 처리한다 — 빈칸은 끝까지 "아직 안 봄"이다.
+    """
+    done_att = done_att or {}
+    if cut is None:
+        cut = truncated_body_length(posts)
+    rows = []
+    for p in posts or []:
+        if p.get("cat") != "E" or str(p.get("id")) in done_att:
+            continue
+        blen = len(str(p.get("body") or ""))
+        cut_here = cut is not None and blen >= cut
+        if not (p.get("attendees_needs_review") or cut_here):
+            continue
+        rows.append([
+            str(p["id"]), _to_cell(p.get("title")), "", "",
+            ", ".join(p.get("attendees") or []),
+            blen,
+            BODY_CUT if cut_here else BODY_WHOLE,
+        ])
+    return rows
+
+
 def correction_candidates(posts: list[dict], unresolved_freq: dict[str, int],
                           corrections: dict, members: Optional[list[dict]] = None,
                           join_aliases: Optional[dict] = None,
@@ -388,12 +442,7 @@ def correction_candidates(posts: list[dict], unresolved_freq: dict[str, int],
         and str(p["id"]) not in done_posts
     ]
 
-    att_rows = [
-        [str(p["id"]), _to_cell(p.get("title")), "", ""]
-        for p in posts
-        if p.get("cat") == "E" and p.get("attendees_needs_review")
-        and str(p["id"]) not in done_att
-    ]
+    att_rows = attendee_fix_rows(posts, done_att)
 
     out = {TAB_NAME_MAP: name_rows, TAB_POST_FIX: post_rows,
            TAB_ATTENDEE_FIX: att_rows}
@@ -466,6 +515,14 @@ GUIDE_ROWS: list[list[str]] = [
     ["  · 참석자     쉼표로 구분한 닉네임. 예: 원석사진, 나무, 바다"],
     ["  · 여기에 적으면 본문에서 뽑은 결과를 통째로 대체합니다(더하지 않습니다)."],
     ["  · 작성자도 참석했다면 작성자 닉네임을 함께 적어 주세요."],
+    ["  오른쪽 회색 참고 열 셋은 판단 재료입니다(앱이 채웁니다)."],
+    ["  · 추출된 참석자  앱이 본문에서 뽑은 명단. 맞으면 그대로 `참석자`에 복사하세요"],
+    ["  · 본문길이       본문 글자 수"],
+    [f"  · 본문상태       `{BODY_CUT}`이면 소모임 API가 본문을 끊어 보낸 길이와 같습니다."],
+    ["                   뒤에 적힌 참석자가 통째로 빠졌을 수 있으니 원문을 확인하세요."],
+    [f"                   `{BODY_WHOLE}`이면 본문은 다 왔습니다."],
+    ["  ※ 명단이 맞아도 빈칸으로 두면 끝까지 \"아직 안 봄\"으로 셉니다."],
+    ["     맞다고 확인했으면 복사해 넣어 주세요 — 그래야 남은 건수가 줄어듭니다."],
     [""],
     ["■ ⑤ 테마사진보정 — 댓글이 달렸지만 테마사진이 아닌 사진"],
     ["  이 탭은 **앱에서 채웁니다.** 📷 사진 탭 > 🎨 테마사진에서 사진을 보고"],
@@ -521,8 +578,15 @@ HEADER_NOTES: dict[str, dict[int, str]] = {
         0: "후기 게시글 id. 보정을 붙이는 열쇠이므로 고치지 마세요.",
         1: "후기 제목. 앱이 채운 참고값입니다.",
         2: "쉼표로 구분한 참석자 닉네임 (예: 원석사진, 나무).\n"
-           "본문에서 뽑은 결과를 통째로 대체합니다. 작성자도 참석했으면 함께 적으세요.",
+           "본문에서 뽑은 결과를 통째로 대체합니다. 작성자도 참석했으면 함께 적으세요.\n"
+           "오른쪽 `추출된 참석자`가 맞으면 그대로 복사해 넣으세요 — 그래야 확인한 것으로 봅니다.",
         3: "자유 메모. 앱은 읽지 않습니다.",
+        4: "앱이 본문에서 뽑은 참석자. 참고값이라 고쳐도 반영되지 않습니다.\n"
+           "맞으면 왼쪽 `참석자`에 복사, 빠진 사람이 있으면 더해서 적으세요.",
+        5: "본문 글자 수. 참고값입니다.",
+        6: f"`{BODY_CUT}`이면 본문이 API에서 끊긴 길이와 같습니다 —\n"
+           "뒤쪽에 적힌 참석자가 통째로 빠졌을 수 있으니 소모임에서 원문을 확인하세요.\n"
+           f"`{BODY_WHOLE}`이면 본문은 다 왔고, 이름을 못 뽑은 다른 이유가 있는 것입니다.",
     },
 }
 
@@ -803,10 +867,39 @@ class CorrectionStore:
         for tab, cols in CORRECTION_COLS.items():
             if not self.c.read(self.file_id, tab):
                 self.c.write(self.file_id, tab, [cols])
+        self.widen_headers()
         if members:
             self.seed({TAB_MEMBER_NAMES:
                        member_name_candidates(members, join_aliases)})
         self.write_guide(master_names)
+
+    def widen_headers(self) -> None:
+        """열이 늘어난 탭의 **헤더 한 줄만** 넓힌다.
+
+        이미 쓰고 계신 시트에는 옛 헤더가 그대로 있다. 그냥 두면 앱이 새로
+        채우는 참고값이 이름 없는 열에 떨어져 무슨 값인지 알 수 없다.
+
+        두 가지를 지킨다.
+
+        · **앞부분이 그대로일 때만 손댄다.** 앞 열 이름이 하나라도 다르면
+          우리가 아는 시트가 아니므로 아무것도 하지 않는다.
+        · **행 하나만 쓴다.** `write`는 탭을 통째로 비우고 다시 쓰기 때문에,
+          헤더 한 줄 넓히자고 사람이 채운 수백 행을 지웠다 넣을 이유가 없다.
+        """
+        for tab, cols in CORRECTION_COLS.items():
+            try:
+                rows = self.c.read(self.file_id, tab)
+            except Exception:  # noqa: BLE001
+                continue
+            head = [_clean(c) for c in (rows[0] if rows else [])]
+            if not head or len(head) >= len(cols):
+                continue
+            if head != [_clean(c) for c in cols[:len(head)]]:
+                continue
+            try:
+                self.c.write_row(self.file_id, tab, list(cols))
+            except Exception:  # noqa: BLE001 — 넓히기 실패가 보정을 막아서는 안 된다
+                pass
 
     def migrate(self) -> None:
         """`이름매핑` → `후기이름매핑`. 탭 이름만 갈아 끼워 내용을 살린다.
