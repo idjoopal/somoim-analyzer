@@ -573,7 +573,7 @@ NAME_RX = re.compile(r"[가-힣]{2,4}|[A-Za-z]{2,10}")
 
 # 이름 해소 매핑(name_resolution)의 특수값.
 # 후기에서 추출된 이름이 마스터에 없을 때 사용자가 드롭다운으로 지정한 처리:
-#   - LEFT_MEMBER: 탈퇴/차단 멤버 → 추적하지 않음
+#   - LEFT_MEMBER: 나간 멤버(탈퇴·강퇴) → 추적하지 않음
 #   - NOT_A_NAME:  이름 아님(노이즈) → 추적하지 않음
 #   - 그 외 문자열: 그 마스터 닉네임으로 정규화(예: "음승구" → "승구")
 LEFT_MEMBER = "__LEFT__"
@@ -938,8 +938,12 @@ def collect_members(
 
 
 def collect_banned_names() -> set[str]:
-    """탈퇴/차단(ban=Y) 멤버 닉네임 집합. 미매칭 해소 표의 '참고' 정보용
-    (자동 선택 X — 사용자가 직접 드롭다운으로 지정)."""
+    """**강퇴된**(ban=Y) 멤버 닉네임 집합.
+
+    자발적으로 나간 사람은 멤버 목록에 아예 없으므로 여기 잡히지 않는다 —
+    `ban=Y`는 탈퇴가 아니라 강퇴다. 이름 해소의 참고 정보로 쌓아 둔다
+    (자동 선택은 하지 않는다 — 사람이 `후기이름매핑`에서 지정한다).
+    """
     r = requests.post(BASE_URL + "/api/group",
                       headers=HEADERS, json={"gid": GROUP_ID}, timeout=10)
     r.raise_for_status()

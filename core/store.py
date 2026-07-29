@@ -35,7 +35,7 @@ CORRECTION_TITLE = "다감노_보정"
 TAB_POSTS = "게시글"
 TAB_PHOTOS = "사진"
 TAB_MEMBERS = "멤버"
-TAB_BANNED = "탈퇴멤버"
+TAB_BANNED = "강퇴멤버"      # ban=Y — 자발적으로 나간 사람은 목록에 아예 없다
 TAB_JOIN_ALIASES = "가입인사매핑"
 TAB_HISTORY = "_수집이력"
 TAB_FIELDS = "_원본필드"
@@ -46,14 +46,15 @@ TAB_MEMBER_NAMES = "이름매핑1"      # ① 멤버 실명 — 나머지 보정
 TAB_NAME_MAP = "후기이름매핑"        # ② 실명으로도 안 풀린 나머지
 TAB_POST_FIX = "공지보정"
 TAB_ATTENDEE_FIX = "참석자보정"
-TAB_PHOTO_FIX = "사진보정"          # 테마사진 추정을 사람이 뒤집는 곳
+TAB_PHOTO_FIX = "테마사진보정"      # 테마사진 추정을 사람이 뒤집는 곳
 TAB_GUIDE = "_사용법"
 CORRECTION_TABS = [TAB_GUIDE, TAB_MEMBER_NAMES, TAB_NAME_MAP,
                    TAB_POST_FIX, TAB_ATTENDEE_FIX, TAB_PHOTO_FIX]
 
-# 이름이 바뀌기 전의 탭. 사람이 채워 둔 값을 살리려면 새로 만들지 말고
-# 이름만 갈아 끼워야 한다 (`CorrectionStore.ensure`).
+# 이름이 바뀌기 전의 탭. 쌓인 값을 살리려면 새로 만들지 말고 이름만 갈아
+# 끼워야 한다 (`CorrectionStore.ensure` · `RawStore.ensure`).
 LEGACY_NAME_MAP = "이름매핑"
+LEGACY_BANNED = "탈퇴멤버"      # ban=Y는 강퇴다 — 이름이 뜻을 잘못 말하고 있었다
 
 # ── 컬럼 (헤더 행 = 이 순서) ──
 POST_KEYS = [
@@ -288,7 +289,7 @@ def parse_corrections(name_rows: list[list], post_rows: list[list],
 
 
 def parse_photo_flags(rows: Optional[list[list]]) -> dict[str, bool]:
-    """`사진보정` → `{사진 id: 테마아님}`.
+    """`테마사진보정` → `{사진 id: 테마아님}`.
 
     `FALSE`로 되돌린 행도 담는다 — "해제했다가 취소했다"는 사실 자체가 기록이고,
     행을 지우는 것보다 되돌리기가 명확하다.
@@ -446,10 +447,10 @@ GUIDE_ROWS: list[list[str]] = [
     ["  · '멤버 id'는 고치지 마세요 — 닉네임이 바뀌어도 이 값으로 같은 사람을 따라갑니다"],
     [""],
     ["■ ② 후기이름매핑 — 실명 명단으로도 안 풀린 나머지"],
-    ["  ①을 채우고 나면 여기 남는 것은 오타·탈퇴자·이름이 아닌 것들입니다."],
+    ["  ①을 채우고 나면 여기 남는 것은 오타·나간 멤버·이름이 아닌 것들입니다."],
     ["  '처리' 칸에 셋 중 하나를 넣습니다 (드롭다운에서 고르세요)."],
     ["  · 마스터 닉네임    같은 사람의 다른 표기일 때. 멤버 명단에 있는 닉네임 그대로"],
-    [f"  · {LEFT_MEMBER}         탈퇴한 멤버. 집계에서 빠집니다. \"탈퇴\"라고 써도 됩니다"],
+    [f"  · {LEFT_MEMBER}         나간 멤버(탈퇴·강퇴). 집계에서 빠집니다. \"탈퇴\"·\"강퇴\"도 됩니다"],
     [f"  · {NOT_A_NAME}         이름이 아님(조사·오탈자 등). \"노이즈\"·\"❌\"도 됩니다"],
     ["  목록에 없는 새 닉네임도 직접 입력할 수 있습니다(경고만 뜹니다)."],
     [""],
@@ -466,7 +467,7 @@ GUIDE_ROWS: list[list[str]] = [
     ["  · 여기에 적으면 본문에서 뽑은 결과를 통째로 대체합니다(더하지 않습니다)."],
     ["  · 작성자도 참석했다면 작성자 닉네임을 함께 적어 주세요."],
     [""],
-    ["■ ⑤ 사진보정 — 댓글이 달렸지만 테마사진이 아닌 사진"],
+    ["■ ⑤ 테마사진보정 — 댓글이 달렸지만 테마사진이 아닌 사진"],
     ["  이 탭은 **앱에서 채웁니다.** 📷 사진 탭 > 🎨 테마사진에서 사진을 보고"],
     ["  '테마 아님'에 체크한 뒤 [변경 저장]을 누르면 여기에 기록됩니다."],
     ["  · 테마아님   TRUE면 테마사진에서 뺍니다. FALSE로 되돌리면 다시 셉니다"],
@@ -494,7 +495,7 @@ HEADER_NOTES: dict[str, dict[int, str]] = {
     },
     TAB_NAME_MAP: {
         0: "후기 본문에서 나온 이름 표기. 보정을 붙이는 열쇠이므로 고치지 마세요.",
-        1: f"마스터 닉네임 / {LEFT_MEMBER}(탈퇴) / {NOT_A_NAME}(이름 아님) 중 하나.\n"
+        1: f"마스터 닉네임 / {LEFT_MEMBER}(탈퇴·강퇴) / {NOT_A_NAME}(이름 아님) 중 하나.\n"
            "비워 두면 '아직 보정 안 함'으로 봅니다.",
         2: "이 표기가 나온 횟수. 앱이 채운 참고값입니다.",
         3: "자유 메모. 앱은 읽지 않습니다.",
@@ -667,6 +668,7 @@ def resolution_from_corrections(corrections: dict) -> dict[str, str]:
     """
     alias = {
         "탈퇴": LEFT_MEMBER, "탈퇴멤버": LEFT_MEMBER, "left": LEFT_MEMBER,
+        "강퇴": LEFT_MEMBER, "강퇴멤버": LEFT_MEMBER,
         "노이즈": NOT_A_NAME, "이름아님": NOT_A_NAME, "noise": NOT_A_NAME,
         "x": NOT_A_NAME, "❌": NOT_A_NAME,
     }
@@ -687,7 +689,19 @@ class RawStore:
         self.c, self.file_id = client, file_id
 
     def ensure(self) -> None:
+        self.migrate()
         self.c.ensure_tabs(self.file_id, RAW_TABS)
+
+    def migrate(self) -> None:
+        """`탈퇴멤버` → `강퇴멤버`. 탭 이름만 갈아 끼워 쌓인 값을 살린다.
+
+        `ensure_tabs`보다 **먼저** 돌아야 한다. 순서가 뒤집히면 빈 `강퇴멤버`가
+        먼저 생겨 이름 변경이 건너뛰어지고, 기존 명단이 옛 탭에 고립된다.
+        """
+        try:
+            self.c.rename_tab(self.file_id, LEGACY_BANNED, TAB_BANNED)
+        except Exception:  # noqa: BLE001 — 이관 실패가 수집을 막아서는 안 된다
+            pass
 
     def load(self) -> dict:
         return {

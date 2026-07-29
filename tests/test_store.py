@@ -24,6 +24,7 @@ from core.store import (
     POST_KEYS,
     FIELD_COLS,
     TAB_ATTENDEE_FIX,
+    TAB_BANNED,
     TAB_FIELDS,
     TAB_GUIDE,
     TAB_HISTORY,
@@ -1051,3 +1052,47 @@ def test_load_exposes_photo_flags():
                                     ["ph2", "바다", "FALSE", ""]]})
     flags = CorrectionStore(c, "F").load()["photos"]
     assert flags == {"ph1": True, "ph2": False}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 강퇴멤버 — ban=Y는 탈퇴가 아니다
+#
+# 자발적으로 나간 사람은 멤버 목록에 아예 없다. `탈퇴멤버`라는 이름이
+# 뜻을 잘못 말하고 있었다.
+# ═══════════════════════════════════════════════════════════════
+
+def test_legacy_banned_tab_is_renamed_keeping_its_rows():
+    """상수만 바꾸면 빈 탭이 새로 생기고 쌓인 명단이 옛 탭에 고립된다."""
+    c = RenamingClient({"탈퇴멤버": [["닉네임"], ["강퇴당한사람"]]})
+    RawStore(c, "F").ensure()
+
+    assert "탈퇴멤버" not in c.tabs
+    assert c.tabs[TAB_BANNED] == [["닉네임"], ["강퇴당한사람"]]
+
+
+def test_banned_migration_is_safe_to_run_twice():
+    c = RenamingClient({"탈퇴멤버": [["닉네임"], ["a"]]})
+    store = RawStore(c, "F")
+    store.ensure()
+    store.ensure()
+    assert c.tabs[TAB_BANNED] == [["닉네임"], ["a"]]
+
+
+def test_banned_migration_does_not_clobber_an_existing_new_tab():
+    c = RenamingClient({"탈퇴멤버": [["닉네임"], ["옛것"]],
+                        TAB_BANNED: [["닉네임"], ["새것"]]})
+    RawStore(c, "F").ensure()
+    assert c.tabs[TAB_BANNED][1] == ["새것"]
+
+
+def test_raw_store_works_with_a_client_that_cannot_rename():
+    """이관 실패가 수집을 막아서는 안 된다."""
+    c = FakeClient()                       # rename_tab 없음
+    RawStore(c, "F").ensure()
+    assert TAB_BANNED in c.tabs
+
+
+def test_kicked_member_is_accepted_as_a_left_marker():
+    """`__LEFT__`는 탈퇴와 강퇴를 모두 담는다."""
+    assert resolution_from_corrections({"names": {"가": "강퇴"}}) == {"가": LEFT_MEMBER}
+    assert resolution_from_corrections({"names": {"나": "탈퇴"}}) == {"나": LEFT_MEMBER}
