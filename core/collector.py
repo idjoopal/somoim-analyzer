@@ -370,7 +370,11 @@ def summarize_raw_fields(raw_items: list[dict],
     ]
 
 
-def body_cut_length(lengths, min_hits: int = 3) -> Optional[int]:
+MIN_CUT_LENGTH = 40   # 이보다 짧은 벽은 잘림으로 보지 않는다 (아래 설명)
+
+
+def body_cut_length(lengths, min_hits: int = 3,
+                    min_len: int = MIN_CUT_LENGTH) -> Optional[int]:
     """본문이 잘리는 길이를 **데이터에서** 알아낸다. 안 잘렸으면 None.
 
     목록 API가 몇 자에서 자르는지는 문서에 없다. 상수로 박아 두면 API가 값을
@@ -378,8 +382,14 @@ def body_cut_length(lengths, min_hits: int = 3) -> Optional[int]:
     서로 다른 글 여러 개가 정확히 같은 길이에서 끝나고 그보다 긴 글이 하나도
     없으면, 그건 우연이 아니라 잘린 것이다.
 
-    `min_hits`건 미만이면 판단하지 않는다. 가장 긴 글 하나는 그냥 가장 긴
-    글일 뿐이고, 짧은 글 둘이 우연히 같은 길이일 수도 있다.
+    두 가지로 오탐을 막는다.
+
+    · `min_hits`건 미만이면 판단하지 않는다. 가장 긴 글 하나는 그냥 가장 긴
+      글일 뿐이다.
+    · `min_len`보다 짧은 벽도 무시한다. 미리보기를 준다면 문장 몇 개는 준다.
+      "닉 다녀왔습니다" 같은 짧은 글 셋이 우연히 같은 길이인 쪽이 훨씬 흔하고,
+      **거짓 경고는 진짜 경고를 죽인다.** 이 값은 답이 아니라 "이보다 짧으면
+      추측하지 않겠다"는 선이다 — 실제 잘리는 길이는 여전히 데이터가 정한다.
 
     `Counter.most_common`을 쓰지 않는 이유: 본문이 아예 빈 글이 잘린 글보다
     많으면 최빈값은 0이 되고, **정작 잘리고 있는데 아니라고 답한다.**
@@ -388,7 +398,9 @@ def body_cut_length(lengths, min_hits: int = 3) -> Optional[int]:
     if not counts:
         return None
     longest = max(counts)
-    return longest if counts[longest] >= min_hits else None
+    if longest < min_len or counts[longest] < min_hits:
+        return None
+    return longest
 
 
 def summarize_body_lengths(raw_items: list[dict], key: str = "c") -> dict:

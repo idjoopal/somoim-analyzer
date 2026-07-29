@@ -1132,6 +1132,15 @@ def test_body_cut_length_stays_quiet_without_a_wall():
     assert body_cut_length([0, 0, 0]) is None       # 빈 본문은 길이가 아니다
 
 
+def test_a_short_wall_is_not_truncation():
+    """짧은 글 셋이 우연히 같은 길이인 쪽이 훨씬 흔하다.
+
+    "닉 다녀왔습니다"만 적힌 후기 셋이 그렇다. 미리보기를 준다면 문장 몇 개는
+    주지, 여덟 글자에서 끊지 않는다. 거짓 경고는 진짜 경고를 죽인다.
+    """
+    assert body_cut_length([4, 4, 8, 8, 8]) is None
+
+
 def test_body_cut_length_survives_a_pile_of_empty_bodies():
     """최빈값으로 재면 빈 본문이 많을 때 **잘리고 있는데 아니라고 답한다.**
 
