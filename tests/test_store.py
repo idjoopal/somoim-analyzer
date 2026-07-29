@@ -19,6 +19,7 @@ from core.store import (
     ATTENDEE_FIX_COLS,
     MEMBER_NAME_COLS,
     NAME_MAP_COLS,
+    PHOTO_FIX_COLS,
     POST_FIX_COLS,
     POST_KEYS,
     FIELD_COLS,
@@ -28,6 +29,7 @@ from core.store import (
     TAB_HISTORY,
     TAB_MEMBER_NAMES,
     TAB_NAME_MAP,
+    TAB_PHOTO_FIX,
     TAB_POST_FIX,
     CorrectionStore,
     RawStore,
@@ -981,3 +983,71 @@ def test_field_report_replaces_previous_run():
                                          "예시": "", "비고": ""}]})
     fields = [r[0] for r in c.tabs[TAB_FIELDS][1:]]
     assert fields == ["새것"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 사진보정 — 앱이 사람의 판단을 대신 적는 유일한 탭
+# ═══════════════════════════════════════════════════════════════
+
+def test_photo_fix_is_never_seeded():
+    """댓글 달린 사진이 전부 후보다 — 시딩하면 수천 행이 깔린다."""
+    c = FakeClient()
+    store = CorrectionStore(c, "F")
+    store.ensure()
+    store.seed(correction_candidates([], {}, {"names": {}, "posts": {}, "attendees": {}},
+                                     members=MEMBERS))
+    assert c.tabs[TAB_PHOTO_FIX] == [PHOTO_FIX_COLS]      # 헤더뿐
+
+
+def test_saving_a_flag_creates_only_that_row():
+    c = FakeClient()
+    store = CorrectionStore(c, "F")
+    store.ensure()
+    assert store.save_photo_flags({"ph1": True}, {"ph1": "나무"}) == 1
+
+    rows = c.tabs[TAB_PHOTO_FIX]
+    assert rows[0] == PHOTO_FIX_COLS
+    assert rows[1][:3] == ["ph1", "나무", "TRUE"]
+    assert len(rows) == 2
+
+
+def test_unmarking_flips_the_existing_row_instead_of_adding_one():
+    c = FakeClient()
+    store = CorrectionStore(c, "F")
+    store.ensure()
+    store.save_photo_flags({"ph1": True})
+    store.save_photo_flags({"ph1": False})
+
+    rows = c.tabs[TAB_PHOTO_FIX]
+    assert len(rows) == 2                                 # 중복 행이 생기면 안 된다
+    assert rows[1][2] == "FALSE"
+
+
+def test_saving_the_same_value_writes_nothing():
+    c = FakeClient()
+    store = CorrectionStore(c, "F")
+    store.ensure()
+    store.save_photo_flags({"ph1": True})
+    before = [list(r) for r in c.tabs[TAB_PHOTO_FIX]]
+    assert store.save_photo_flags({"ph1": True}) == 0
+    assert c.tabs[TAB_PHOTO_FIX] == before
+
+
+def test_saving_one_flag_leaves_the_others_alone():
+    """다른 보정과 같은 규칙 — 사용자가 건드린 id의 행만 바꾼다."""
+    c = FakeClient()
+    store = CorrectionStore(c, "F")
+    store.ensure()
+    store.save_photo_flags({"ph1": True, "ph2": True})
+    store.save_photo_flags({"ph1": False})
+
+    by_id = {r[0]: r[2] for r in c.tabs[TAB_PHOTO_FIX][1:]}
+    assert by_id == {"ph1": "FALSE", "ph2": "TRUE"}
+
+
+def test_load_exposes_photo_flags():
+    c = FakeClient({TAB_PHOTO_FIX: [PHOTO_FIX_COLS,
+                                    ["ph1", "나무", "TRUE", ""],
+                                    ["ph2", "바다", "FALSE", ""]]})
+    flags = CorrectionStore(c, "F").load()["photos"]
+    assert flags == {"ph1": True, "ph2": False}

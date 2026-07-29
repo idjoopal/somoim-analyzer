@@ -189,12 +189,11 @@ def test_existing_data_renders_without_collecting():
     at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
     assert not at.exception, [str(e) for e in at.exception]
     labels = [t.label for t in at.tabs]
-    assert "📊 개요" in labels and "👥 참석" in labels
+    assert "📊 개요" in labels and "👥 참석 & 후기" in labels
     # 탭 개수가 아니라 **이름**을 본다 — 개수만 세면 탭을 합치거나 나눌 때마다
     # 무의미하게 깨지고, 정작 탭이 사라진 것은 못 잡는다.
-    assert "📋 데이터" not in labels          # 구글 시트로 대체됨
-    assert "🎨 테마사진" not in labels        # 📷 사진에 합침
-    assert "👤 사용자" not in labels          # 📊 개요에 흡수
+    for gone in ("📋 데이터", "🎨 테마사진", "👤 사용자", "📝 후기", "🏷️ 카테고리"):
+        assert gone not in labels, f"{gone} 탭은 다른 곳으로 합쳤다"
 
 
 def test_opening_the_app_fills_the_correction_sheet():
