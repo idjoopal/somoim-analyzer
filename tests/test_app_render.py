@@ -124,13 +124,14 @@ PHOTOS = [
 ]
 
 
-def make_stores(posts=None, photos=None, history=None, corrections=None):
+def make_stores(posts=None, photos=None, history=None, corrections=None,
+                members=None):
     raw_tabs = {
         TAB_POSTS: records_to_rows(posts or [], POST_KEYS),
         "사진": records_to_rows(photos or [], [
             "id", "author", "wid", "posted_at", "likes", "comments", "has_comment",
             "url_large", "url_medium", "url_small", "url_thumb"]),
-        "멤버": MEMBERS,
+        "멤버": members or MEMBERS,
         TAB_HISTORY: [["수집시각", "시작월", "종료월", "게시글", "사진", "멤버"]]
                      + (history or []),
     }
@@ -709,3 +710,54 @@ def test_no_truncation_no_filter():
     """잘린 게 없으면 거를 것도 없다 — 쓸모없는 스위치를 두지 않는다."""
     at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
     assert not any("잘린 후기만" in t.label for t in at.toggle)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 함께 간 사람 — 컬럼이 고정 7개
+# ═══════════════════════════════════════════════════════════════
+
+PAIR_MEMBERS = [
+    ["mid", "mn", "is_admin", "joined_at", "last_visit", "os", "push"],
+    ["w1", "나무", "FALSE", "2025-08-01 00:00:00", "2026-03-01 00:00:00", "iOS", "TRUE"],
+    ["w2", "바다", "FALSE", "2025-08-01 00:00:00", "2026-03-01 00:00:00", "iOS", "TRUE"],
+    ["w3", "하늘", "FALSE", "2025-08-01 00:00:00", "2026-03-01 00:00:00", "iOS", "TRUE"],
+]
+
+
+def _pair_review(pid, posted, body):
+    r = review(pid, posted)
+    r["body"] = body
+    return r
+
+
+PAIRS = [
+    notice("n1", "2026-03-07"),
+    notice("n2", "2026-03-14"),
+    _pair_review("pr1", datetime(2026, 3, 8, 9, 0), "나무 바다 다녀왔습니다"),
+    _pair_review("pr2", datetime(2026, 3, 15, 9, 0), "나무 하늘 다녀왔습니다"),
+]
+
+
+def test_co_attendance_table_has_fixed_columns():
+    """이름을 컬럼으로 쓰던 시절엔 쌍이 늘어날수록 표가 옆으로 늘어났다.
+
+    순수 함수 테스트만으로는 이 증상을 못 잡는다 — 넓어지는 곳이
+    `pd.DataFrame`이기 때문이다.
+    """
+    from streamlit_app import CO_ATTENDANCE_COLS
+
+    at = run(stores=make_stores(PAIRS, [], members=PAIR_MEMBERS))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    tables = [d.value for d in at.dataframe if "사람 A" in list(d.value.columns)]
+    assert tables, "함께 간 사람 표가 없다"
+    df = tables[0]
+    assert list(df.columns) == CO_ATTENDANCE_COLS
+    assert len(df) == 2, "나무·바다 / 나무·하늘 두 쌍"
+    # 값까지 본다 — `columns=`로 틀만 잡으면 이름이 새어도 빈 칸 일곱 개가
+    # 그려져 컬럼 검사만으로는 통과해 버린다.
+    assert set(df["사람 A"]) == {"나무"}
+    assert set(df["사람 B"]) == {"바다", "하늘"}
+    assert list(df["함께"]) == [1, 1]
+    assert list(df["A 참석"]) == [2, 2]     # 나무는 두 번 다 갔다
+    assert list(df["A 기준"]) == [50.0, 50.0]
