@@ -189,12 +189,11 @@ def test_existing_data_renders_without_collecting():
     at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
     assert not at.exception, [str(e) for e in at.exception]
     labels = [t.label for t in at.tabs]
-    assert "📊 개요" in labels and "👥 참석" in labels
+    assert "📊 개요" in labels and "👥 참석 & 후기" in labels
     # 탭 개수가 아니라 **이름**을 본다 — 개수만 세면 탭을 합치거나 나눌 때마다
     # 무의미하게 깨지고, 정작 탭이 사라진 것은 못 잡는다.
-    assert "📋 데이터" not in labels          # 구글 시트로 대체됨
-    assert "🎨 테마사진" not in labels        # 📷 사진에 합침
-    assert "👤 사용자" not in labels          # 📊 개요에 흡수
+    for gone in ("📋 데이터", "🎨 테마사진", "👤 사용자", "📝 후기", "🏷️ 카테고리"):
+        assert gone not in labels, f"{gone} 탭은 다른 곳으로 합쳤다"
 
 
 def test_opening_the_app_fills_the_correction_sheet():
@@ -352,3 +351,17 @@ def test_store_open_failure_shows_message_instead_of_crashing():
     at.run()
     assert not at.exception, [str(e) for e in at.exception]
     assert any("JSON" in e.value for e in at.error)
+
+
+def test_hidden_theme_photos_are_reachable_regardless_of_period():
+    """숨긴 사진 목록은 "내가 뭘 숨겼나"이지 기간별 뷰가 아니다.
+
+    기간으로 자르면 다른 기간에서 해제한 사진을 앱에서 되돌릴 수 없게 되고,
+    보정 시트를 손으로 열어야만 복구할 수 있다.
+    """
+    raw, fix = make_stores(MULTI_YEAR, PHOTOS)
+    at = run(stores=(raw, fix))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    ids = {str(p["id"]) for p in at.session_state["_all_photos"]}
+    assert ids == {"p1", "p2", "p3"}, "기간 밖 사진이 빠지면 되돌릴 수 없다"

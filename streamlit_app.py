@@ -517,7 +517,7 @@ def confidence_report(posts: list[dict],
          "설명": "본문이 잘려 오면 뒤쪽 참석자가 통째로 빠집니다"},
         {"항목": "해소 안 된 이름", "건수": pending.get(TAB_NAME_MAP, 0),
          "어디서": TAB_NAME_MAP,
-         "설명": "실명 명단으로도 멤버와 이어지지 않은 이름 (오타·탈퇴자 등)"},
+         "설명": "실명 명단으로도 멤버와 이어지지 않은 이름 (오타·나간 멤버 등)"},
         {"항목": "검토 대상 공지", "건수": pending.get(TAB_POST_FIX, 0),
          "어디서": TAB_POST_FIX,
          "설명": "출사일·카테고리를 자동으로 확정하지 못한 공지"},
@@ -546,10 +546,13 @@ def avg_attendance_trend(posts: list[dict],
 
 
 def co_attendance(posts: list[dict], top_n: int = 20) -> list[dict]:
-    """함께 간 횟수 상위 쌍. `{두 사람, 함께, ...}`.
+    """함께 간 횟수 상위 쌍.
 
     쌍은 정렬해 담으므로 A-B와 B-A가 한 행으로 합쳐진다. 참석자가 한 명뿐인
     출사에서는 쌍이 생기지 않는다.
+
+    **비율은 양쪽 기준을 모두 낸다.** 두 사람의 전체 참석 수가 달라
+    "8번 함께"가 한쪽에겐 대부분이고 다른 쪽에겐 일부일 수 있다.
     """
     pair: Counter = Counter()
     solo: Counter = Counter()
@@ -562,11 +565,75 @@ def co_attendance(posts: list[dict], top_n: int = 20) -> list[dict]:
         for i, a in enumerate(names):
             for b in names[i + 1:]:
                 pair[(a, b)] += 1
+
+    def pct(n, total):
+        return round(n / total * 100, 1) if total else 0.0
+
     rows = []
     for (a, b), n in pair.most_common(top_n):
-        rows.append({"두 사람": f"{a} · {b}", "함께": n,
-                     f"{a}": solo[a], f"{b}": solo[b]})
+        rows.append({
+            "두 사람": f"{a} · {b}", "함께": n,
+            f"{a} 참석": solo[a], f"{a} 기준": pct(n, solo[a]),
+            f"{b} 참석": solo[b], f"{b} 기준": pct(n, solo[b]),
+        })
     return rows
+
+
+# ═══════════════════════════════════════════════════════════════
+# 카테고리 — 📌 출사 탭으로 합치면서 통계를 붙인다
+# ═══════════════════════════════════════════════════════════════
+
+def category_author_ranking(posts: list[dict]) -> list[dict]:
+    """작성자 × 카테고리 교차표. 누가 어떤 출사를 주로 여는지."""
+    agg: dict[str, dict] = {}
+    for p in posts:
+        if p.get("cat") != "A" or not p.get("is_active", True):
+            continue
+        cat = p.get("category")
+        if not cat:
+            continue
+        row = agg.setdefault(p["author"], {"작성자": p["author"], "합계": 0})
+        row[cat] = row.get(cat, 0) + 1
+        row["합계"] += 1
+    cols = [c for c in ALL_CATS if any(c in r for r in agg.values())]
+    rows = []
+    for r in sorted(agg.values(), key=lambda x: -x["합계"]):
+        rows.append({"작성자": r["작성자"], "합계": r["합계"],
+                     **{c: r.get(c, 0) for c in cols}})
+    return rows
+
+
+def _like_stats(groups: dict[str, list[dict]], key_name: str) -> list[dict]:
+    """`{키: 공지들}` → 건수·좋아요 합·평균.
+
+    **평균만 두면 1건 쓰고 좋아요 많이 받은 쪽이 1위가 된다.** 건수를 같이
+    실어 표본이 작다는 것이 눈에 보이게 한다.
+    """
+    rows = []
+    for k, items in groups.items():
+        if not items:
+            continue
+        total = sum(p.get("likes") or 0 for p in items)
+        rows.append({key_name: k, "공지 수": len(items), "좋아요 합": total,
+                     "평균 좋아요": round(total / len(items), 1)})
+    return sorted(rows, key=lambda r: -r["평균 좋아요"])
+
+
+def category_likes(posts: list[dict]) -> list[dict]:
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for p in posts:
+        if p.get("cat") == "A" and p.get("category"):
+            groups[p["category"]].append(p)
+    return _like_stats(groups, "카테고리")
+
+
+def author_likes(posts: list[dict], min_posts: int = 2) -> list[dict]:
+    """작성자별 공지 평균 좋아요. 표본이 너무 작으면 순위가 무의미해 걸러 낸다."""
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for p in posts:
+        if p.get("cat") == "A" and p.get("is_active", True):
+            groups[p["author"]].append(p)
+    return [r for r in _like_stats(groups, "작성자") if r["공지 수"] >= min_posts]
 
 
 def dormant_members(posts: list[dict], members: list[dict],
@@ -601,16 +668,24 @@ def dormant_members(posts: list[dict], members: list[dict],
     return sorted(rows, key=lambda r: r["마지막 참석"])
 
 
-def newcomer_settling(members: list[dict], posts: list[dict]) -> list[dict]:
-    """가입 후 첫 참석까지 걸린 기간. 아직 안 온 사람은 `첫 참석`이 None.
+def newcomer_settling(members: list[dict], posts: list[dict],
+                      since_ym: int | None = None) -> tuple[list[dict], int]:
+    """가입 후 첫 참석까지 걸린 기간. `(행 목록, 제외한 인원 수)`.
 
-    가입만 하고 안 오는 비율이 곧 유입의 질이다.
+    **수집 기간보다 먼저 가입한 사람은 뺀다.** 그 사람의 첫 참석은 데이터
+    밖에 있을 수 있어, "가입 후 N일 만에 첫 참석"이 사실이 아니게 된다.
+    아직 안 온 사람은 `첫 참석`이 None — 그 수가 곧 유입의 질이다.
+
+    제외 수를 함께 돌려주는 이유: 조용히 빠지면 명단이 틀린 것처럼 보인다.
     """
     first, _ = member_first_seen(posts)
-    rows = []
+    rows, skipped = [], 0
     for m in members or []:
         nick, joined = m.get("mn"), m.get("joined_at")
         if not nick or not joined:
+            continue
+        if since_ym is not None and ym_of(joined) < int(since_ym):
+            skipped += 1
             continue
         iso = first.get(nick)
         days = None
@@ -622,7 +697,7 @@ def newcomer_settling(members: list[dict], posts: list[dict]) -> list[dict]:
             "첫 참석": iso,
             "가입→첫 참석(일)": days if days is not None and days >= 0 else None,
         })
-    return sorted(rows, key=lambda r: r["가입일"], reverse=True)
+    return sorted(rows, key=lambda r: r["가입일"], reverse=True), skipped
 
 
 
@@ -832,8 +907,8 @@ def build_analysis(raw: dict, corrections: dict) -> dict:
     달라지므로 순서가 중요하다.
     """
     from core.store import (
-        apply_corrections, filter_excluded, real_by_nickname,
-        real_name_resolution, resolution_from_corrections,
+        apply_corrections, apply_photo_corrections, filter_excluded,
+        real_by_nickname, real_name_resolution, resolution_from_corrections,
     )
 
     posts = [dict(p) for p in raw.get("posts") or []]
@@ -843,6 +918,9 @@ def build_analysis(raw: dict, corrections: dict) -> dict:
 
     counts = apply_corrections(posts, corrections)
     posts = filter_excluded(posts)
+    # 테마 해제는 **모든 집계보다 먼저**. has_comment가 단일 게이트라 여기서
+    # 뒤집으면 KPI·월별 추이·업로더 비율·매트릭스·참여자 순위가 전부 따라온다.
+    counts["테마해제"] = apply_photo_corrections(photos, corrections)
 
     active_mids = {m["mid"] for m in members if m.get("mid")}
     _mark_active(posts, active_mids)
@@ -865,6 +943,7 @@ def build_analysis(raw: dict, corrections: dict) -> dict:
                    "duplicates": find_duplicate_member_names(members)},
         "resolution": resolution,
         "real_names": real_by_nickname(member_names, members),
+        "photo_flags": corrections.get("photos") or {},
         "applied": counts,
         "history": raw.get("history") or [],
     }
@@ -936,7 +1015,8 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
                    members: list[dict] | None = None,
                    applied: dict[str, int] | None = None,
                    pending: dict[str, int] | None = None,
-                   correction_url: str | None = None) -> None:
+                   correction_url: str | None = None,
+                   fix_store=None) -> None:
     period = period_label(start_ym, end_ym)
     months = month_axis(start_ym, end_ym)
     st.subheader(f"{period} 인사이트")
@@ -953,8 +1033,7 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
     duplicates = master.get("duplicates") if isinstance(master, dict) else set()
 
     tabs = st.tabs(
-        ["📊 개요", "📌 출사", "👥 참석", "📝 후기", "📷 사진",
-         "🏷️ 카테고리", "🧑‍🤝‍🧑 멤버"]
+        ["📊 개요", "📌 출사", "👥 참석 & 후기", "📷 사진", "🧑‍🤝‍🧑 멤버"]
     )
 
     with tabs[0]:
@@ -964,13 +1043,10 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
     with tabs[2]:
         _tab_attendance(posts, months)
     with tabs[3]:
-        _tab_reviews(posts, months)
+        _tab_photos(photos, months, fix_store=fix_store)
     with tabs[4]:
-        _tab_photos(photos, months)
-    with tabs[5]:
-        _tab_categories(posts, months)
-    with tabs[6]:
-        _tab_members(members or [], posts, photos, duplicates or set(), months)
+        _tab_members(members or [], posts, photos, duplicates or set(), months,
+                     since_ym=start_ym)
 
 
 def render_confidence(posts: list[dict], pending: dict[str, int] | None,
@@ -1064,7 +1140,6 @@ def _tab_outings(posts: list[dict], months: list[int]) -> None:
     st.caption("작성자별 cat=A 공지 수 (진행+취소). 출사일이 대상 기간에 든 공지만 집계.")
     ranking = outing_user_ranking(posts)
     if ranking:
-        st.altair_chart(hbar(ranking, "작성자", "합계", "공지 수 TOP 10", n=10), width="stretch")
         st.dataframe(
             _ranking_df(ranking, "합계"),
             hide_index=True, width="stretch",
@@ -1076,18 +1151,6 @@ def _tab_outings(posts: list[dict], months: list[int]) -> None:
         )
     else:
         st.info("출사 공지가 없습니다.")
-
-    st.markdown("#### 출사 취소(펑) 순위")
-    st.caption("공지 3건 이상 작성자 중 취소율 높은 순. 취소 = 제목 (펑)/[펑].")
-    cancels = cancel_ranking(posts, min_notices=3)
-    if cancels:
-        st.dataframe(
-            _ranking_df(cancels, "취소"),
-            hide_index=True, width="stretch",
-            column_config={"취소율": st.column_config.NumberColumn("취소율", format="%.1f%%")},
-        )
-    else:
-        st.info("공지 3건 이상인 작성자가 없습니다.")
 
     st.markdown("#### 출사당 평균 참석 인원")
     st.caption("모임 규모가 커지는지 줄어드는지. 참석자를 못 뽑은 출사도 분모에 들어가므로, "
@@ -1104,8 +1167,13 @@ def _tab_outings(posts: list[dict], months: list[int]) -> None:
     if rows:
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
+    # 🏷️ 카테고리 탭을 합쳤다 — 카테고리는 결국 출사를 나누는 축이다.
+    st.divider()
+    st.markdown("### 🏷️ 카테고리")
+    _category_section(posts, months)
 
-def _tab_reviews(posts: list[dict], months: list[int]) -> None:
+
+def _review_section(posts: list[dict], months: list[int]) -> None:
     """📝 후기 게시글 목록 — 월별 expander, 각 후기 카드에 정규화된 참석자 명단.
 
     참석자는 Stage 1에서 적용된 매핑(가입인사 자동 + 사용자 매핑)으로 마스터 닉네임에
@@ -1249,8 +1317,13 @@ def _tab_attendance(posts: list[dict], months: list[int]) -> None:
                 att = ", ".join(r.get("attendees", [])) or "—"
                 st.markdown(f"- **{d}** [{r['author']}] {r['title']} · 참석자: {att}")
 
+    # 📝 후기 탭을 합쳤다 — 참석자 표에서 이상한 걸 보면 같은 탭에서 원문을 연다.
+    st.divider()
+    st.markdown("### 📖 후기 본문 상세 확인")
+    _review_section(posts, months)
 
-def _tab_photos(photos: list[dict], months: list[int]) -> None:
+
+def _tab_photos(photos: list[dict], months: list[int], fix_store=None) -> None:
     st.caption("💬 댓글이 달린 사진(rn>0)을 **테마사진 참여로 추정**합니다 — "
                "댓글 내용이 비공개라 사진 자체로만 판단합니다. 아래 월별 미리보기로 "
                "실제 테마사진인지 직접 확인하세요.")
@@ -1259,10 +1332,6 @@ def _tab_photos(photos: list[dict], months: list[int]) -> None:
     st.caption("작성자별 사진 수 · 테마예상 = 댓글 달린(테마사진 참여 추정) 사진 수 · 좋아요 합계.")
     ranking = photo_user_ranking(photos)
     if ranking:
-        st.altair_chart(
-            hbar(ranking, "작성자", "사진수", "사진 업로드 TOP 10", n=10, scheme="oranges"),
-            width="stretch",
-        )
         st.dataframe(
             _ranking_df(ranking, "사진수"),
             hide_index=True, width="stretch",
@@ -1293,10 +1362,29 @@ def _tab_photos(photos: list[dict], months: list[int]) -> None:
     # 🎨 테마사진 탭을 합쳤다 — 같은 사진 데이터를 두 탭에서 갈라 보던 것.
     st.divider()
     st.markdown("### 🎨 테마사진")
-    _theme_section(photos, months)
+    _theme_section(photos, months, fix_store)
 
 
-def _theme_section(photos: list[dict], months: list[int]) -> None:
+_PENDING = "_theme_pending"       # 저장 전 체크박스 상태 {사진 id: 테마아님}
+
+
+def _theme_toggle(p: dict, container, excluded: bool) -> None:
+    """사진 한 장의 '테마 아님' 체크박스. 상태는 저장 버튼 전까지 세션에만 둔다."""
+    pid = str(p.get("id"))
+    pending = st.session_state.setdefault(_PENDING, {})
+    checked = pending.get(pid, excluded)
+    new = container.checkbox("테마 아님", value=checked, key=f"thm_{pid}")
+    if new != excluded:
+        pending[pid] = new
+    else:
+        pending.pop(pid, None)          # 원래대로 돌아왔으면 저장할 것이 없다
+
+
+def _theme_section(photos: list[dict], months: list[int], fix_store=None) -> None:
+    all_photos = st.session_state.get("_all_photos") or photos
+    excluded_ids = st.session_state.get("_theme_excluded") or set()
+    pending = st.session_state.get(_PENDING) or {}
+
     user_month, authors, mon_count, mon_list = theme_matrix(photos, months)
     by_month = themed_photos_by_month(photos)
     multi = is_multi_year(months[0], months[-1]) if months else True
@@ -1304,7 +1392,21 @@ def _theme_section(photos: list[dict], months: list[int]) -> None:
     st.markdown("#### 월별 테마사진 제출 인원")
     st.bar_chart(pd.DataFrame({"참여 인원": [mon_count.get(m, 0) for m in months]},
                               index=axis_labels(months)))
-    st.caption("각 월을 펼치면 참여자 명단과 그 달 테마사진 미리보기를 볼 수 있습니다.")
+    st.caption("각 월을 펼쳐 실제 테마사진인지 확인하고, 아니면 **테마 아님**에 "
+               "체크하세요. 여러 장 고른 뒤 아래 **변경 저장**을 눌러야 반영됩니다.")
+
+    if pending and fix_store is not None:
+        st.warning(f"저장하지 않은 변경 {len(pending)}건 — 저장해야 통계에 반영됩니다.",
+                   icon="✍️")
+    if fix_store is not None:
+        c1, c2 = st.columns([1, 4])
+        if c1.button("💾 변경 저장", type="primary", disabled=not pending,
+                     width="stretch"):
+            _save_theme_flags(fix_store, all_photos)
+        if c2.button("되돌리기(저장 안 함)", disabled=not pending):
+            st.session_state[_PENDING] = {}
+            st.rerun()
+
     for m in [m for m in months if mon_list.get(m)]:
         ph = by_month.get(m, [])
         with st.expander(f"{ym_label(m, multi_year=multi)} — "
@@ -1316,6 +1418,8 @@ def _theme_section(photos: list[dict], months: list[int]) -> None:
                         p["url_small"], width="stretch",
                         caption=f"{p['author']} · 👍{p['likes']} 💬{p['comments']}",
                     )
+                    if fix_store is not None:
+                        _theme_toggle(p, col, False)
 
     st.markdown("#### 테마 매트릭스")
     ch = heatmap(photos, months)
@@ -1330,8 +1434,57 @@ def _theme_section(photos: list[dict], months: list[int]) -> None:
     if parts:
         st.dataframe(_ranking_df(parts, "테마사진"), hide_index=True, width="stretch")
 
+    # 해제한 사진은 접어 둔다 — 잘못 눌렀으면 여기서 체크를 풀어 되돌린다.
+    hidden = [p for p in all_photos if str(p.get("id")) in excluded_ids]
+    if hidden:
+        with st.expander(f"🚫 테마 아님으로 표시한 사진 {len(hidden)}장"):
+            st.caption("체크를 풀고 **변경 저장**을 누르면 다시 테마사진으로 셉니다.")
+            for i in range(0, len(hidden), 5):
+                for col, p in zip(st.columns(5), hidden[i:i + 5]):
+                    col.image(p["url_small"], width="stretch",
+                              caption=f"{p['author']} · 💬{p['comments']}")
+                    if fix_store is not None:
+                        _theme_toggle(p, col, True)
 
-def _tab_categories(posts: list[dict], months: list[int]) -> None:
+
+def _save_theme_flags(fix_store, all_photos: list[dict]) -> None:
+    pending = st.session_state.get(_PENDING) or {}
+    if not pending:
+        return
+    authors = {str(p.get("id")): p.get("author", "") for p in all_photos}
+    try:
+        n = fix_store.save_photo_flags(pending, authors)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"저장하지 못했습니다: {e}")
+        return
+    st.session_state[_PENDING] = {}
+    _rebuild_analysis()
+    st.toast(f"{n}건 저장했습니다.", icon="✅")
+    st.rerun()
+
+
+def _rebuild_analysis() -> None:
+    """시트를 다시 읽지 않고 분석만 다시 조립한다.
+
+    raw는 수천 행이라 매번 읽으면 체크 한 번에 몇 초가 걸린다. 세션에 캐시해
+    둔 raw로 `build_analysis`만 돌리면 제출 인원·참여자·테마사진 수가 갱신된다.
+    """
+    raw = st.session_state.get("_raw")
+    stores = st.session_state.get("_stores")
+    if raw is None or not stores:
+        st.session_state.pop("_analysis", None)      # 캐시가 없으면 다시 읽는다
+        return
+    try:
+        corrections = stores[1].load()
+    except Exception:  # noqa: BLE001
+        st.session_state.pop("_analysis", None)
+        return
+    analysis = build_analysis(raw, corrections)
+    analysis["pending"] = st.session_state.get("_analysis", {}).get("pending", {})
+    st.session_state["_analysis"] = analysis
+
+
+def _category_section(posts: list[dict], months: list[int]) -> None:
     st.caption("출사 공지(cat=A) 제목의 [카테고리] 태그 기준. 출사: 인물(1:1인물·1:1인물출사 포함)·인물&풍경·풍경·GN / 활동: 보정·문화.")
     rows = category_counts(posts)
     if not rows:
@@ -1354,10 +1507,6 @@ def _tab_categories(posts: list[dict], months: list[int]) -> None:
     st.caption("출사일 기준 집계." + (f" 제외: {', '.join(notes)}." if notes else ""))
 
     st.markdown("#### 기간 전체 분포")
-    st.altair_chart(
-        hbar(rows, "카테고리", "개수", "카테고리별 공지 수", n=len(rows), scheme="teals"),
-        width="stretch",
-    )
     st.dataframe(
         pd.DataFrame(rows), hide_index=True, width="stretch",
         column_config={
@@ -1365,6 +1514,35 @@ def _tab_categories(posts: list[dict], months: list[int]) -> None:
                 "개수", min_value=0, max_value=max(r["개수"] for r in rows), format="%d"),
         },
     )
+
+    st.markdown("#### 카테고리별 작성자")
+    st.caption("누가 어떤 출사를 주로 여는지. 카테고리가 붙은 공지만 집계합니다.")
+    cross = category_author_ranking(posts)
+    if cross:
+        st.dataframe(_ranking_df(cross, "합계"), hide_index=True,
+                     width="stretch", height=320)
+    else:
+        st.caption("카테고리가 붙은 공지가 없습니다.")
+
+    st.markdown("#### 좋아요 통계")
+    st.caption("**공지 수를 함께 보세요** — 1건 쓰고 좋아요를 많이 받으면 "
+               "평균만으로는 1위가 됩니다.")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**카테고리별**")
+        cl = category_likes(posts)
+        if cl:
+            st.dataframe(pd.DataFrame(cl), hide_index=True, width="stretch")
+        else:
+            st.caption("집계할 공지가 없습니다.")
+    with c2:
+        st.markdown("**작성자별** (공지 2건 이상)")
+        al = author_likes(posts)
+        if al:
+            st.dataframe(pd.DataFrame(al), hide_index=True,
+                         width="stretch", height=320)
+        else:
+            st.caption("공지 2건 이상인 작성자가 없습니다.")
 
 
 def _raw_nick(m: dict) -> str:
@@ -1378,7 +1556,8 @@ def display_of(m: dict) -> str:
 
 def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
                   duplicates: set[str] | None = None,
-                  months: list[int] | None = None) -> None:
+                  months: list[int] | None = None,
+                  since_ym: int | None = None) -> None:
     """🧑‍🤝‍🧑 활성 멤버 현황 — 유령/휴면 분류, 신규 가입 추이, 동명이인 마킹."""
     if not members:
         st.info("멤버 정보가 없습니다. 사이드바의 **API 수집**으로 받아오면 이 탭이 채워집니다.")
@@ -1473,8 +1652,11 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
         st.caption("최근 3개월 안에 다들 한 번은 참석했습니다.")
 
     st.markdown("#### 신규 멤버 정착")
-    st.caption("가입 후 첫 참석까지 걸린 기간. **첫 참석이 비어 있으면 가입만 하고 아직 안 온 분**입니다.")
-    settle = newcomer_settling(members, posts)
+    st.caption("가입 후 첫 참석까지 걸린 기간. **첫 참석이 비어 있으면 가입만 하고 아직 안 온 분**입니다. "
+               "수집 기간보다 먼저 가입한 분은 첫 참석이 데이터 밖일 수 있어 제외합니다.")
+    settle, skipped = newcomer_settling(members, posts, since_ym)
+    if skipped:
+        st.caption(f"수집 기간 이전 가입 {skipped}명은 집계에서 제외했습니다.")
     if settle:
         arrived = [r for r in settle if r["가입→첫 참석(일)"] is not None]
         c1, c2 = st.columns(2)
@@ -1483,6 +1665,8 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
                   if arrived else "—")
         c2.metric("가입만 하고 미참석", f"{len(settle) - len(arrived)}명")
         st.dataframe(pd.DataFrame(settle), hide_index=True, width="stretch", height=280)
+    else:
+        st.caption("수집 기간 안에 가입한 멤버가 없습니다.")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1741,6 +1925,8 @@ def load_analysis(stores) -> dict | None:
         except Exception as e:  # noqa: BLE001
             st.error(f"구글 시트를 읽지 못했습니다: {e}")
             return None
+        # 테마 해제 후 시트를 다시 읽지 않고 재조립하려면 raw가 필요하다.
+        st.session_state["_raw"] = raw
         analysis["pending"] = seed_and_count(fix_store, raw, corrections, analysis)
     st.session_state["_analysis"] = analysis
     return analysis
@@ -1807,13 +1993,21 @@ def main() -> None:
     posts, photos = slice_period(analysis, *view)
     from core.store import relabel_names
     real = analysis.get("real_names")
+    # 테마 해제한 사진은 has_comment=False라 월별 미리보기에 안 나온다.
+    # 되돌리려면 해제된 id와 사진이 필요한데, **기간으로 자르면 안 된다** —
+    # 다른 기간에서 해제한 것을 되돌릴 수 없게 된다. "내가 뭘 숨겼나"는
+    # 기간별 뷰가 아니다.
+    st.session_state["_all_photos"] = relabel_names(analysis["photos"], real)
+    st.session_state["_theme_excluded"] = {
+        pid for pid, off in (analysis.get("photo_flags") or {}).items() if off}
     render_results(view[0], view[1],
                    relabel_names(posts, real), relabel_names(photos, real),
                    analysis["master"],
                    members=relabel_names(analysis["members"], real),
                    applied=analysis["applied"],
                    pending=analysis.get("pending"),
-                   correction_url=sheet_url(stores[1].file_id) if stores else None)
+                   correction_url=sheet_url(stores[1].file_id) if stores else None,
+                   fix_store=stores[1] if stores else None)
 
 
 

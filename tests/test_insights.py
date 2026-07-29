@@ -138,7 +138,19 @@ def test_pair_row_shows_each_persons_total():
     posts = [notice("n1", "2026-03-01", ["나무", "바다"]),
              notice("n2", "2026-03-08", ["나무"])]
     row = co_attendance(posts)[0]
-    assert row["나무"] == 2 and row["바다"] == 1
+    assert row["나무 참석"] == 2 and row["바다 참석"] == 1
+
+
+def test_ratio_is_reported_from_both_sides():
+    """"8번 함께"가 한쪽에겐 대부분이고 다른 쪽에겐 일부일 수 있다."""
+    posts = [notice("n1", "2026-03-01", ["나무", "바다"]),
+             notice("n2", "2026-03-08", ["바다"]),
+             notice("n3", "2026-03-15", ["바다"]),
+             notice("n4", "2026-03-22", ["바다"])]
+    row = co_attendance(posts)[0]
+    assert row["함께"] == 1
+    assert row["나무 기준"] == 100.0        # 나무는 한 번 갔고 그게 바다와 함께
+    assert row["바다 기준"] == 25.0         # 바다는 네 번 중 한 번
 
 
 def test_duplicate_name_in_one_outing_does_not_pair_with_itself():
@@ -180,23 +192,102 @@ def test_dormant_needs_attendance_history_to_report_anything():
 
 def test_days_from_joining_to_first_attendance():
     posts = [notice("n1", "2026-03-11", ["나무"])]
-    got = newcomer_settling([member("m1", "나무", datetime(2026, 3, 1))], posts)
-    assert got[0]["가입→첫 참석(일)"] == 10
+    rows, _ = newcomer_settling([member("m1", "나무", datetime(2026, 3, 1))], posts)
+    assert rows[0]["가입→첫 참석(일)"] == 10
+
+
+def test_members_who_joined_before_the_collected_period_are_excluded():
+    """수집 전에 가입한 사람은 첫 참석이 데이터 밖일 수 있어 "N일 만에"가 거짓이다."""
+    members = [member("m1", "고참", datetime(2024, 5, 1)),
+               member("m2", "신입", datetime(2026, 3, 1))]
+    rows, skipped = newcomer_settling(members, [], since_ym=202601)
+    assert [r["멤버"] for r in rows] == ["신입"]
+    assert skipped == 1                     # 조용히 빠지면 명단이 틀린 것처럼 보인다
+
+
+def test_without_a_period_nobody_is_excluded():
+    rows, skipped = newcomer_settling(
+        [member("m1", "고참", datetime(2024, 5, 1))], [])
+    assert len(rows) == 1 and skipped == 0
 
 
 def test_member_who_never_came_has_no_first_attendance():
     """이 값이 비어 있는 사람 수가 곧 유입의 질이다."""
-    got = newcomer_settling([member("m1", "신입", datetime(2026, 3, 1))], [])
-    assert got[0]["첫 참석"] is None
-    assert got[0]["가입→첫 참석(일)"] is None
+    rows, _ = newcomer_settling([member("m1", "신입", datetime(2026, 3, 1))], [])
+    assert rows[0]["첫 참석"] is None
+    assert rows[0]["가입→첫 참석(일)"] is None
 
 
 def test_attendance_before_joining_date_is_not_reported_as_negative():
     """닉네임 재사용·가입일 보정 등으로 뒤집힐 수 있다 — 음수 일수는 무의미하다."""
     posts = [notice("n1", "2026-02-01", ["나무"])]
-    got = newcomer_settling([member("m1", "나무", datetime(2026, 3, 1))], posts)
-    assert got[0]["가입→첫 참석(일)"] is None
+    rows, _ = newcomer_settling([member("m1", "나무", datetime(2026, 3, 1))], posts)
+    assert rows[0]["가입→첫 참석(일)"] is None
 
 
 def test_member_without_a_join_date_is_skipped():
-    assert newcomer_settling([member("m1", "나무", None)], []) == []
+    rows, _ = newcomer_settling([member("m1", "나무", None)], [])
+    assert rows == []
+
+
+# ═══════════════════════════════════════════════════════════════
+# 테마사진 보정 — has_comment가 단일 게이트라는 전제가 실제로 성립하는가
+#
+# 여기가 이번 작업의 핵심이다. 한 곳만 뒤집어도 KPI·월별 추이·업로더 비율·
+# 매트릭스·참여자 순위가 전부 따라와야 한다. 한 군데라도 안 따라오면
+# 화면마다 다른 숫자를 말하게 된다.
+# ═══════════════════════════════════════════════════════════════
+
+def themed(pid, author="나무", posted=None, comments=2):
+    return {"id": pid, "author": author, "wid": "w1",
+            "posted_at": posted or datetime(2026, 3, 5),
+            "likes": 3, "comments": comments, "has_comment": comments > 0,
+            "url_large": "", "url_medium": "", "url_small": "", "url_thumb": ""}
+
+
+def test_unmarking_flows_into_every_theme_aggregation():
+    from core.store import apply_photo_corrections
+    from streamlit_app import (compute_kpis, monthly_table, photo_user_ranking,
+                               theme_matrix, theme_participant_ranking)
+
+    photos = [themed("p1"), themed("p2")]
+    before = compute_kpis([], photos)["테마 예상"]
+    assert before == 2
+
+    apply_photo_corrections(photos, {"photos": {"p1": True}})
+
+    assert compute_kpis([], photos)["테마 예상"] == 1
+    assert monthly_table([], photos)["테마사진 참가"][202603] == 1
+    assert photo_user_ranking(photos)[0]["테마예상"] == 1
+    assert theme_matrix(photos, [202603])[2].get(202603) == 1     # 참여 인원
+    assert theme_participant_ranking(photos)[0]["테마사진"] == 1
+
+
+def test_restoring_returns_the_exact_original_numbers():
+    """되돌리기가 정확히 복귀하지 않으면 사용자는 실수를 되돌릴 수 없다."""
+    from core.store import apply_photo_corrections
+    from streamlit_app import compute_kpis
+
+    def fresh():
+        return [themed("p1"), themed("p2")]
+
+    original = compute_kpis([], fresh())
+    photos = fresh()
+    apply_photo_corrections(photos, {"photos": {"p1": True}})
+    restored = fresh()
+    apply_photo_corrections(restored, {"photos": {"p1": False}})
+    assert compute_kpis([], restored) == original
+
+
+def test_marking_a_photo_that_was_never_themed_changes_nothing():
+    from core.store import apply_photo_corrections
+    photos = [themed("p1", comments=0)]
+    assert apply_photo_corrections(photos, {"photos": {"p1": True}}) == 0
+    assert photos[0]["has_comment"] is False
+
+
+def test_no_flags_means_no_work():
+    from core.store import apply_photo_corrections
+    photos = [themed("p1")]
+    assert apply_photo_corrections(photos, {}) == 0
+    assert photos[0]["has_comment"] is True

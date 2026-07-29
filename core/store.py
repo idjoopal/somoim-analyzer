@@ -35,7 +35,7 @@ CORRECTION_TITLE = "다감노_보정"
 TAB_POSTS = "게시글"
 TAB_PHOTOS = "사진"
 TAB_MEMBERS = "멤버"
-TAB_BANNED = "탈퇴멤버"
+TAB_BANNED = "강퇴멤버"      # ban=Y — 자발적으로 나간 사람은 목록에 아예 없다
 TAB_JOIN_ALIASES = "가입인사매핑"
 TAB_HISTORY = "_수집이력"
 TAB_FIELDS = "_원본필드"
@@ -46,13 +46,15 @@ TAB_MEMBER_NAMES = "이름매핑1"      # ① 멤버 실명 — 나머지 보정
 TAB_NAME_MAP = "후기이름매핑"        # ② 실명으로도 안 풀린 나머지
 TAB_POST_FIX = "공지보정"
 TAB_ATTENDEE_FIX = "참석자보정"
+TAB_PHOTO_FIX = "테마사진보정"      # 테마사진 추정을 사람이 뒤집는 곳
 TAB_GUIDE = "_사용법"
 CORRECTION_TABS = [TAB_GUIDE, TAB_MEMBER_NAMES, TAB_NAME_MAP,
-                   TAB_POST_FIX, TAB_ATTENDEE_FIX]
+                   TAB_POST_FIX, TAB_ATTENDEE_FIX, TAB_PHOTO_FIX]
 
-# 이름이 바뀌기 전의 탭. 사람이 채워 둔 값을 살리려면 새로 만들지 말고
-# 이름만 갈아 끼워야 한다 (`CorrectionStore.ensure`).
+# 이름이 바뀌기 전의 탭. 쌓인 값을 살리려면 새로 만들지 말고 이름만 갈아
+# 끼워야 한다 (`CorrectionStore.ensure` · `RawStore.ensure`).
 LEGACY_NAME_MAP = "이름매핑"
+LEGACY_BANNED = "탈퇴멤버"      # ban=Y는 강퇴다 — 이름이 뜻을 잘못 말하고 있었다
 
 # ── 컬럼 (헤더 행 = 이 순서) ──
 POST_KEYS = [
@@ -72,6 +74,7 @@ MEMBER_NAME_COLS = ["멤버 id", "닉네임", "실명", "비고"]
 NAME_MAP_COLS = ["이름토큰", "처리", "빈도", "비고"]
 POST_FIX_COLS = ["공지 id", "제목", "카테고리", "출사일", "취소", "제외", "비고"]
 ATTENDEE_FIX_COLS = ["후기 id", "제목", "참석자", "비고"]
+PHOTO_FIX_COLS = ["사진 id", "작성자", "테마아님", "비고"]
 
 # 탭 → 헤더. `ensure`와 `seed`가 같은 정의를 봐야 한다 — 헤더 없는 탭에 행을
 # 붙이면 다음 읽기에서 첫 행이 헤더로 오인돼 그 항목이 매번 다시 추가된다.
@@ -80,6 +83,7 @@ CORRECTION_COLS = {
     TAB_NAME_MAP: NAME_MAP_COLS,
     TAB_POST_FIX: POST_FIX_COLS,
     TAB_ATTENDEE_FIX: ATTENDEE_FIX_COLS,
+    TAB_PHOTO_FIX: PHOTO_FIX_COLS,
 }
 
 _BOOL_KEYS = {"is_outing", "is_canceled", "needs_review", "has_comment",
@@ -240,8 +244,9 @@ def upsert(existing: list[dict], incoming: list[dict], key: str = "id") -> list[
 # ═══════════════════════════════════════════════════════════════
 
 def parse_corrections(name_rows: list[list], post_rows: list[list],
-                      att_rows: list[list]) -> dict:
-    """보정 시트 3개 탭 → 적용 가능한 dict.
+                      att_rows: list[list],
+                      photo_rows: Optional[list[list]] = None) -> dict:
+    """보정 시트 탭들 → 적용 가능한 dict.
 
     사람이 손으로 채우는 시트라 빈칸·공백이 섞인다. **값이 비어 있는 행은
     "아직 보정 안 함"으로 보고 무시**한다(빈 문자열로 덮어쓰지 않는다).
@@ -279,7 +284,40 @@ def parse_corrections(name_rows: list[list], post_rows: list[list],
         if rid and raw:
             attendees[rid] = [n.strip() for n in raw.split(",") if n.strip()]
 
-    return {"names": names, "posts": posts, "attendees": attendees}
+    return {"names": names, "posts": posts, "attendees": attendees,
+            "photos": parse_photo_flags(photo_rows)}
+
+
+def parse_photo_flags(rows: Optional[list[list]]) -> dict[str, bool]:
+    """`테마사진보정` → `{사진 id: 테마아님}`.
+
+    `FALSE`로 되돌린 행도 담는다 — "해제했다가 취소했다"는 사실 자체가 기록이고,
+    행을 지우는 것보다 되돌리기가 명확하다.
+    """
+    out: dict[str, bool] = {}
+    for r in rows_to_records(rows or []):
+        pid = _clean(r.get("사진 id"))
+        if pid:
+            out[pid] = coerce_bool(r.get("테마아님"))
+    return out
+
+
+def apply_photo_corrections(photos: list[dict], corrections: dict) -> int:
+    """테마사진 추정을 사람이 뒤집은 대로 반영. 뒤집은 건수를 반환.
+
+    `has_comment`가 KPI·월별 추이·업로더 테마비율·매트릭스·참여자 순위의
+    **단일 게이트**라, 여기 한 곳만 바꾸면 전부 따라온다. photos는 제자리에서
+    수정된다(`build_analysis`가 이미 사본을 넘긴다).
+    """
+    flags = corrections.get("photos") or {}
+    if not flags:
+        return 0
+    n = 0
+    for p in photos:
+        if flags.get(str(p.get("id"))) and p.get("has_comment"):
+            p["has_comment"] = False
+            n += 1
+    return n
 
 
 def _clean(v) -> str:
@@ -409,10 +447,10 @@ GUIDE_ROWS: list[list[str]] = [
     ["  · '멤버 id'는 고치지 마세요 — 닉네임이 바뀌어도 이 값으로 같은 사람을 따라갑니다"],
     [""],
     ["■ ② 후기이름매핑 — 실명 명단으로도 안 풀린 나머지"],
-    ["  ①을 채우고 나면 여기 남는 것은 오타·탈퇴자·이름이 아닌 것들입니다."],
+    ["  ①을 채우고 나면 여기 남는 것은 오타·나간 멤버·이름이 아닌 것들입니다."],
     ["  '처리' 칸에 셋 중 하나를 넣습니다 (드롭다운에서 고르세요)."],
     ["  · 마스터 닉네임    같은 사람의 다른 표기일 때. 멤버 명단에 있는 닉네임 그대로"],
-    [f"  · {LEFT_MEMBER}         탈퇴한 멤버. 집계에서 빠집니다. \"탈퇴\"라고 써도 됩니다"],
+    [f"  · {LEFT_MEMBER}         나간 멤버(탈퇴·강퇴). 집계에서 빠집니다. \"탈퇴\"·\"강퇴\"도 됩니다"],
     [f"  · {NOT_A_NAME}         이름이 아님(조사·오탈자 등). \"노이즈\"·\"❌\"도 됩니다"],
     ["  목록에 없는 새 닉네임도 직접 입력할 수 있습니다(경고만 뜹니다)."],
     [""],
@@ -428,6 +466,12 @@ GUIDE_ROWS: list[list[str]] = [
     ["  · 참석자     쉼표로 구분한 닉네임. 예: 원석사진, 나무, 바다"],
     ["  · 여기에 적으면 본문에서 뽑은 결과를 통째로 대체합니다(더하지 않습니다)."],
     ["  · 작성자도 참석했다면 작성자 닉네임을 함께 적어 주세요."],
+    [""],
+    ["■ ⑤ 테마사진보정 — 댓글이 달렸지만 테마사진이 아닌 사진"],
+    ["  이 탭은 **앱에서 채웁니다.** 📷 사진 탭 > 🎨 테마사진에서 사진을 보고"],
+    ["  '테마 아님'에 체크한 뒤 [변경 저장]을 누르면 여기에 기록됩니다."],
+    ["  · 테마아님   TRUE면 테마사진에서 뺍니다. FALSE로 되돌리면 다시 셉니다"],
+    ["  · 손으로 고쳐도 되지만, 앱에서 사진을 보며 하는 편이 훨씬 쉽습니다"],
     [""],
     ["■ 작업 순서"],
     ["  1. 앱에서 수집  → 앱이 채울 후보 행을 이 시트에 추가"],
@@ -451,7 +495,7 @@ HEADER_NOTES: dict[str, dict[int, str]] = {
     },
     TAB_NAME_MAP: {
         0: "후기 본문에서 나온 이름 표기. 보정을 붙이는 열쇠이므로 고치지 마세요.",
-        1: f"마스터 닉네임 / {LEFT_MEMBER}(탈퇴) / {NOT_A_NAME}(이름 아님) 중 하나.\n"
+        1: f"마스터 닉네임 / {LEFT_MEMBER}(탈퇴·강퇴) / {NOT_A_NAME}(이름 아님) 중 하나.\n"
            "비워 두면 '아직 보정 안 함'으로 봅니다.",
         2: "이 표기가 나온 횟수. 앱이 채운 참고값입니다.",
         3: "자유 메모. 앱은 읽지 않습니다.",
@@ -465,6 +509,13 @@ HEADER_NOTES: dict[str, dict[int, str]] = {
         4: "출사가 취소됐으면 TRUE.",
         5: "출사 공지가 아니거나 집계에서 빼야 하면 TRUE.",
         6: "자유 메모. 앱은 읽지 않습니다.",
+    },
+    TAB_PHOTO_FIX: {
+        0: "사진 id. 앱이 채웁니다 — 고치지 마세요.",
+        1: "업로더. 앱이 채운 참고값입니다.",
+        2: "TRUE면 테마사진에서 뺍니다. FALSE로 되돌리면 다시 셉니다.\n"
+           "📷 사진 탭에서 사진을 보며 체크하는 편이 쉽습니다.",
+        3: "자유 메모. 앱은 읽지 않습니다.",
     },
     TAB_ATTENDEE_FIX: {
         0: "후기 게시글 id. 보정을 붙이는 열쇠이므로 고치지 마세요.",
@@ -617,6 +668,7 @@ def resolution_from_corrections(corrections: dict) -> dict[str, str]:
     """
     alias = {
         "탈퇴": LEFT_MEMBER, "탈퇴멤버": LEFT_MEMBER, "left": LEFT_MEMBER,
+        "강퇴": LEFT_MEMBER, "강퇴멤버": LEFT_MEMBER,
         "노이즈": NOT_A_NAME, "이름아님": NOT_A_NAME, "noise": NOT_A_NAME,
         "x": NOT_A_NAME, "❌": NOT_A_NAME,
     }
@@ -637,7 +689,19 @@ class RawStore:
         self.c, self.file_id = client, file_id
 
     def ensure(self) -> None:
+        self.migrate()
         self.c.ensure_tabs(self.file_id, RAW_TABS)
+
+    def migrate(self) -> None:
+        """`탈퇴멤버` → `강퇴멤버`. 탭 이름만 갈아 끼워 쌓인 값을 살린다.
+
+        `ensure_tabs`보다 **먼저** 돌아야 한다. 순서가 뒤집히면 빈 `강퇴멤버`가
+        먼저 생겨 이름 변경이 건너뛰어지고, 기존 명단이 옛 탭에 고립된다.
+        """
+        try:
+            self.c.rename_tab(self.file_id, LEGACY_BANNED, TAB_BANNED)
+        except Exception:  # noqa: BLE001 — 이관 실패가 수집을 막아서는 안 된다
+            pass
 
     def load(self) -> dict:
         return {
@@ -780,6 +844,7 @@ class CorrectionStore:
             self.c.read(self.file_id, TAB_NAME_MAP),
             self.c.read(self.file_id, TAB_POST_FIX),
             self.c.read(self.file_id, TAB_ATTENDEE_FIX),
+            self.c.read(self.file_id, TAB_PHOTO_FIX),
         )
         out["member_names"] = parse_member_names(
             self.c.read(self.file_id, TAB_MEMBER_NAMES))
@@ -808,6 +873,40 @@ class CorrectionStore:
         if master_names:
             self.write_guide(master_names)
         return added
+
+    def save_photo_flags(self, flags: dict[str, bool],
+                         authors: Optional[dict] = None) -> int:
+        """테마사진 해제 여부를 저장. 바뀐 건수를 반환.
+
+        **이 탭만 앱이 사람의 판단을 대신 적는다.** 사진 한 장의 체크박스를
+        시트에서 직접 찾아 켜라고 할 수는 없어서다. 그래도 다른 보정과 같은
+        규칙을 지킨다 — 사용자가 건드린 id의 행만 바꾸고 나머지는 그대로 둔다.
+
+        읽고 병합해 통째로 다시 쓴다. 해제한 사진만 행이 생기므로 작은 탭이다.
+        """
+        if not flags:
+            return 0
+        rows = self.c.read(self.file_id, TAB_PHOTO_FIX)
+        existing = rows_to_records(rows)
+        by_id = {_clean(r.get("사진 id")): r for r in existing if _clean(r.get("사진 id"))}
+        authors = authors or {}
+        changed = 0
+        for pid, not_theme in flags.items():
+            pid = _clean(pid)
+            if not pid:
+                continue
+            cur = by_id.get(pid)
+            if cur is None:
+                by_id[pid] = {"사진 id": pid, "작성자": authors.get(pid, ""),
+                              "테마아님": bool(not_theme), "비고": ""}
+                changed += 1
+            elif coerce_bool(cur.get("테마아님")) != bool(not_theme):
+                cur["테마아님"] = bool(not_theme)
+                changed += 1
+        if changed:
+            self.c.write(self.file_id, TAB_PHOTO_FIX,
+                         records_to_rows(list(by_id.values()), PHOTO_FIX_COLS))
+        return changed
 
     def pending_count(self) -> dict[str, int]:
         """탭별 미기입 행 수 — 사이드바 안내용.
