@@ -187,7 +187,13 @@ def test_existing_data_renders_without_collecting():
     """수집 버튼을 누르지 않아도 시트에 있는 데이터로 바로 결과가 떠야 한다."""
     at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
     assert not at.exception, [str(e) for e in at.exception]
-    assert len(at.tabs) >= 10
+    labels = [t.label for t in at.tabs]
+    assert "📊 개요" in labels and "👥 참석" in labels
+    # 탭 개수가 아니라 **이름**을 본다 — 개수만 세면 탭을 합치거나 나눌 때마다
+    # 무의미하게 깨지고, 정작 탭이 사라진 것은 못 잡는다.
+    assert "📋 데이터" not in labels          # 구글 시트로 대체됨
+    assert "🎨 테마사진" not in labels        # 📷 사진에 합침
+    assert "👤 사용자" not in labels          # 📊 개요에 흡수
 
 
 def test_multi_year_range_renders():

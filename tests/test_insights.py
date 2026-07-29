@@ -1,0 +1,203 @@
+"""인사이트 집계 테스트 — 순수 함수라 네트워크·Streamlit 무관.
+
+**신뢰도 카운트가 가장 중요하다.** 이 숫자가 틀리면 사용자는 "다 채웠다"고
+믿고 덜 채워진 결과를 그대로 읽게 된다.
+"""
+
+from datetime import date, datetime
+
+from streamlit_app import (
+    avg_attendance_trend,
+    co_attendance,
+    confidence_report,
+    dormant_members,
+    newcomer_settling,
+)
+
+
+def notice(pid, outing_date="2026-03-07", attendees=None, held=True, **kw):
+    base = {
+        "id": pid, "cat": "A", "author": "닉", "title": f"[풍경] {pid}",
+        "outing_date": outing_date, "posted_at": datetime(2026, 3, 1),
+        "category": "풍경", "is_outing": True, "is_canceled": False,
+        "actually_held": held, "attendees": attendees or [],
+        "needs_review": False,
+    }
+    base.update(kw)
+    return base
+
+
+def review(pid, attendees=None, matched="n1", **kw):
+    base = {
+        "id": pid, "cat": "E", "author": "닉", "title": f"후기 {pid}",
+        "posted_at": datetime(2026, 3, 8), "attendees": attendees or [],
+        "matched_outing_id": matched, "attendees_needs_review": False,
+    }
+    base.update(kw)
+    return base
+
+
+def member(mid, mn, joined=None, **kw):
+    return {"mid": mid, "mn": mn, "joined_at": joined, "last_visit": None,
+            "is_admin": False, "os": "", "push": False, **kw}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 신뢰도 — 진짜 없는 것과 아직 안 채운 것을 구분한다
+# ═══════════════════════════════════════════════════════════════
+
+def _by_item(rows):
+    return {r["항목"]: r["건수"] for r in rows}
+
+
+def test_clean_data_reports_nothing_pending():
+    rows = confidence_report(
+        [notice("n1", attendees=["나무"]), review("r1", attendees=["나무"])],
+        [member("m1", "나무")], {"나무": "김나무"})
+    assert all(r["건수"] == 0 for r in rows)
+
+
+def test_counts_each_kind_of_gap():
+    posts = [
+        notice("n1", outing_date=None),                  # 출사일 미상
+        notice("n2", needs_review=True),                 # 검토 대상
+        review("r1", attendees=[]),                      # 참석자 못 뽑음
+        review("r2", attendees=["나무"], matched=None),   # 고아 후기
+    ]
+    got = _by_item(confidence_report(posts, [member("m1", "나무")], {}))
+    assert got["출사일 미상 공지"] == 1
+    assert got["분류 검토 대상 공지"] == 1
+    assert got["참석자 못 뽑은 후기"] == 1
+    assert got["공지와 안 이어진 후기"] == 1
+    assert got["실명 미기입 멤버"] == 1
+
+
+def test_review_flagged_for_correction_counts_even_with_names():
+    """참석자가 있어도 검토 표시가 있으면 아직 확정된 게 아니다."""
+    posts = [review("r1", attendees=["나무"], attendees_needs_review=True)]
+    assert _by_item(confidence_report(posts, [], {}))["참석자 못 뽑은 후기"] == 1
+
+
+def test_filled_real_names_drop_out_of_the_count():
+    """`real_names`는 앱에서 닉네임 키로 온다 (`real_by_nickname`)."""
+    members = [member("m1", "나무"), member("m2", "바다")]
+    assert _by_item(confidence_report([], members, {"나무": "김나무"}))["실명 미기입 멤버"] == 1
+
+
+def test_every_row_says_where_to_fix_it():
+    """숫자만 보여 주고 어디를 채우라는 말이 없으면 쓸모가 없다."""
+    for r in confidence_report([], [], {}):
+        assert r["어디서"] and r["설명"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 출사당 평균 참석 인원
+# ═══════════════════════════════════════════════════════════════
+
+def test_average_counts_outings_with_nobody_listed():
+    """참석자를 못 뽑은 출사를 빼면 모임 규모가 실제보다 부풀려진다."""
+    posts = [notice("n1", "2026-03-01", ["a", "b", "c", "d"]),
+             notice("n2", "2026-03-08", [])]
+    assert avg_attendance_trend(posts, [202603])[202603] == 2.0
+
+
+def test_month_without_outings_is_none_not_zero():
+    """0으로 그리면 '아무도 안 왔다'로 읽힌다 — 출사가 없던 것과 다르다."""
+    got = avg_attendance_trend([notice("n1", "2026-03-01", ["a"])], [202602, 202603])
+    assert got[202602] is None
+    assert got[202603] == 1.0
+
+
+def test_unmatched_outings_are_excluded_from_the_average():
+    posts = [notice("n1", "2026-03-01", ["a", "b"]),
+             notice("n2", "2026-03-08", [], held=False)]
+    assert avg_attendance_trend(posts, [202603])[202603] == 2.0
+
+
+def test_average_ignores_outings_outside_the_axis():
+    got = avg_attendance_trend([notice("n1", "2025-01-05", ["a"])], [202603])
+    assert got == {202603: None}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 함께 간 사람
+# ═══════════════════════════════════════════════════════════════
+
+def test_pairs_are_symmetric_and_counted_once():
+    posts = [notice("n1", "2026-03-01", ["나무", "바다"]),
+             notice("n2", "2026-03-08", ["바다", "나무"])]   # 순서만 다름
+    rows = co_attendance(posts)
+    assert len(rows) == 1
+    assert rows[0]["함께"] == 2
+
+
+def test_solo_outing_makes_no_pair():
+    assert co_attendance([notice("n1", attendees=["나무"])]) == []
+
+
+def test_pair_row_shows_each_persons_total():
+    posts = [notice("n1", "2026-03-01", ["나무", "바다"]),
+             notice("n2", "2026-03-08", ["나무"])]
+    row = co_attendance(posts)[0]
+    assert row["나무"] == 2 and row["바다"] == 1
+
+
+def test_duplicate_name_in_one_outing_does_not_pair_with_itself():
+    rows = co_attendance([notice("n1", attendees=["나무", "나무", "바다"])])
+    assert len(rows) == 1 and rows[0]["함께"] == 1
+
+
+# ═══════════════════════════════════════════════════════════════
+# 이탈 조짐 — 유령 멤버(전 기간 0건)와 다르다
+# ═══════════════════════════════════════════════════════════════
+
+def test_recently_active_member_is_not_dormant():
+    posts = [notice("n1", "2026-03-01", ["나무"])]
+    assert dormant_members(posts, [member("m1", "나무")],
+                           as_of=date(2026, 3, 20)) == []
+
+
+def test_member_quiet_for_months_is_flagged():
+    posts = [notice("n1", "2026-01-05", ["나무"])]
+    got = dormant_members(posts, [member("m1", "나무")], as_of=date(2026, 6, 1))
+    assert [r["멤버"] for r in got] == ["나무"]
+
+
+def test_never_attended_member_is_not_called_dormant():
+    """한 번도 안 온 사람은 이탈이 아니라 미유입 — 가입 직후일 수도 있다."""
+    posts = [notice("n1", "2026-01-05", ["나무"])]
+    got = dormant_members(posts, [member("m1", "나무"), member("m2", "신입")],
+                          as_of=date(2026, 6, 1))
+    assert "신입" not in [r["멤버"] for r in got]
+
+
+def test_dormant_needs_attendance_history_to_report_anything():
+    assert dormant_members([], [member("m1", "나무")]) == []
+
+
+# ═══════════════════════════════════════════════════════════════
+# 신규 멤버 정착
+# ═══════════════════════════════════════════════════════════════
+
+def test_days_from_joining_to_first_attendance():
+    posts = [notice("n1", "2026-03-11", ["나무"])]
+    got = newcomer_settling([member("m1", "나무", datetime(2026, 3, 1))], posts)
+    assert got[0]["가입→첫 참석(일)"] == 10
+
+
+def test_member_who_never_came_has_no_first_attendance():
+    """이 값이 비어 있는 사람 수가 곧 유입의 질이다."""
+    got = newcomer_settling([member("m1", "신입", datetime(2026, 3, 1))], [])
+    assert got[0]["첫 참석"] is None
+    assert got[0]["가입→첫 참석(일)"] is None
+
+
+def test_attendance_before_joining_date_is_not_reported_as_negative():
+    """닉네임 재사용·가입일 보정 등으로 뒤집힐 수 있다 — 음수 일수는 무의미하다."""
+    posts = [notice("n1", "2026-02-01", ["나무"])]
+    got = newcomer_settling([member("m1", "나무", datetime(2026, 3, 1))], posts)
+    assert got[0]["가입→첫 참석(일)"] is None
+
+
+def test_member_without_a_join_date_is_skipped():
+    assert newcomer_settling([member("m1", "나무", None)], []) == []
