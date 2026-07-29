@@ -365,3 +365,19 @@ def test_hidden_theme_photos_are_reachable_regardless_of_period():
 
     ids = {str(p["id"]) for p in at.session_state["_all_photos"]}
     assert ids == {"p1", "p2", "p3"}, "기간 밖 사진이 빠지면 되돌릴 수 없다"
+
+
+def test_excel_export_is_hidden_while_the_builder_is_out_of_sync():
+    """엑셀이 화면과 다른 내용을 내보내면 어느 쪽이 맞는지 알 수 없게 된다.
+
+    숨긴 것이 실수가 아니라 결정이라는 것을 여기서 못 박는다. 엑셀을 화면에
+    맞춘 뒤 `SHOW_EXPORT = True`로 돌리면 이 테스트를 뒤집으면 된다.
+    """
+    import streamlit_app
+
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    assert not at.exception, [str(e) for e in at.exception]
+    assert streamlit_app.SHOW_EXPORT is False
+    labels = [b.label for b in at.sidebar.button] + \
+             [b.label for b in at.sidebar.download_button]
+    assert not any("엑셀" in x or "내보내기" in x for x in labels)
