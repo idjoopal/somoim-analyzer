@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import altair as alt
 import pandas as pd
@@ -466,6 +466,167 @@ def orphan_reviews(posts: list[dict]) -> list[dict]:
     return [p for p in posts if p.get("cat") == "E" and not p.get("matched_outing_id")]
 
 
+def activity_ranking(posts: list[dict], photos: list[dict]) -> list[dict]:
+    """작성자별 게시글·사진 종합. 글이나 사진이 1건이라도 있으면 포함."""
+    photo_cnt = {r["작성자"]: r["사진수"] for r in photo_user_ranking(photos)}
+    by_author = {r["작성자"]: r for r in top_posters(posts, n=max(len(posts), 1))}
+    rows = []
+    for author in set(by_author) | set(photo_cnt):
+        pr = by_author.get(author)
+        rows.append({
+            "작성자": author,
+            "게시글": pr["게시글"] if pr else 0,
+            "사진": photo_cnt.get(author, 0),
+            "공지": pr["공지"] if pr else 0,
+            "취소": pr["취소"] if pr else 0,
+            "후기": pr["후기"] if pr else 0,
+            "좋아요": pr["좋아요"] if pr else 0,
+        })
+    rows.sort(key=lambda x: (-x["게시글"], -x["사진"]))
+    return rows
+
+
+# ═══════════════════════════════════════════════════════════════
+# 신뢰도 — 이 숫자를 얼마나 믿어도 되나
+#
+# 본문이 잘려 들어오는 탓에 참석자·출사일이 비어 있는 경우가 있다. 그때
+# **진짜 없는 것과 아직 안 채운 것을 구분할 수 없으면** 결과를 잘못 읽는다.
+# 그래서 무엇이 얼마나 비어 있는지를 결과 화면 맨 앞에 세운다.
+# ═══════════════════════════════════════════════════════════════
+
+def confidence_report(posts: list[dict], members: list[dict] | None = None,
+                      real_names: dict | None = None) -> list[dict]:
+    """보정이 필요한 항목을 종류별로. 각 행은 `{항목, 건수, 어디서, 설명}`.
+
+    사이드바의 미기입 수와 **같은 판정**을 쓴다 — 두 곳이 다른 숫자를 말하면
+    사용자는 어느 쪽을 믿어야 할지 알 수 없다.
+    """
+    notices = [p for p in posts if p.get("cat") == "A"]
+    reviews = [p for p in posts if p.get("cat") == "E"]
+    members = members or []
+
+    no_date = [p for p in notices if not p.get("outing_date")]
+    flagged = [p for p in notices if p.get("needs_review")]
+    no_att = [p for p in reviews if p.get("attendees_needs_review")
+              or not p.get("attendees")]
+    orphans = orphan_reviews(posts)
+    # `real_names`는 `real_by_nickname` 결과 — **닉네임 키**다. 표시용으로 실명이
+    # 붙은 members가 올 수 있으므로 원래 닉네임으로 대조한다.
+    named = set(real_names or {})
+    no_real = [m for m in members if m.get("mn") and _raw_nick(m) not in named]
+
+    return [
+        {"항목": "실명 미기입 멤버", "건수": len(no_real), "어디서": "이름매핑1",
+         "설명": "실명을 채우면 후기 본문의 이름이 자동으로 멤버와 이어집니다"},
+        {"항목": "참석자 못 뽑은 후기", "건수": len(no_att), "어디서": "참석자보정",
+         "설명": "본문이 잘려 오면 뒤쪽 참석자가 통째로 빠집니다"},
+        {"항목": "출사일 미상 공지", "건수": len(no_date), "어디서": "공지보정",
+         "설명": "출사일이 없으면 월별 집계에서 빠집니다"},
+        {"항목": "분류 검토 대상 공지", "건수": len(flagged), "어디서": "공지보정",
+         "설명": "카테고리·출사일을 자동으로 확정하지 못한 공지"},
+        {"항목": "공지와 안 이어진 후기", "건수": len(orphans), "어디서": "—",
+         "설명": "짝이 될 출사 공지를 못 찾은 후기 (참석 집계에서 빠짐)"},
+    ]
+
+
+def avg_attendance_trend(posts: list[dict],
+                         months: list[int]) -> dict[int, float | None]:
+    """월별 **출사당 평균 참석 인원**. 출사가 없는 달은 None(0이 아니다).
+
+    참석자 0명인 출사도 분모에 넣는다 — 빼면 "인원이 적힌 출사"만 평균 내게
+    되어 모임 규모가 실제보다 부풀려진다.
+    """
+    per_month: dict[int, list[int]] = {m: [] for m in months}
+    for p in posts:
+        if p.get("cat") != "A" or not p.get("actually_held"):
+            continue
+        m = post_ym(p)
+        if m in per_month:
+            per_month[m].append(len(p.get("attendees") or []))
+    return {m: (round(sum(v) / len(v), 1) if v else None)
+            for m, v in per_month.items()}
+
+
+def co_attendance(posts: list[dict], top_n: int = 20) -> list[dict]:
+    """함께 간 횟수 상위 쌍. `{두 사람, 함께, ...}`.
+
+    쌍은 정렬해 담으므로 A-B와 B-A가 한 행으로 합쳐진다. 참석자가 한 명뿐인
+    출사에서는 쌍이 생기지 않는다.
+    """
+    pair: Counter = Counter()
+    solo: Counter = Counter()
+    for p in posts:
+        if p.get("cat") != "A" or not p.get("actually_held"):
+            continue
+        names = sorted({n for n in (p.get("attendees") or []) if n})
+        for n in names:
+            solo[n] += 1
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                pair[(a, b)] += 1
+    rows = []
+    for (a, b), n in pair.most_common(top_n):
+        rows.append({"두 사람": f"{a} · {b}", "함께": n,
+                     f"{a}": solo[a], f"{b}": solo[b]})
+    return rows
+
+
+def dormant_members(posts: list[dict], members: list[dict],
+                    as_of: date | None = None,
+                    quiet_months: int = 3) -> list[dict]:
+    """참석 이력이 있는데 최근 `quiet_months` 동안 조용한 멤버.
+
+    유령 멤버(전 기간 0건)와 다르다 — **활동하다 끊긴 사람**을 잡는 것이 목적이다.
+    한 번도 참석한 적 없는 사람은 여기 넣지 않는다(이탈이 아니라 미유입이고,
+    가입 직후라 아직 기회가 없었을 수도 있다).
+    """
+    _, last = member_first_seen(posts)
+    if not last:
+        return []
+    as_of = as_of or max(date.fromisoformat(d) for d in last.values())
+    cutoff = as_of - timedelta(days=int(quiet_months) * 30)
+
+    by_nick = {m.get("mn"): m for m in members or [] if m.get("mn")}
+    rows = []
+    for name, iso in last.items():
+        seen = date.fromisoformat(iso)
+        if seen > cutoff:
+            continue
+        m = by_nick.get(name) or {}
+        rows.append({
+            "멤버": name,
+            "마지막 참석": iso,
+            "쉰 기간(일)": (as_of - seen).days,
+            "마지막 방문": (m["last_visit"].strftime("%Y-%m-%d")
+                        if m.get("last_visit") else "—"),
+        })
+    return sorted(rows, key=lambda r: r["마지막 참석"])
+
+
+def newcomer_settling(members: list[dict], posts: list[dict]) -> list[dict]:
+    """가입 후 첫 참석까지 걸린 기간. 아직 안 온 사람은 `첫 참석`이 None.
+
+    가입만 하고 안 오는 비율이 곧 유입의 질이다.
+    """
+    first, _ = member_first_seen(posts)
+    rows = []
+    for m in members or []:
+        nick, joined = m.get("mn"), m.get("joined_at")
+        if not nick or not joined:
+            continue
+        iso = first.get(nick)
+        days = None
+        if iso:
+            days = (date.fromisoformat(iso) - joined.date()).days
+        rows.append({
+            "멤버": nick,
+            "가입일": joined.strftime("%Y-%m-%d"),
+            "첫 참석": iso,
+            "가입→첫 참석(일)": days if days is not None and days >= 0 else None,
+        })
+    return sorted(rows, key=lambda r: r["가입일"], reverse=True)
+
+
 
 # ═══════════════════════════════════════════════════════════════
 # Altair 차트
@@ -775,11 +936,12 @@ def _ranking_df(rows: list[dict], count_col: str) -> pd.DataFrame:
 def render_results(start_ym: int, end_ym: int, posts: list[dict],
                    photos: list[dict], master: dict,
                    members: list[dict] | None = None,
-                   applied: dict[str, int] | None = None) -> None:
+                   applied: dict[str, int] | None = None,
+                   real_names: dict | None = None,
+                   correction_url: str | None = None) -> None:
     period = period_label(start_ym, end_ym)
     months = month_axis(start_ym, end_ym)
     st.subheader(f"{period} 인사이트")
-    render_basis_box(posts, photos, period)
 
     kpis = compute_kpis(posts, photos)
     for col, (label, val) in zip(st.columns(len(kpis)), kpis.items()):
@@ -788,55 +950,75 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
     if applied and any(applied.values()):
         st.caption(f"📕 보정 시트 적용 — 공지 {applied.get('공지', 0)}건 · "
                    f"참석자 {applied.get('참석자', 0)}건")
+    render_basis_box(posts, photos, period)
 
-    master_names = master.get("names") if isinstance(master, dict) else (master or set())
     duplicates = master.get("duplicates") if isinstance(master, dict) else set()
 
     tabs = st.tabs(
-        ["📊 개요", "📌 출사", "📝 후기", "👥 참석", "📷 사진", "🎨 테마사진",
-         "🏷️ 카테고리", "👤 사용자", "🧑‍🤝‍🧑 멤버", "📋 데이터"]
+        ["📊 개요", "📌 출사", "👥 참석", "📝 후기", "📷 사진",
+         "🏷️ 카테고리", "🧑‍🤝‍🧑 멤버"]
     )
 
     with tabs[0]:
-        _tab_overview(posts, photos, months)
+        _tab_overview(posts, photos, months, members or [], real_names,
+                      correction_url)
     with tabs[1]:
         _tab_outings(posts, months)
     with tabs[2]:
-        _tab_reviews(posts, months)
+        _tab_attendance(posts, months)
     with tabs[3]:
-        _tab_attendance(posts, master_names or set(), months)
+        _tab_reviews(posts, months)
     with tabs[4]:
         _tab_photos(photos, months)
     with tabs[5]:
-        _tab_theme(photos, months)
-    with tabs[6]:
         _tab_categories(posts, months)
-    with tabs[7]:
-        _tab_users(posts, photos)
-    with tabs[8]:
+    with tabs[6]:
         _tab_members(members or [], posts, photos, duplicates or set(), months)
-    with tabs[9]:
-        _tab_data(posts, photos)
 
 
-def _tab_overview(posts: list[dict], photos: list[dict], months: list[int]) -> None:
+def render_confidence(posts: list[dict], members: list[dict],
+                      real_names: dict | None,
+                      correction_url: str | None = None) -> None:
+    """이 숫자를 얼마나 믿어도 되는지 — 결과 화면의 맨 앞.
+
+    본문이 잘려 들어오는 탓에 참석자가 비어 있을 수 있다. **진짜 없는 것과
+    아직 안 채운 것을 구분할 수 없으면** 결과를 잘못 읽는다.
+    """
+    rows = confidence_report(posts, members, real_names)
+    pending = [r for r in rows if r["건수"]]
+    if not pending:
+        st.success("보정이 필요한 항목이 없습니다. 아래 숫자를 그대로 보셔도 됩니다.", icon="✅")
+        return
+
+    st.warning(
+        f"**보정이 필요한 항목 {sum(r['건수'] for r in pending)}건** — "
+        "아래 숫자는 이만큼 덜 채워진 상태입니다.", icon="🎯")
+    cols = st.columns(min(len(pending), 5))
+    for col, r in zip(cols, pending):
+        col.metric(r["항목"], r["건수"], help=f"{r['설명']}\n\n→ {r['어디서']}")
+    with st.expander("무엇을 어디서 채우면 되나"):
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        if correction_url:
+            st.link_button("📕 보정 시트 열기", correction_url, width="stretch")
+
+
+def _tab_overview(posts: list[dict], photos: list[dict], months: list[int],
+                  members: list[dict] | None = None,
+                  real_names: dict | None = None,
+                  correction_url: str | None = None) -> None:
+    render_confidence(posts, members or [], real_names, correction_url)
+    st.divider()
+
     k = compute_kpis(posts, photos)
-    c1, c2 = st.columns(2)
-    with c1:
-        if k["진행 출사"] + k["취소 출사"] > 0:
-            st.altair_chart(
-                donut({"진행": k["진행 출사"], "취소": k["취소 출사"]}, "출사 공지 진행/취소"),
-                width="stretch",
-            )
-    with c2:
-        cats = category_counts(posts)
-        if cats:
-            st.altair_chart(
-                donut({r["카테고리"]: r["개수"] for r in cats}, "카테고리 분포", scheme="set2"),
-                width="stretch",
-            )
+    if k["진행 출사"] + k["취소 출사"] > 0:
+        # 카테고리 분포 도넛은 🏷️ 카테고리 탭과 완전히 겹쳐 여기서 뺐다.
+        st.altair_chart(
+            donut({"진행": k["진행 출사"], "취소": k["취소 출사"]}, "출사 공지 진행/취소"),
+            width="stretch",
+        )
     st.altair_chart(monthly_trend_chart(monthly_table(posts, photos), months), width="stretch")
-    st.caption("월별 추이 — 출사는 출사일 기준, 후기·사진·테마사진 참가는 작성일 기준.")
+    st.caption("월별 추이 — 출사는 출사일 기준, 후기·사진·테마사진 참가는 작성일 기준. "
+               "출사·사진·테마 각각의 월별 상세는 해당 탭에 있습니다.")
 
     ex = summary_extras(posts, photos)
     st.markdown("#### 핵심 숫자")
@@ -851,9 +1033,25 @@ def _tab_overview(posts: list[dict], photos: list[dict], months: list[int]) -> N
     if ex["top_post_comments"]:
         tc = ex["top_post_comments"]
         st.markdown(f"**최고 인기 게시글 (댓글 기준)** 💬{tc['comments']} (👍{tc['likes']}) — {tc['author']} · {tc['title']}")
-    if ex["top_photo_likes"]:
-        tph = ex["top_photo_likes"]
-        st.markdown(f"**최고 인기 사진 (좋아요 기준)** 👍{tph['likes']} — {tph['author']}")
+
+    # 👤 사용자 탭을 흡수 — 출사·사진 랭킹의 상위집합이라 탭 하나를 따로 둘 이유가 없었다.
+    st.markdown("#### 활동 종합 랭킹")
+    st.caption("작성자별 게시글 수(공지+취소+후기)와 업로드한 사진 수. "
+               "게시글 수 → 사진 수 순으로 정렬, 좋아요는 게시글 좋아요 합계.")
+    rows = activity_ranking(posts, photos)
+    if rows:
+        st.dataframe(
+            _ranking_df(rows, "게시글"),
+            hide_index=True, width="stretch", height=360,
+            column_config={
+                "게시글": st.column_config.ProgressColumn(
+                    "게시글", min_value=0, max_value=max(r["게시글"] for r in rows) or 1, format="%d"),
+                "사진": st.column_config.ProgressColumn(
+                    "사진", min_value=0, max_value=max(r["사진"] for r in rows) or 1, format="%d"),
+            },
+        )
+    else:
+        st.info("데이터가 없습니다.")
 
 
 def _tab_outings(posts: list[dict], months: list[int]) -> None:
@@ -895,6 +1093,16 @@ def _tab_outings(posts: list[dict], months: list[int]) -> None:
         )
     else:
         st.info("공지 3건 이상인 작성자가 없습니다.")
+
+    st.markdown("#### 출사당 평균 참석 인원")
+    st.caption("모임 규모가 커지는지 줄어드는지. 참석자를 못 뽑은 출사도 분모에 들어가므로, "
+               "📊 개요의 보정 대기가 많으면 실제보다 낮게 나옵니다.")
+    avg = avg_attendance_trend(posts, months)
+    if any(v is not None for v in avg.values()):
+        st.line_chart(pd.DataFrame({"평균 참석 인원": [avg[m] for m in months]},
+                                   index=axis_labels(months)))
+    else:
+        st.caption("매칭된 출사가 없습니다.")
 
     st.markdown("#### 출사 공지 전체 목록")
     rows = outings_table(posts)
@@ -963,21 +1171,19 @@ def _tab_reviews(posts: list[dict], months: list[int]) -> None:
                         st.text(body)
 
 
-def _tab_attendance(posts: list[dict], master: set[str], months: list[int]) -> None:
-    st.info(
-        "📝 **후기 본문에 적힌 이름 명단으로 실제 참석자를 추적합니다.** "
-        "댓글이 막혀 있어도 후기는 공개이고, 본문의 실명을 멤버 마스터와 매칭합니다. "
-        "매칭이 안 되면 보정 시트에서 고칠 수 있습니다 — **`이름매핑1`에 실명을 채우는 것이 "
-        "가장 효과가 큽니다.** 그래도 남는 것은 `후기이름매핑`·`참석자보정`에서 처리하세요.",
-        icon="👥",
+def _tab_attendance(posts: list[dict], months: list[int]) -> None:
+    st.caption(
+        "후기 본문에 적힌 이름으로 실제 참석자를 추적합니다. 매칭이 안 되면 "
+        "**`이름매핑1`에 실명을 채우는 것이 가장 효과가 큽니다** — 남는 것만 "
+        "`후기이름매핑`·`참석자보정`에서 처리하세요."
     )
 
+    # 멤버 마스터 수는 🧑‍🤝‍🧑 멤버 탭에 있어 여기서 뺐다.
     rate = real_attendance_rate(posts)
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("출사 공지", rate["공지"])
     c2.metric("후기 매칭", rate["매칭"])
     c3.metric("실제 진행률", f"{rate['진행률']}%")
-    c4.metric("멤버 마스터", f"{len(master)}명")
 
     st.markdown("#### 멤버별 참석 횟수")
     counts = attendance_counts(posts)
@@ -1032,6 +1238,14 @@ def _tab_attendance(posts: list[dict], master: set[str], months: list[int]) -> N
         )
         st.dataframe(styled, hide_index=True, width="stretch", height=400)
 
+    st.markdown("#### 함께 간 사람")
+    st.caption("같은 출사에 함께 참석한 횟수 상위 20쌍. 옆 칸은 각자의 전체 참석 횟수입니다.")
+    pairs = co_attendance(posts)
+    if pairs:
+        st.dataframe(pd.DataFrame(pairs), hide_index=True, width="stretch", height=320)
+    else:
+        st.caption("두 명 이상이 참석한 출사가 없습니다.")
+
     orph = orphan_reviews(posts)
     if orph:
         with st.expander(f"⚠️ 공지와 매칭되지 않은 후기 {len(orph)}건"):
@@ -1042,11 +1256,9 @@ def _tab_attendance(posts: list[dict], master: set[str], months: list[int]) -> N
 
 
 def _tab_photos(photos: list[dict], months: list[int]) -> None:
-    st.info(
-        "💬 **댓글이 달린 사진을 '테마사진 참여'로 간주합니다.** "
-        "(댓글 내용은 비공개라 사진 자체로 추정합니다)",
-        icon="🎨",
-    )
+    st.caption("💬 댓글이 달린 사진(rn>0)을 **테마사진 참여로 추정**합니다 — "
+               "댓글 내용이 비공개라 사진 자체로만 판단합니다. 아래 월별 미리보기로 "
+               "실제 테마사진인지 직접 확인하세요.")
 
     st.markdown("#### 사진 업로드 순위")
     st.caption("작성자별 사진 수 · 테마예상 = 댓글 달린(테마사진 참여 추정) 사진 수 · 좋아요 합계.")
@@ -1083,13 +1295,13 @@ def _tab_photos(photos: list[dict], months: list[int]) -> None:
     else:
         st.info("사진이 없습니다.")
 
+    # 🎨 테마사진 탭을 합쳤다 — 같은 사진 데이터를 두 탭에서 갈라 보던 것.
+    st.divider()
+    st.markdown("### 🎨 테마사진")
+    _theme_section(photos, months)
 
-def _tab_theme(photos: list[dict], months: list[int]) -> None:
-    st.info(
-        "🎨 **테마사진 = 댓글이 달린 사진(rn>0)** 입니다. 댓글 내용은 비공개라 "
-        "테마 이벤트 참여를 *추정*한 값이니, 아래 월별 미리보기로 실제 테마사진인지 직접 확인하세요.",
-        icon="🎨",
-    )
+
+def _theme_section(photos: list[dict], months: list[int]) -> None:
     user_month, authors, mon_count, mon_list = theme_matrix(photos, months)
     by_month = themed_photos_by_month(photos)
     multi = is_multi_year(months[0], months[-1]) if months else True
@@ -1097,7 +1309,7 @@ def _tab_theme(photos: list[dict], months: list[int]) -> None:
     st.markdown("#### 월별 테마사진 제출 인원")
     st.bar_chart(pd.DataFrame({"참여 인원": [mon_count.get(m, 0) for m in months]},
                               index=axis_labels(months)))
-    st.caption("각 월을 펼치면 참여자 명단과 그 달 테마사진(댓글 달린 사진) 미리보기를 볼 수 있습니다.")
+    st.caption("각 월을 펼치면 참여자 명단과 그 달 테마사진 미리보기를 볼 수 있습니다.")
     for m in [m for m in months if mon_list.get(m)]:
         ph = by_month.get(m, [])
         with st.expander(f"{ym_label(m, multi_year=multi)} — "
@@ -1158,42 +1370,6 @@ def _tab_categories(posts: list[dict], months: list[int]) -> None:
                 "개수", min_value=0, max_value=max(r["개수"] for r in rows), format="%d"),
         },
     )
-
-
-def _tab_users(posts: list[dict], photos: list[dict]) -> None:
-    st.markdown("#### 사용자 활동 종합 랭킹")
-    st.caption(
-        "작성자별 게시글 수(공지+취소+후기)와 업로드한 사진 수. 게시글이나 사진이 1건 이상인 사용자 전체. "
-        "게시글 수 → 사진 수 순으로 정렬, 좋아요는 게시글 좋아요 합계."
-    )
-    photo_cnt = {r["작성자"]: r["사진수"] for r in photo_user_ranking(photos)}
-    by_author = {r["작성자"]: r for r in top_posters(posts, n=max(len(posts), 1))}
-    rows = []
-    for author in set(by_author) | set(photo_cnt):
-        pr = by_author.get(author)
-        rows.append({
-            "작성자": author,
-            "게시글": pr["게시글"] if pr else 0,
-            "사진": photo_cnt.get(author, 0),
-            "공지": pr["공지"] if pr else 0,
-            "취소": pr["취소"] if pr else 0,
-            "후기": pr["후기"] if pr else 0,
-            "좋아요": pr["좋아요"] if pr else 0,
-        })
-    rows.sort(key=lambda x: (-x["게시글"], -x["사진"]))
-    if rows:
-        st.dataframe(
-            _ranking_df(rows, "게시글"),
-            hide_index=True, width="stretch",
-            column_config={
-                "게시글": st.column_config.ProgressColumn(
-                    "게시글", min_value=0, max_value=max(r["게시글"] for r in rows) or 1, format="%d"),
-                "사진": st.column_config.ProgressColumn(
-                    "사진", min_value=0, max_value=max(r["사진"] for r in rows) or 1, format="%d"),
-            },
-        )
-    else:
-        st.info("데이터가 없습니다.")
 
 
 def _raw_nick(m: dict) -> str:
@@ -1291,31 +1467,27 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
         st.bar_chart(jdf, height=240)
         st.caption("가입일이 분석 기간 안에 든 활성 멤버만 집계됩니다.")
 
+    # 유령 멤버는 *전 기간* 0건만 잡는다 — 활동하다 끊긴 사람은 여기서 본다.
+    st.markdown("#### 최근 조용해진 멤버")
+    st.caption("참석 이력이 있는데 3개월 넘게 참석이 없는 멤버. "
+               "한 번도 참석한 적 없는 사람은 위 유령 멤버 쪽입니다.")
+    dormant = dormant_members(posts, members)
+    if dormant:
+        st.dataframe(pd.DataFrame(dormant), hide_index=True, width="stretch", height=280)
+    else:
+        st.caption("최근 3개월 안에 다들 한 번은 참석했습니다.")
 
-def _tab_data(posts: list[dict], photos: list[dict]) -> None:
-    st.caption("수집·보정된 원본 데이터 전체입니다. 표 우측 상단에서 검색·정렬, 아래 버튼으로 CSV 저장이 가능합니다.")
-
-    st.markdown(f"#### 게시글 데이터 ({len(posts)}건)")
-    pdf = posts_dataframe(posts)
-    st.dataframe(pdf, hide_index=True, width="stretch", height=360)
-    st.download_button(
-        "⬇️ 게시글 CSV", data=pdf.to_csv(index=False).encode("utf-8-sig"),
-        file_name="다감노_게시글.csv", mime="text/csv",
-    )
-
-    st.markdown(f"#### 사진 데이터 ({len(photos)}건)")
-    phdf = photos_dataframe(photos)
-    st.dataframe(
-        phdf, hide_index=True, width="stretch", height=360,
-        column_config={
-            "고화질 URL": st.column_config.LinkColumn("고화질 URL", display_text="열기"),
-            "썸네일 URL": st.column_config.LinkColumn("썸네일 URL", display_text="열기"),
-        },
-    )
-    st.download_button(
-        "⬇️ 사진 CSV", data=phdf.to_csv(index=False).encode("utf-8-sig"),
-        file_name="다감노_사진.csv", mime="text/csv",
-    )
+    st.markdown("#### 신규 멤버 정착")
+    st.caption("가입 후 첫 참석까지 걸린 기간. **첫 참석이 비어 있으면 가입만 하고 아직 안 온 분**입니다.")
+    settle = newcomer_settling(members, posts)
+    if settle:
+        arrived = [r for r in settle if r["가입→첫 참석(일)"] is not None]
+        c1, c2 = st.columns(2)
+        c1.metric("첫 참석까지 (중앙값)",
+                  f"{sorted(r['가입→첫 참석(일)'] for r in arrived)[len(arrived) // 2]}일"
+                  if arrived else "—")
+        c2.metric("가입만 하고 미참석", f"{len(settle) - len(arrived)}명")
+        st.dataframe(pd.DataFrame(settle), hide_index=True, width="stretch", height=280)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1405,6 +1577,10 @@ def render_sidebar(stores, analysis: dict | None) -> None:
         # ── 데이터 현황 ─────────────────────────────────────────
         st.divider()
         st.subheader("🗂 데이터 현황")
+        # 원본 표를 앱에서 다시 그리던 📋 데이터 탭을 없앴다 — raw가 구글 시트에
+        # 있으니 시트를 열면 정렬·필터·다운로드가 다 된다.
+        st.link_button("📗 raw 시트 열기", sheet_url(raw_store.file_id),
+                       width="stretch")
         history = (analysis or {}).get("history") or []
         if history:
             rng = collected_range(history, [], [])
@@ -1605,7 +1781,9 @@ def main() -> None:
                    relabel_names(posts, real), relabel_names(photos, real),
                    analysis["master"],
                    members=relabel_names(analysis["members"], real),
-                   applied=analysis["applied"])
+                   applied=analysis["applied"],
+                   real_names=real,
+                   correction_url=sheet_url(stores[1].file_id) if stores else None)
 
 
 
