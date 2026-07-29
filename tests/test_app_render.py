@@ -426,13 +426,15 @@ class _RecordingBox:
 
     def __init__(self):
         self.calls = []
+        self.checkbox_value = None
 
     def image(self, *a, **k):
         self.calls.append("image")
 
     def checkbox(self, label, *a, **k):
         self.calls.append(f"checkbox:{label}")
-        return k.get("value", False)
+        self.checkbox_value = k.get("value", False)
+        return self.checkbox_value
 
     def caption(self, *a, **k):
         self.calls.append("caption")
@@ -448,6 +450,10 @@ class _RecordingCol:
         return self.box
 
 
+PHOTO_CARD_SAMPLE = {"id": "p9", "author": "나무", "likes": 3, "comments": 1,
+                     "url_small": "u"}
+
+
 def test_theme_checkbox_sits_inside_the_photo_box():
     """체크박스가 사진과 **같은 테두리 칸 안, 바로 아래**에 있어야 한다.
 
@@ -457,8 +463,7 @@ def test_theme_checkbox_sits_inside_the_photo_box():
     from streamlit_app import _photo_card
 
     col = _RecordingCol()
-    _photo_card(col, {"id": "p9", "author": "나무", "likes": 3, "comments": 1,
-                      "url_small": "u"}, fix_store=object(), excluded_ids=set())
+    _photo_card(col, PHOTO_CARD_SAMPLE, fix_store=object(), excluded_ids=set())
 
     assert col.border is True, "테두리가 없으면 무엇에 대한 체크인지 안 보인다"
     assert col.box.calls == ["image", "checkbox:테마 아님", "caption"]
@@ -476,13 +481,20 @@ def test_theme_section_is_a_fragment():
     assert "fragment" in _theme_section.__code__.co_filename
 
 
+def open_theme_month(at, ym):
+    """월 expander를 펼친다 — 닫힌 달의 사진은 아예 그려지지 않는다."""
+    at.session_state[f"thm_open_{ym}"] = True
+    at.run()
+    return at
+
+
 def test_checking_one_photo_enables_save_right_away():
     """체크 한 장이면 저장 버튼이 곧바로 켜져야 한다.
 
     예전에는 화면 위쪽 경고·버튼을 그린 **뒤에** 체크박스에서 상태를 모아서,
     한 장만 체크하면 저장 버튼이 계속 꺼져 있었다(한 박자 늦음).
     """
-    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    at = open_theme_month(run(stores=make_stores(MULTI_YEAR, PHOTOS)), 202603)
     assert not at.exception, [str(e) for e in at.exception]
 
     at.checkbox(key="thm_p2").check().run()
@@ -494,13 +506,15 @@ def test_checking_one_photo_enables_save_right_away():
 
 def test_discarding_unchecks_the_boxes():
     """되돌리기 한 번으로 체크가 실제로 풀려야 한다."""
-    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    at = open_theme_month(run(stores=make_stores(MULTI_YEAR, PHOTOS)), 202603)
     at.checkbox(key="thm_p2").check().run()
     assert at.session_state["_theme_pending"] == {"p2": True}
 
     [b for b in at.button if "되돌리기" in b.label][0].click().run()
     assert not at.exception, [str(e) for e in at.exception]
     assert at.session_state["_theme_pending"] == {}
+    # 되돌린 뒤 그 달을 다시 열어 확인한다 — 체크가 실제로 풀려 있어야 한다.
+    open_theme_month(at, 202603)
     assert at.checkbox(key="thm_p2").value is False
 
 
@@ -583,3 +597,115 @@ def test_truncated_reviews_are_seeded_into_the_attendee_sheet():
     assert {"r1", "r2", "r3"} <= set(seeded), "잘린 후기가 후보에 없다"
     assert seeded["r1"][5] == 120                     # 본문길이
     assert seeded["r1"][6] == "⚠️ 잘림 의심"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 펼친 달이 접히지 않게 · 잘린 후기를 눈에 띄게
+# ═══════════════════════════════════════════════════════════════
+#
+# AppTest는 브라우저와 달리 expander의 위젯 상태를 되돌려 보내지 않는다
+# (`ElementTree.get_widget_states`는 **엘리먼트**만 훑고 expander는 블록이다).
+# 그래서 "리런 뒤에도 열려 있는가"를 여기서 끝까지 볼 수는 없다. 대신 열린
+# 채로 남게 만드는 **조건 자체**를 못 박는다 — `key` + `on_change`가 있어야
+# 스트림릿이 expander를 위젯으로 등록하고, 그때만 proto에 id가 실린다.
+
+def all_expanders(at):
+    """아이콘이 붙은 expander를 AppTest는 `status`로 분류한다 — 둘 다 모은다."""
+    return list(at.expander) + list(at.get("status"))
+
+
+def test_theme_month_expanders_are_stateful():
+    """상태 없는 expander는 리런마다 접힌다 — 체크를 이어서 할 수가 없다."""
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    months = [e for e in all_expanders(at) if "테마사진" in e.label]
+    assert months, "테마사진 월 expander가 없다"
+    for e in months:
+        assert e.proto.id, f"{e.label} — 상태를 안 가지면 체크할 때마다 접힌다"
+
+
+def test_closed_theme_month_draws_nothing():
+    """닫힌 달까지 그리면 체크 한 번에 수백 개 위젯을 다시 만든다."""
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    assert "thm_p2" not in [c.key for c in at.checkbox]
+
+    at.session_state["thm_open_202603"] = True
+    at.run()
+    assert "thm_p2" in [c.key for c in at.checkbox]
+
+
+def test_photo_card_shows_the_unsaved_check():
+    """닫힌 달은 안 그리므로 위젯 상태가 버려진다.
+
+    저장된 값으로만 되살리면 그 달을 다시 열었을 때 체크가 풀린 채 나타나고,
+    **저장을 누르기도 전에 변경이 사라진다.**
+    """
+    from streamlit_app import _photo_card
+
+    col = _RecordingCol()
+    _photo_card(col, PHOTO_CARD_SAMPLE, fix_store=object(), excluded_ids=set(),
+                pending={"p9": True})
+    assert col.box.checkbox_value is True
+
+    col = _RecordingCol()
+    _photo_card(col, PHOTO_CARD_SAMPLE, fix_store=object(),
+                excluded_ids={"p9"}, pending={})
+    assert col.box.checkbox_value is True, "시트에 저장된 값도 그대로 보여야 한다"
+
+
+def test_review_section_is_a_fragment():
+    """필터를 켤 때마다 앱 전체를 다시 그릴 이유가 없다."""
+    from streamlit_app import _review_section
+
+    assert getattr(_review_section, "__wrapped__", None) is not None
+    assert "fragment" in _review_section.__code__.co_filename
+
+
+def test_month_label_says_how_many_are_truncated():
+    """모든 달을 열어 모든 카드를 읽어야 손볼 것을 찾는다면 표시가 없는 것과 같다."""
+    at = run(stores=make_stores(TRUNCATED, []))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    labels = [e.label for e in all_expanders(at) if "— 후기" in e.label]
+    assert any("✂️ 잘림 3건" in x for x in labels), labels
+    icons = [e.icon for e in all_expanders(at) if "✂️ 잘림" in e.label]
+    assert icons and all(i == "✂️" for i in icons)
+
+
+def test_intact_months_get_no_mark():
+    """모든 줄에 붙으면 표시가 아니라 배경이 된다."""
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    for e in all_expanders(at):
+        if "— 후기" in e.label:
+            assert "✂️" not in e.label and e.icon != "✂️"
+
+
+def test_truncated_card_gets_a_red_badge():
+    """회색 캡션 한 조각은 쭉 내리며 훑을 때 눈에 걸리지 않는다."""
+    at = run(stores=make_stores(TRUNCATED, []))
+    at.session_state["rev_open_202603"] = True
+    at.run()
+    assert not at.exception, [str(e) for e in at.exception]
+
+    badges = [m.value for m in at.markdown if ":red-badge[" in str(m.value)]
+    assert len(badges) == 3, f"잘린 3건에만 붙어야 한다: {badges}"
+    assert all("✂️" in b for b in badges)
+
+
+def test_showing_only_truncated_reviews():
+    """표시를 키워도 수백 건을 훑는 것보다는 걸러 내는 편이 빠르다."""
+    at = run(stores=make_stores(TRUNCATED, []))
+    before = [e.label for e in all_expanders(at) if "— 후기" in e.label][0]
+    assert "후기 4건" in before and "✂️ 잘림 3건" in before
+
+    at.toggle(key="rev_only_cut").set_value(True).run()
+    assert not at.exception, [str(e) for e in at.exception]
+    after = [e.label for e in all_expanders(at) if "— 후기" in e.label][0]
+    assert "후기 3건" in after, after
+
+
+def test_no_truncation_no_filter():
+    """잘린 게 없으면 거를 것도 없다 — 쓸모없는 스위치를 두지 않는다."""
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    assert not any("잘린 후기만" in t.label for t in at.toggle)
