@@ -826,31 +826,6 @@ def hbar(rows: list[dict], cat_col: str, val_col: str, title: str,
     )
 
 
-def heatmap(photos: list[dict], months: list[int], max_authors: int = 30) -> alt.Chart | None:
-    user_month, authors, _, _ = theme_matrix(photos, months)
-    authors = authors[:max_authors]
-    labels = axis_labels(months)
-    long = [
-        {"월": lab, "작성자": a, "장수": user_month[a].get(m, 0)}
-        for a in authors
-        for m, lab in zip(months, labels) if user_month[a].get(m, 0) > 0
-    ]
-    if not long:
-        return None
-    df = pd.DataFrame(long)
-    return (
-        alt.Chart(df)
-        .mark_rect()
-        .encode(
-            x=alt.X("월:O", title="월", sort=labels),
-            y=alt.Y("작성자:N", sort=authors, title=None),
-            color=alt.Color("장수:Q", scale=alt.Scale(scheme="purples"), legend=alt.Legend(title="장수")),
-            tooltip=["작성자", "월", "장수"],
-        )
-        .properties(title="월별 테마사진 제출 (작성자×월)", height=max(220, 22 * len(authors)))
-    )
-
-
 def monthly_trend_chart(monthly: dict[str, dict[int, int]], months: list[int],
                         title: str = "월별 활동 추이") -> alt.Chart:
     labels = axis_labels(months)
@@ -1602,7 +1577,7 @@ def _theme_section(photos: list[dict], months: list[int], fix_store=None) -> Non
     excluded_ids = st.session_state.get("_theme_excluded") or set()
     pending = _collect_pending(all_photos, excluded_ids)
 
-    user_month, authors, mon_count, mon_list = theme_matrix(photos, months)
+    _, _, mon_count, mon_list = theme_matrix(photos, months)
     by_month = themed_photos_by_month(photos)
     multi = is_multi_year(months[0], months[-1]) if months else True
 
@@ -1624,7 +1599,26 @@ def _theme_section(photos: list[dict], months: list[int], fix_store=None) -> Non
         if c2.button("되돌리기(저장 안 함)", disabled=not pending):
             _discard_theme_flags()
 
-    for m in [m for m in months if mon_list.get(m)]:
+    # 해제한 사진은 **저장 버튼 바로 아래**에 둔다. 잘못 체크한 것을 되돌리는
+    # 일은 체크하는 일과 같은 작업인데, 화면 맨 끝에 있으면 월 목록을 다 지나
+    # 내려갔다가 저장하러 다시 올라와야 한다. 접힌 상태라 평소엔 한 줄이다.
+    hidden = [p for p in all_photos if str(p.get("id")) in excluded_ids]
+    if hidden:
+        exp = st.expander(f"🚫 테마 아님으로 표시한 사진 {len(hidden)}장",
+                          key="thm_open_hidden", on_change="rerun")
+        with exp:
+            if exp.open:
+                st.caption("체크를 풀고 **변경 저장**을 누르면 다시 테마사진으로 셉니다.")
+                for i in range(0, len(hidden), 5):
+                    for col, p in zip(st.columns(5), hidden[i:i + 5]):
+                        _photo_card(col, p, fix_store, excluded_ids, pending)
+
+    open_months = [m for m in months if mon_list.get(m)]
+    if not open_months:
+        # 예전엔 이 안내가 히트맵의 else 가지에만 있었다. 히트맵을 지우면서
+        # 함께 사라지면, 테마사진이 없을 때 화면이 그냥 텅 빈다.
+        st.info("이 기간에 테마사진(댓글 달린 사진)이 없습니다.")
+    for m in open_months:
         ph = by_month.get(m, [])
         # `key` + `on_change`가 있어야 expander가 **상태를 갖는 위젯**이 된다.
         # 기본값(`on_change="ignore"`)이면 아무것도 기억하지 않아, 체크 한 번에
@@ -1640,30 +1634,13 @@ def _theme_section(photos: list[dict], months: list[int], fix_store=None) -> Non
                 for col, p in zip(st.columns(5), ph[i:i + 5]):
                     _photo_card(col, p, fix_store, excluded_ids, pending)
 
-    st.markdown("#### 테마 매트릭스")
-    ch = heatmap(photos, months)
-    if ch is not None:
-        st.altair_chart(ch, width="stretch")
-    else:
-        st.info("테마사진(댓글 달린 사진)이 없습니다.")
-
+    # 테마 매트릭스(작성자×월 히트맵)는 지웠다 — 세로로 660px까지 늘어나면서
+    # 바로 위 월별 목록·아래 참여자 순위와 같은 말을 하고 있었다.
     st.markdown("#### 테마 참여자 순위")
     st.caption("참여월수(여러 달에 걸친 참여) 우선, 동률은 테마사진 수.")
     parts = theme_participant_ranking(photos)
     if parts:
         st.dataframe(_ranking_df(parts, "테마사진"), hide_index=True, width="stretch")
-
-    # 해제한 사진은 접어 둔다 — 잘못 눌렀으면 여기서 체크를 풀어 되돌린다.
-    hidden = [p for p in all_photos if str(p.get("id")) in excluded_ids]
-    if hidden:
-        exp = st.expander(f"🚫 테마 아님으로 표시한 사진 {len(hidden)}장",
-                          key="thm_open_hidden", on_change="rerun")
-        with exp:
-            if exp.open:
-                st.caption("체크를 풀고 **변경 저장**을 누르면 다시 테마사진으로 셉니다.")
-                for i in range(0, len(hidden), 5):
-                    for col, p in zip(st.columns(5), hidden[i:i + 5]):
-                        _photo_card(col, p, fix_store, excluded_ids, pending)
 
 
 def _discard_theme_flags() -> None:
