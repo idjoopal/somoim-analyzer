@@ -42,6 +42,16 @@ from core.gsheets import sheet_url
 
 ALL_CATS = OUTING_CATS + NON_OUTING_CATS
 CAT_OPTIONS = ALL_CATS + ["(없음)"]
+
+# 엑셀 내보내기를 잠시 숨긴다.
+#
+# `core/excel_builder.py`가 화면과 어긋났다 — 없어진 `👤 사용자` 시트가 그대로
+# 있고, 신뢰도·함께 간 사람·정착률 같은 새 통계는 빠져 있다. **화면과 다른
+# 결과 파일을 내보내면 어느 쪽이 맞는지 알 수 없게 되므로** 맞출 때까지 숨긴다.
+#
+# 구글 시트 내보내기도 같은 `build_excel` 바이트를 올리는 방식이라 함께 숨긴다.
+# 코드는 그대로 두었으니 이 값만 True로 돌리면 살아난다.
+SHOW_EXPORT = False
 STATUS_OPTIONS = ["진행", "취소"]
 
 
@@ -1803,7 +1813,7 @@ def render_sidebar(stores, analysis: dict | None) -> None:
             st.rerun()
 
         # ── 다운로드 ────────────────────────────────────────────
-        if analysis and analysis.get("posts"):
+        if SHOW_EXPORT and analysis and analysis.get("posts"):
             st.divider()
             st.subheader("💾 다운로드")
             rng = st.session_state.get("_view_range") or collected_range(
