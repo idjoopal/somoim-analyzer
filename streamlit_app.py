@@ -1254,6 +1254,12 @@ def _tab_outings(posts: list[dict], months: list[int]) -> None:
     _category_section(posts, months)
 
 
+def _is_truncated(r: dict, body_cut: int | None) -> bool:
+    """본문이 잘림 지점에 닿았는지. `body_cut`이 없으면 아무것도 잘리지 않았다."""
+    return bool(body_cut) and len(r.get("body") or "") >= int(body_cut)
+
+
+@st.fragment
 def _review_section(posts: list[dict], months: list[int],
                     body_cut: int | None = None) -> None:
     """📝 후기 게시글 목록 — 월별 expander, 각 후기 카드에 정규화된 참석자 명단.
@@ -1261,6 +1267,9 @@ def _review_section(posts: list[dict], months: list[int],
     참석자는 Stage 1에서 적용된 매핑(가입인사 자동 + 사용자 매핑)으로 마스터 닉네임에
     정규화돼 있다 — 동명이인은 한 명으로 합쳐 표시된다는 주의가 있긴 하지만, 이 탭은
     "어느 후기에 누가 적혔는지" 빠르게 훑어보는 용도. 사진은 표시하지 않음.
+
+    **프래그먼트다.** 필터를 켜거나 달을 펼칠 때마다 앱 전체를 다시 그릴 이유가
+    없다 — 여기서 바뀌는 것은 이 구역의 화면뿐이다.
     """
     reviews = sorted(
         (p for p in posts if p.get("cat") == "E"),
@@ -1273,17 +1282,22 @@ def _review_section(posts: list[dict], months: list[int],
         "매칭된 출사 공지가 있으면 출사일·카테고리를 함께 보여줍니다. 사진은 🎨 테마사진 탭에서.",
         icon="📝",
     )
+    only_cut = False
     if body_cut:
-        cut_n = sum(1 for r in reviews if len(r.get("body") or "") >= body_cut)
+        cut_n = sum(1 for r in reviews if _is_truncated(r, body_cut))
         st.warning(
             f"소모임 목록 API가 본문을 **{body_cut}자**에서 끊어 보냅니다. "
             f"이 기간 후기 {cut_n}건이 그 길이라 **뒤쪽에 적힌 참석자가 통째로 "
-            "빠졌을 수 있습니다.** 아래 카드에 ✂️ 표시가 붙은 것이 그 후기이며, "
-            "`참석자보정` 시트에 이미 후보로 올라가 있습니다.",
+            "빠졌을 수 있습니다.** 잘린 후기는 월 이름 옆 ✂️와 카드 위 빨간 "
+            "배지로 표시되며, `참석자보정` 시트에 이미 후보로 올라가 있습니다.",
             icon="✂️",
         )
+        # 표시를 아무리 키워도 수백 건을 훑는 것보다는 걸러 내는 편이 빠르다.
+        only_cut = st.toggle(f"✂️ 잘린 후기만 보기 ({cut_n}건)", key="rev_only_cut")
+        if only_cut:
+            reviews = [r for r in reviews if _is_truncated(r, body_cut)]
     if not reviews:
-        st.caption("후기 게시글이 없습니다.")
+        st.caption("잘린 후기가 없습니다." if only_cut else "후기 게시글이 없습니다.")
         return
 
     by_month: dict[int, list[dict]] = defaultdict(list)
@@ -1293,7 +1307,17 @@ def _review_section(posts: list[dict], months: list[int],
     multi = is_multi_year(months[0], months[-1]) if months else True
     for m in sorted(by_month.keys(), reverse=True):
         items = by_month[m]
-        with st.expander(f"{ym_label(m, multi_year=multi)} — 후기 {len(items)}건", expanded=False):
+        n_cut = sum(1 for r in items if _is_truncated(r, body_cut))
+        # 잘린 게 없는 달에는 아무 표시도 붙이지 않는다 — 모든 줄에 붙으면
+        # 그건 표시가 아니라 배경이 되고, 찾는 데 도움이 안 된다.
+        label = f"{ym_label(m, multi_year=multi)} — 후기 {len(items)}건"
+        if n_cut:
+            label += f" · ✂️ 잘림 {n_cut}건"
+        exp = st.expander(label, icon="✂️" if n_cut else None,
+                          key=f"rev_open_{m}", on_change="rerun")
+        with exp:
+            if not exp.open:
+                continue
             for r in items:
                 posted = r["posted_at"].strftime("%Y-%m-%d")
                 title = r.get("title") or ""
@@ -1301,8 +1325,12 @@ def _review_section(posts: list[dict], months: list[int],
                 body = r.get("body") or ""
                 attendees = r.get("attendees") or []
                 blen = len(body)
-                truncated = bool(body_cut) and blen >= body_cut
+                truncated = _is_truncated(r, body_cut)
                 with st.container(border=True):
+                    if truncated:
+                        # 카드 맨 위 · 빨강. 회색 캡션 한 조각으로는 쭉 내리며
+                        # 훑을 때 눈에 걸리지 않는다.
+                        st.badge("✂️ 본문 잘림 — 참석자 확인 필요", color="red")
                     st.markdown(f"**{title}**")
                     meta_bits = [f"🗓 {posted}", f"✍ {author}",
                                  ("✂️ 본문 %d자 (잘림)" if truncated
@@ -1498,19 +1526,26 @@ def _collect_pending(all_photos: list[dict], excluded_ids: set) -> dict[str, boo
     return pending
 
 
-def _photo_card(col, p: dict, fix_store, excluded_ids: set) -> None:
+def _photo_card(col, p: dict, fix_store, excluded_ids: set,
+                pending: dict | None = None) -> None:
     """사진 한 장과 그 체크박스를 **테두리 한 칸**에 함께 담는다.
 
     격자로 늘어놓으면 사진 사이 간격과 사진·체크박스 사이 간격이 비슷해서
     어느 사진에 대한 체크인지 헷갈린다. 사진 높이가 제각각이라 줄이 어긋나면
     더 그렇다. 한 칸으로 묶으면 그 질문 자체가 없어진다.
+
+    체크박스 초기값은 **저장 전 상태(`pending`)를 먼저** 본다. 닫힌 달은
+    그리지 않으므로 그 달의 위젯 상태는 버려지는데, 저장된 값으로만 되살리면
+    다시 열었을 때 체크가 풀린 채 나타나고 **변경이 조용히 사라진다.**
     """
     pid = str(p.get("id"))
+    saved = pid in excluded_ids
     box = col.container(border=True)
     box.image(p["url_small"], width="stretch")
     if fix_store is not None:
         # 사진 바로 아래 — 캡션보다 위에 둬야 사진에 붙어 보인다.
-        box.checkbox("테마 아님", value=pid in excluded_ids, key=_theme_key(pid))
+        box.checkbox("테마 아님", value=(pending or {}).get(pid, saved),
+                     key=_theme_key(pid))
     box.caption(f"{p.get('author', '')} · 👍{p.get('likes', 0)} "
                 f"💬{p.get('comments', 0)}")
 
@@ -1552,12 +1587,19 @@ def _theme_section(photos: list[dict], months: list[int], fix_store=None) -> Non
 
     for m in [m for m in months if mon_list.get(m)]:
         ph = by_month.get(m, [])
-        with st.expander(f"{ym_label(m, multi_year=multi)} — "
-                         f"참여 {len(mon_list[m])}명 · 테마사진 {len(ph)}장"):
+        # `key` + `on_change`가 있어야 expander가 **상태를 갖는 위젯**이 된다.
+        # 기본값(`on_change="ignore"`)이면 아무것도 기억하지 않아, 체크 한 번에
+        # 펼쳐 둔 달이 도로 접혔다 — 연달아 작업할 수가 없었다.
+        exp = st.expander(f"{ym_label(m, multi_year=multi)} — "
+                          f"참여 {len(mon_list[m])}명 · 테마사진 {len(ph)}장",
+                          key=f"thm_open_{m}", on_change="rerun")
+        with exp:
+            if not exp.open:
+                continue        # 닫힌 달은 그리지 않는다 — 리런이 그만큼 가볍다
             st.write("**참여자:** " + ", ".join(mon_list[m]))
             for i in range(0, len(ph), 5):
                 for col, p in zip(st.columns(5), ph[i:i + 5]):
-                    _photo_card(col, p, fix_store, excluded_ids)
+                    _photo_card(col, p, fix_store, excluded_ids, pending)
 
     st.markdown("#### 테마 매트릭스")
     ch = heatmap(photos, months)
@@ -1575,11 +1617,14 @@ def _theme_section(photos: list[dict], months: list[int], fix_store=None) -> Non
     # 해제한 사진은 접어 둔다 — 잘못 눌렀으면 여기서 체크를 풀어 되돌린다.
     hidden = [p for p in all_photos if str(p.get("id")) in excluded_ids]
     if hidden:
-        with st.expander(f"🚫 테마 아님으로 표시한 사진 {len(hidden)}장"):
-            st.caption("체크를 풀고 **변경 저장**을 누르면 다시 테마사진으로 셉니다.")
-            for i in range(0, len(hidden), 5):
-                for col, p in zip(st.columns(5), hidden[i:i + 5]):
-                    _photo_card(col, p, fix_store, excluded_ids)
+        exp = st.expander(f"🚫 테마 아님으로 표시한 사진 {len(hidden)}장",
+                          key="thm_open_hidden", on_change="rerun")
+        with exp:
+            if exp.open:
+                st.caption("체크를 풀고 **변경 저장**을 누르면 다시 테마사진으로 셉니다.")
+                for i in range(0, len(hidden), 5):
+                    for col, p in zip(st.columns(5), hidden[i:i + 5]):
+                        _photo_card(col, p, fix_store, excluded_ids, pending)
 
 
 def _discard_theme_flags() -> None:
