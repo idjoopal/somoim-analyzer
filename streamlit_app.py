@@ -1445,22 +1445,64 @@ def _tab_photos(photos: list[dict], months: list[int], fix_store=None) -> None:
 _PENDING = "_theme_pending"       # 저장 전 체크박스 상태 {사진 id: 테마아님}
 
 
-def _theme_toggle(p: dict, container, excluded: bool) -> None:
-    """사진 한 장의 '테마 아님' 체크박스. 상태는 저장 버튼 전까지 세션에만 둔다."""
-    pid = str(p.get("id"))
+def _theme_key(pid: str) -> str:
+    return f"thm_{pid}"
+
+
+def _collect_pending(all_photos: list[dict], excluded_ids: set) -> dict[str, bool]:
+    """체크박스 위젯 상태를 훑어 '저장할 것'을 다시 계산한다.
+
+    위젯 값은 스크립트가 돌기 **전에** 확정된다. 그래서 여기서 한 번에 모으면
+    화면 위쪽의 경고 문구와 저장 버튼이 방금 누른 체크를 곧바로 반영한다.
+    체크박스를 그리는 자리에서 모으면 그 둘이 **한 박자 늦어** 한 장만 체크한
+    상태에서는 저장 버튼이 계속 꺼져 있었다.
+
+    기준은 체크 상태와 **시트에 저장된 값**의 차이다. 같아졌으면 저장할 것이
+    없으니 지운다.
+    """
     pending = st.session_state.setdefault(_PENDING, {})
-    checked = pending.get(pid, excluded)
-    new = container.checkbox("테마 아님", value=checked, key=f"thm_{pid}")
-    if new != excluded:
-        pending[pid] = new
-    else:
-        pending.pop(pid, None)          # 원래대로 돌아왔으면 저장할 것이 없다
+    for p in all_photos:
+        pid = str(p.get("id"))
+        key = _theme_key(pid)
+        if key not in st.session_state:
+            continue                     # 이번 화면에 안 그려진 사진 — 건드리지 않는다
+        now = bool(st.session_state[key])
+        if now != (pid in excluded_ids):
+            pending[pid] = now
+        else:
+            pending.pop(pid, None)       # 원래대로 돌아왔으면 저장할 것이 없다
+    return pending
 
 
+def _photo_card(col, p: dict, fix_store, excluded_ids: set) -> None:
+    """사진 한 장과 그 체크박스를 **테두리 한 칸**에 함께 담는다.
+
+    격자로 늘어놓으면 사진 사이 간격과 사진·체크박스 사이 간격이 비슷해서
+    어느 사진에 대한 체크인지 헷갈린다. 사진 높이가 제각각이라 줄이 어긋나면
+    더 그렇다. 한 칸으로 묶으면 그 질문 자체가 없어진다.
+    """
+    pid = str(p.get("id"))
+    box = col.container(border=True)
+    box.image(p["url_small"], width="stretch")
+    if fix_store is not None:
+        # 사진 바로 아래 — 캡션보다 위에 둬야 사진에 붙어 보인다.
+        box.checkbox("테마 아님", value=pid in excluded_ids, key=_theme_key(pid))
+    box.caption(f"{p.get('author', '')} · 👍{p.get('likes', 0)} "
+                f"💬{p.get('comments', 0)}")
+
+
+@st.fragment
 def _theme_section(photos: list[dict], months: list[int], fix_store=None) -> None:
+    """테마사진 확인·보정.
+
+    **프래그먼트다.** 체크박스 하나 누를 때마다 앱 전체를 다시 그리면 수천 장
+    이름 다시 붙이고 다섯 탭을 통째로 재계산해서, 이어서 체크할 수가 없었다.
+    프래그먼트로 두면 체크는 이 구역만 다시 그린다. 전체 갱신은 **저장했을
+    때만** — 그때는 통계가 실제로 바뀌므로 앱 전체를 다시 돌린다.
+    """
     all_photos = st.session_state.get("_all_photos") or photos
     excluded_ids = st.session_state.get("_theme_excluded") or set()
-    pending = st.session_state.get(_PENDING) or {}
+    pending = _collect_pending(all_photos, excluded_ids)
 
     user_month, authors, mon_count, mon_list = theme_matrix(photos, months)
     by_month = themed_photos_by_month(photos)
@@ -1469,8 +1511,9 @@ def _theme_section(photos: list[dict], months: list[int], fix_store=None) -> Non
     st.markdown("#### 월별 테마사진 제출 인원")
     st.bar_chart(pd.DataFrame({"참여 인원": [mon_count.get(m, 0) for m in months]},
                               index=axis_labels(months)))
-    st.caption("각 월을 펼쳐 실제 테마사진인지 확인하고, 아니면 **테마 아님**에 "
-               "체크하세요. 여러 장 고른 뒤 아래 **변경 저장**을 눌러야 반영됩니다.")
+    st.caption("각 월을 펼쳐 실제 테마사진인지 확인하고, 아니면 사진 아래 "
+               "**테마 아님**에 체크하세요. 체크는 이 구역만 다시 그리니 여러 "
+               "장을 이어서 고른 뒤, 아래 **변경 저장**을 한 번 누르면 됩니다.")
 
     if pending and fix_store is not None:
         st.warning(f"저장하지 않은 변경 {len(pending)}건 — 저장해야 통계에 반영됩니다.",
@@ -1481,8 +1524,7 @@ def _theme_section(photos: list[dict], months: list[int], fix_store=None) -> Non
                      width="stretch"):
             _save_theme_flags(fix_store, all_photos)
         if c2.button("되돌리기(저장 안 함)", disabled=not pending):
-            st.session_state[_PENDING] = {}
-            st.rerun()
+            _discard_theme_flags()
 
     for m in [m for m in months if mon_list.get(m)]:
         ph = by_month.get(m, [])
@@ -1491,12 +1533,7 @@ def _theme_section(photos: list[dict], months: list[int], fix_store=None) -> Non
             st.write("**참여자:** " + ", ".join(mon_list[m]))
             for i in range(0, len(ph), 5):
                 for col, p in zip(st.columns(5), ph[i:i + 5]):
-                    col.image(
-                        p["url_small"], width="stretch",
-                        caption=f"{p['author']} · 👍{p['likes']} 💬{p['comments']}",
-                    )
-                    if fix_store is not None:
-                        _theme_toggle(p, col, False)
+                    _photo_card(col, p, fix_store, excluded_ids)
 
     st.markdown("#### 테마 매트릭스")
     ch = heatmap(photos, months)
@@ -1518,10 +1555,20 @@ def _theme_section(photos: list[dict], months: list[int], fix_store=None) -> Non
             st.caption("체크를 풀고 **변경 저장**을 누르면 다시 테마사진으로 셉니다.")
             for i in range(0, len(hidden), 5):
                 for col, p in zip(st.columns(5), hidden[i:i + 5]):
-                    col.image(p["url_small"], width="stretch",
-                              caption=f"{p['author']} · 💬{p['comments']}")
-                    if fix_store is not None:
-                        _theme_toggle(p, col, True)
+                    _photo_card(col, p, fix_store, excluded_ids)
+
+
+def _discard_theme_flags() -> None:
+    """체크를 전부 저장 전 상태로.
+
+    `_theme_pending`만 비우면 안 된다 — 체크박스 **위젯 상태**가 그대로라
+    다음 렌더에서 `_collect_pending`이 도로 주워 담는다. 위젯 키를 지우면
+    저장된 값으로 다시 초기화된다.
+    """
+    for pid in list(st.session_state.get(_PENDING) or {}):
+        st.session_state.pop(_theme_key(pid), None)
+    st.session_state[_PENDING] = {}
+    st.rerun()          # 앱 전체 — 저장·되돌리기 두 번만 이렇게 한다
 
 
 def _save_theme_flags(fix_store, all_photos: list[dict]) -> None:
@@ -1537,7 +1584,7 @@ def _save_theme_flags(fix_store, all_photos: list[dict]) -> None:
     st.session_state[_PENDING] = {}
     _rebuild_analysis()
     st.toast(f"{n}건 저장했습니다.", icon="✅")
-    st.rerun()
+    st.rerun(scope="app")       # 통계가 바뀌었으니 이때만 앱 전체를 다시 그린다
 
 
 def _rebuild_analysis() -> None:

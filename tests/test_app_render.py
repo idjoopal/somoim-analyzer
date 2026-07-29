@@ -6,6 +6,7 @@
 
 from datetime import datetime
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
 from core.store import (
@@ -407,3 +408,119 @@ def test_members_tab_counts_joiners_who_already_left():
                             [202509, 202601])
     assert rows[0]["잔류"] == 1        # w1은 멤버 목록에 있다
     assert rows[1]["이탈"] == 1        # gone은 없다
+
+
+# ═══════════════════════════════════════════════════════════════
+# 테마사진 체크 — 사진에 붙어 있고, 눌러도 앱 전체가 다시 그려지지 않는다
+# ═══════════════════════════════════════════════════════════════
+
+class _RecordingBox:
+    """`st.container(border=True)`가 돌려주는 칸 흉내."""
+
+    def __init__(self):
+        self.calls = []
+
+    def image(self, *a, **k):
+        self.calls.append("image")
+
+    def checkbox(self, label, *a, **k):
+        self.calls.append(f"checkbox:{label}")
+        return k.get("value", False)
+
+    def caption(self, *a, **k):
+        self.calls.append("caption")
+
+
+class _RecordingCol:
+    def __init__(self):
+        self.box = _RecordingBox()
+        self.border = None
+
+    def container(self, border=False):
+        self.border = border
+        return self.box
+
+
+def test_theme_checkbox_sits_inside_the_photo_box():
+    """체크박스가 사진과 **같은 테두리 칸 안, 바로 아래**에 있어야 한다.
+
+    격자로 늘어놓으면 사진 사이 간격과 사진·체크박스 간격이 비슷해서, 테두리
+    없이는 어느 사진의 체크인지 헷갈린다. 캡션이 사이에 끼어도 마찬가지다.
+    """
+    from streamlit_app import _photo_card
+
+    col = _RecordingCol()
+    _photo_card(col, {"id": "p9", "author": "나무", "likes": 3, "comments": 1,
+                      "url_small": "u"}, fix_store=object(), excluded_ids=set())
+
+    assert col.border is True, "테두리가 없으면 무엇에 대한 체크인지 안 보인다"
+    assert col.box.calls == ["image", "checkbox:테마 아님", "caption"]
+
+
+def test_theme_section_is_a_fragment():
+    """체크 한 번에 앱 전체를 다시 그리면 이어서 체크할 수가 없다.
+
+    수천 장에 이름을 다시 붙이고 다섯 탭을 통째로 재계산하는 비용이라,
+    프래그먼트가 아니면 이 화면은 쓸 수 없다.
+    """
+    from streamlit_app import _theme_section
+
+    assert getattr(_theme_section, "__wrapped__", None) is not None
+    assert "fragment" in _theme_section.__code__.co_filename
+
+
+def test_checking_one_photo_enables_save_right_away():
+    """체크 한 장이면 저장 버튼이 곧바로 켜져야 한다.
+
+    예전에는 화면 위쪽 경고·버튼을 그린 **뒤에** 체크박스에서 상태를 모아서,
+    한 장만 체크하면 저장 버튼이 계속 꺼져 있었다(한 박자 늦음).
+    """
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    at.checkbox(key="thm_p2").check().run()
+    assert not at.exception, [str(e) for e in at.exception]
+    assert at.session_state["_theme_pending"] == {"p2": True}
+    save = [b for b in at.button if "변경 저장" in b.label][0]
+    assert not save.disabled, "체크했는데 저장이 꺼져 있으면 저장할 방법이 없다"
+
+
+def test_discarding_unchecks_the_boxes():
+    """되돌리기 한 번으로 체크가 실제로 풀려야 한다."""
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    at.checkbox(key="thm_p2").check().run()
+    assert at.session_state["_theme_pending"] == {"p2": True}
+
+    [b for b in at.button if "되돌리기" in b.label][0].click().run()
+    assert not at.exception, [str(e) for e in at.exception]
+    assert at.session_state["_theme_pending"] == {}
+    assert at.checkbox(key="thm_p2").value is False
+
+
+def test_discarding_clears_the_checkbox_widgets():
+    """`_theme_pending`만 비우면 안 된다 — 체크박스 위젯이 켜진 채로 남으면
+    다음 렌더에서 `_collect_pending`이 도로 주워 담는다."""
+    import streamlit_app as app
+
+    class _Stop(Exception):
+        pass
+
+    class _FakeSt:
+        def __init__(self, state):
+            self.session_state = state
+
+        def rerun(self, **_):
+            raise _Stop
+
+    state = {"_theme_pending": {"p2": True}, "thm_p2": True, "thm_p3": False}
+    orig = app.st
+    app.st = _FakeSt(state)
+    try:
+        with pytest.raises(_Stop):
+            app._discard_theme_flags()
+    finally:
+        app.st = orig
+
+    assert state["_theme_pending"] == {}
+    assert "thm_p2" not in state          # 켜진 채 남으면 되살아난다
+    assert state["thm_p3"] is False       # 바꾼 적 없는 것은 건드리지 않는다
