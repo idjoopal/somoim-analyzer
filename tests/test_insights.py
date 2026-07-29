@@ -138,7 +138,8 @@ def test_pair_row_shows_each_persons_total():
     posts = [notice("n1", "2026-03-01", ["나무", "바다"]),
              notice("n2", "2026-03-08", ["나무"])]
     row = co_attendance(posts)[0]
-    assert row["나무 참석"] == 2 and row["바다 참석"] == 1
+    assert row["사람 A"] == "나무" and row["사람 B"] == "바다"
+    assert row["A 참석"] == 2 and row["B 참석"] == 1
 
 
 def test_ratio_is_reported_from_both_sides():
@@ -149,13 +150,39 @@ def test_ratio_is_reported_from_both_sides():
              notice("n4", "2026-03-22", ["바다"])]
     row = co_attendance(posts)[0]
     assert row["함께"] == 1
-    assert row["나무 기준"] == 100.0        # 나무는 한 번 갔고 그게 바다와 함께
-    assert row["바다 기준"] == 25.0         # 바다는 네 번 중 한 번
+    assert row["A 기준"] == 100.0          # 나무는 한 번 갔고 그게 바다와 함께
+    assert row["B 기준"] == 25.0           # 바다는 네 번 중 한 번
 
 
 def test_duplicate_name_in_one_outing_does_not_pair_with_itself():
     rows = co_attendance([notice("n1", attendees=["나무", "나무", "바다"])])
     assert len(rows) == 1 and rows[0]["함께"] == 1
+
+
+def test_columns_do_not_carry_user_names():
+    """이름을 키로 쓰면 `pd.DataFrame`이 모든 행의 키를 합집합으로 모은다.
+
+    쌍마다 사람이 다르면 컬럼이 쌍 수 × 4개까지 불어나고, 자기 행이 아닌
+    칸은 전부 빈칸이 된다. **실제로 80칸짜리 표가 나왔다.**
+    """
+    from streamlit_app import CO_ATTENDANCE_COLS
+
+    people = ["나무", "바다", "하늘", "구름", "노을", "안개"]
+    posts = [notice(f"n{i}", "2026-03-0%d" % (i + 1), [people[i], people[i + 1]])
+             for i in range(len(people) - 1)]
+    rows = co_attendance(posts)
+    assert len(rows) == 5
+
+    keys = {k for r in rows for k in r}
+    assert keys == set(CO_ATTENDANCE_COLS), keys
+    assert not any(p in k for r in rows for k in r for p in people)
+
+
+def test_pair_is_split_into_two_columns():
+    """`나무 · 바다`로 붙여 두면 왼쪽 숫자가 누구 것인지 알 방법이 없다."""
+    row = co_attendance([notice("n1", attendees=["나무", "바다"])])[0]
+    assert row["사람 A"] == "나무" and row["사람 B"] == "바다"
+    assert "·" not in row["사람 A"]
 
 
 # ═══════════════════════════════════════════════════════════════

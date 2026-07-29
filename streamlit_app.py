@@ -563,6 +563,13 @@ def co_attendance(posts: list[dict], top_n: int = 20) -> list[dict]:
 
     **비율은 양쪽 기준을 모두 낸다.** 두 사람의 전체 참석 수가 달라
     "8번 함께"가 한쪽에겐 대부분이고 다른 쪽에겐 일부일 수 있다.
+
+    **컬럼 이름은 고정이고 사람 이름은 값으로만 들어간다.** 예전에는
+    `f"{a} 참석"`처럼 이름을 키로 썼는데, `pd.DataFrame`은 모든 행의 키를
+    합집합으로 모으므로 20쌍이 전부 다른 사람이면 **컬럼이 80개**가 되고
+    자기 행이 아닌 칸은 전부 빈칸이었다. 표가 옆으로 끝없이 길어질 뿐
+    아니라, 이름이 박힌 헤더만 봐서는 그 숫자가 횟수인지 퍼센트인지도
+    알 수 없었다.
     """
     pair: Counter = Counter()
     solo: Counter = Counter()
@@ -582,11 +589,18 @@ def co_attendance(posts: list[dict], top_n: int = 20) -> list[dict]:
     rows = []
     for (a, b), n in pair.most_common(top_n):
         rows.append({
-            "두 사람": f"{a} · {b}", "함께": n,
-            f"{a} 참석": solo[a], f"{a} 기준": pct(n, solo[a]),
-            f"{b} 참석": solo[b], f"{b} 기준": pct(n, solo[b]),
+            # 이름을 두 칸으로 나눈다 — 그래야 `A 참석`·`A 기준`이 누구
+            # 얘기인지 헤더만 보고 안다. `나무 · 바다`로 붙여 두면 왼쪽
+            # 숫자가 누구 것인지 표 어디에도 단서가 없다.
+            "사람 A": a, "사람 B": b, "함께": n,
+            "A 참석": solo[a], "A 기준": pct(n, solo[a]),
+            "B 참석": solo[b], "B 기준": pct(n, solo[b]),
         })
     return rows
+
+
+CO_ATTENDANCE_COLS = ["사람 A", "사람 B", "함께", "A 참석", "A 기준",
+                      "B 참석", "B 기준"]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1431,10 +1445,35 @@ def _tab_attendance(posts: list[dict], months: list[int],
         st.dataframe(styled, hide_index=True, width="stretch", height=400)
 
     st.markdown("#### 함께 간 사람")
-    st.caption("같은 출사에 함께 참석한 횟수 상위 20쌍. 옆 칸은 각자의 전체 참석 횟수입니다.")
+    st.caption("같은 출사에 함께 참석한 횟수 상위 20쌍. "
+               "`A 참석`은 그 사람의 전체 참석 횟수, `A 기준`은 그중 상대와 "
+               "함께한 비율입니다 — 같은 8회라도 한쪽에겐 대부분, 다른 쪽에겐 "
+               "일부일 수 있습니다.")
     pairs = co_attendance(posts)
     if pairs:
-        st.dataframe(pd.DataFrame(pairs), hide_index=True, width="stretch", height=320)
+        # 횟수는 `회`, 비율은 막대. 두 종류가 같은 숫자 모양이면 무엇을 보고
+        # 있는지 알 수 없다 — 예전 표의 실제 문제였다.
+        def _ratio(label: str, whose: str):
+            return st.column_config.ProgressColumn(
+                label, min_value=0, max_value=100, format="%.0f%%",
+                help=f"{whose}가 간 전체 출사 중 상대와 함께한 비율")
+
+        st.dataframe(
+            pd.DataFrame(pairs, columns=CO_ATTENDANCE_COLS),
+            hide_index=True, width="stretch", height=320,
+            column_config={
+                "사람 A": st.column_config.TextColumn("사람 A", width="medium"),
+                "사람 B": st.column_config.TextColumn("사람 B", width="medium"),
+                "함께": st.column_config.NumberColumn(
+                    "함께", format="%d회", help="두 사람이 같은 출사에 함께 간 횟수"),
+                "A 참석": st.column_config.NumberColumn(
+                    "A 참석", format="%d회", help="사람 A의 전체 참석 횟수"),
+                "A 기준": _ratio("A 기준", "사람 A"),
+                "B 참석": st.column_config.NumberColumn(
+                    "B 참석", format="%d회", help="사람 B의 전체 참석 횟수"),
+                "B 기준": _ratio("B 기준", "사람 B"),
+            },
+        )
     else:
         st.caption("두 명 이상이 참석한 출사가 없습니다.")
 
