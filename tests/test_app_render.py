@@ -12,12 +12,14 @@ from streamlit.testing.v1 import AppTest
 from core.store import (
     ATTENDEE_FIX_COLS,
     NAME_MAP_COLS,
+    PHOTO_FIX_COLS,
     POST_FIX_COLS,
     POST_KEYS,
     TAB_ATTENDEE_FIX,
     TAB_MEMBER_NAMES,
     TAB_HISTORY,
     TAB_NAME_MAP,
+    TAB_PHOTO_FIX,
     TAB_POST_FIX,
     TAB_POSTS,
     CorrectionStore,
@@ -761,3 +763,56 @@ def test_co_attendance_table_has_fixed_columns():
     assert list(df["함께"]) == [1, 1]
     assert list(df["A 참석"]) == [2, 2]     # 나무는 두 번 다 갔다
     assert list(df["A 기준"]) == [50.0, 50.0]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 테마사진 화면 배치
+# ═══════════════════════════════════════════════════════════════
+
+def _with_hidden_photo(pid="p2"):
+    """`테마사진보정`에 해제 행을 넣은 보정 시트."""
+    return {
+        TAB_NAME_MAP: [NAME_MAP_COLS],
+        TAB_POST_FIX: [POST_FIX_COLS],
+        TAB_ATTENDEE_FIX: [ATTENDEE_FIX_COLS],
+        TAB_PHOTO_FIX: [PHOTO_FIX_COLS, [pid, "닉", "TRUE", ""]],
+    }
+
+
+def test_hidden_photos_sit_next_to_the_save_button():
+    """되돌리기는 체크와 같은 작업이다 — 화면 양 끝에 떨어져 있으면 안 된다.
+
+    맨 아래 있으면 월 목록을 다 지나 내려갔다가, 저장하러 다시 올라와야 한다.
+    """
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS,
+                                corrections=_with_hidden_photo()))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    labels = [e.label for e in at.expander]          # 문서 순서대로 나온다
+    hidden_at = [i for i, x in enumerate(labels) if "테마 아님으로 표시" in x]
+    months_at = [i for i, x in enumerate(labels) if "테마사진" in x and "장" in x
+                 and "표시" not in x]
+    assert hidden_at, f"해제 목록이 없다: {labels}"
+    assert months_at, f"월 목록이 없다: {labels}"
+    assert hidden_at[0] < months_at[0], labels
+
+
+def test_theme_matrix_is_gone():
+    """지운 것이 실수가 아니라 결정이라는 것을 여기서 못 박는다.
+
+    되살리려면 이 테스트를 뒤집으면 된다.
+    """
+    import streamlit_app
+
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    assert not at.exception, [str(e) for e in at.exception]
+    assert not any("테마 매트릭스" in str(m.value) for m in at.markdown)
+    assert not hasattr(streamlit_app, "heatmap"), "부르는 곳 없는 차트 코드"
+
+
+def test_no_theme_photos_says_so():
+    """히트맵과 함께 사라지면 테마사진이 없을 때 화면이 그냥 텅 빈다."""
+    at = run(stores=make_stores(MULTI_YEAR, [
+        photo("q1", datetime(2026, 3, 9, 9, 0), has_comment=False)]))
+    assert not at.exception, [str(e) for e in at.exception]
+    assert any("테마사진" in i.value and "없습니다" in i.value for i in at.info)
