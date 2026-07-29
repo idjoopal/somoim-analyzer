@@ -986,6 +986,7 @@ def build_analysis(raw: dict, corrections: dict) -> dict:
     from core.store import (
         apply_corrections, apply_photo_corrections, filter_excluded,
         real_by_nickname, real_name_resolution, resolution_from_corrections,
+        truncated_body_length,
     )
 
     posts = [dict(p) for p in raw.get("posts") or []]
@@ -1023,6 +1024,9 @@ def build_analysis(raw: dict, corrections: dict) -> dict:
         "photo_flags": corrections.get("photos") or {},
         "applied": counts,
         "history": raw.get("history") or [],
+        # 기간을 자르기 **전** 전체로 잰다 — 한 달만 보면 표본이 모자라
+        # 벽이 안 보이고, 보는 달마다 다른 답이 나온다.
+        "body_cut": truncated_body_length(posts),
     }
 
 
@@ -1093,7 +1097,7 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
                    applied: dict[str, int] | None = None,
                    pending: dict[str, int] | None = None,
                    correction_url: str | None = None,
-                   fix_store=None) -> None:
+                   fix_store=None, body_cut: int | None = None) -> None:
     period = period_label(start_ym, end_ym)
     months = month_axis(start_ym, end_ym)
     st.subheader(f"{period} 인사이트")
@@ -1118,7 +1122,7 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
     with tabs[1]:
         _tab_outings(posts, months)
     with tabs[2]:
-        _tab_attendance(posts, months)
+        _tab_attendance(posts, months, body_cut=body_cut)
     with tabs[3]:
         _tab_photos(photos, months, fix_store=fix_store)
     with tabs[4]:
@@ -1250,7 +1254,8 @@ def _tab_outings(posts: list[dict], months: list[int]) -> None:
     _category_section(posts, months)
 
 
-def _review_section(posts: list[dict], months: list[int]) -> None:
+def _review_section(posts: list[dict], months: list[int],
+                    body_cut: int | None = None) -> None:
     """📝 후기 게시글 목록 — 월별 expander, 각 후기 카드에 정규화된 참석자 명단.
 
     참석자는 Stage 1에서 적용된 매핑(가입인사 자동 + 사용자 매핑)으로 마스터 닉네임에
@@ -1268,6 +1273,15 @@ def _review_section(posts: list[dict], months: list[int]) -> None:
         "매칭된 출사 공지가 있으면 출사일·카테고리를 함께 보여줍니다. 사진은 🎨 테마사진 탭에서.",
         icon="📝",
     )
+    if body_cut:
+        cut_n = sum(1 for r in reviews if len(r.get("body") or "") >= body_cut)
+        st.warning(
+            f"소모임 목록 API가 본문을 **{body_cut}자**에서 끊어 보냅니다. "
+            f"이 기간 후기 {cut_n}건이 그 길이라 **뒤쪽에 적힌 참석자가 통째로 "
+            "빠졌을 수 있습니다.** 아래 카드에 ✂️ 표시가 붙은 것이 그 후기이며, "
+            "`참석자보정` 시트에 이미 후보로 올라가 있습니다.",
+            icon="✂️",
+        )
     if not reviews:
         st.caption("후기 게시글이 없습니다.")
         return
@@ -1286,9 +1300,13 @@ def _review_section(posts: list[dict], months: list[int]) -> None:
                 author = r.get("author") or "—"
                 body = r.get("body") or ""
                 attendees = r.get("attendees") or []
+                blen = len(body)
+                truncated = bool(body_cut) and blen >= body_cut
                 with st.container(border=True):
                     st.markdown(f"**{title}**")
-                    meta_bits = [f"🗓 {posted}", f"✍ {author}"]
+                    meta_bits = [f"🗓 {posted}", f"✍ {author}",
+                                 ("✂️ 본문 %d자 (잘림)" if truncated
+                                  else "📏 본문 %d자") % blen]
                     cat = r.get("category")
                     if cat:
                         meta_bits.append(f"🏷 {cat}")
@@ -1306,12 +1324,18 @@ def _review_section(posts: list[dict], months: list[int]) -> None:
                         )
                     else:
                         st.markdown("**참석자** — _명단 없음_")
+                    if truncated:
+                        st.caption(
+                            f"✂️ 본문이 {body_cut}자에서 끊겼습니다 — 이 명단이 "
+                            "전부라고 볼 수 없습니다. 소모임에서 원문을 확인하고 "
+                            "`참석자보정` 시트에 채워 주세요.")
                     if body:
                         st.markdown("**본문**")
                         st.text(body)
 
 
-def _tab_attendance(posts: list[dict], months: list[int]) -> None:
+def _tab_attendance(posts: list[dict], months: list[int],
+                    body_cut: int | None = None) -> None:
     st.caption(
         "후기 본문에 적힌 이름으로 실제 참석자를 추적합니다. 매칭이 안 되면 "
         "**`이름매핑1`에 실명을 채우는 것이 가장 효과가 큽니다** — 남는 것만 "
@@ -1397,7 +1421,7 @@ def _tab_attendance(posts: list[dict], months: list[int]) -> None:
     # 📝 후기 탭을 합쳤다 — 참석자 표에서 이상한 걸 보면 같은 탭에서 원문을 연다.
     st.divider()
     st.markdown("### 📖 후기 본문 상세 확인")
-    _review_section(posts, months)
+    _review_section(posts, months, body_cut)
 
 
 def _tab_photos(photos: list[dict], months: list[int], fix_store=None) -> None:
@@ -2160,7 +2184,8 @@ def main() -> None:
                    applied=analysis["applied"],
                    pending=analysis.get("pending"),
                    correction_url=sheet_url(stores[1].file_id) if stores else None,
-                   fix_store=stores[1] if stores else None)
+                   fix_store=stores[1] if stores else None,
+                   body_cut=analysis.get("body_cut"))
 
 
 
