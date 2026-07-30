@@ -64,6 +64,9 @@ CAT_RX    = re.compile(r"\[(" + "|".join(re.escape(c) for c in RAW_CATS) + r")\]
 CANCEL_RX = re.compile(r"[\(\[]\s*펑\s*[\)\]]")
 
 DATE_PATTERN_WITH_YEAR = r"20(\d{2})[./\-](\d{1,2})[./\-](\d{1,2})"
+# 구분자 없이 붙여 쓴 `260308`. 연 20~29·월 01~12·일 01~31만 받고 앞뒤에 숫자가
+# 붙으면 물린다 — 그래야 다른 여섯 자리 숫자를 날짜로 오해하지 않는다.
+DATE_PATTERN_COMPACT   = r"(?<!\d)(2\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)"
 DATE_PATTERNS_NO_YEAR  = [
     r"(\d{1,2})\.(\d{2})\s*[~\-]\s*\d{1,2}\.\d{2}",   # 범위
     r"(\d{1,2})\.(\d{2})",
@@ -614,11 +617,24 @@ NAME_RX = re.compile(r"[가-힣]{2,4}|[A-Za-z]{2,10}")
 LEFT_MEMBER = "__LEFT__"
 NOT_A_NAME  = "__NOISE__"
 
-REVIEW_LOOKBACK_DAYS    = 90    # 후기 제목의 MM.DD를 과거로 해석할 최대 범위
 MATCH_MAX_DAYS_EXACT    = 7     # 후기 출사일이 파싱된 경우 매칭 허용 거리
 MATCH_MAX_DAYS_FALLBACK = 45    # 작성일 근접 fallback 허용 거리
-CAT_MATCH_BONUS         = 100   # 카테고리 일치 시 점수 감점(우선)
-AUTHOR_MATCH_BONUS      = 5     # 작성자 일치 시 점수 감점
+
+# 매칭 점수의 저울. **날짜만으로는 갈리지 않는다** — 같은 날 두 출사가 열리고,
+# 제목의 날짜가 틀리기도 한다. 그래서 증거를 힘 센 순으로 쌓는다:
+#
+#   제목 > 작성자 > 카테고리
+#
+# 제목이 가장 세다. 장소·컨셉 이름("노들섬", "코타츠")은 우연히 겹치지 않는다.
+# 작성자가 다음이다 — 대개 출사를 연 사람이 후기도 쓴다(실제 데이터에서 후기
+# 254건 중 작성자가 다른 것은 1건뿐이었다). 카테고리가 가장 약하다 — 같은
+# 출사인데 공지는 `[인물]`, 후기는 `[인풍]`로 적히는 일이 흔하다.
+#
+# 예전에는 카테고리가 100으로 나머지를 전부 눌렀다. 그래서 **같은 날·같은
+# 사람이 쓴 짝을 놔두고 나흘 떨어진 남의 출사로** 붙는 일이 생겼다.
+TITLE_MATCH_BONUS       = 12    # 제목이 닮은 정도(0~1)에 곱한다
+AUTHOR_MATCH_BONUS      = 8     # 공지를 연 사람이 후기도 썼다
+CAT_MATCH_BONUS         = 3     # 카테고리 표기가 같다
 
 
 def parse_member_csv(text: str) -> tuple[set[str], dict[str, str], dict[str, str]]:
@@ -767,7 +783,11 @@ def parse_review_outing_date(
     """후기 제목/내용에서 '본 출사'의 날짜 추출.
 
     후기는 출사 이후에 작성되므로 infer_outing_date(미래 지향)와 반대로,
-    MM.DD를 작성일 이전의 가장 최근(≤ posted, ≤ REVIEW_LOOKBACK_DAYS) 날짜로 해석한다.
+    MM.DD는 **작성일 이전의 가장 가까운 날짜**로 읽는다. 예전에는 90일까지만
+    읽고 그보다 오래된 것은 버렸는데, 버리면 작성일로 떨어진다 — 그리고
+    **몇 달 늦게 쓴 후기에서 작성일은 제목보다 훨씬 나쁜 단서다.** 2월 출사
+    후기를 7월에 올리면 7월에 열린 남의 출사에 가서 붙는다. 제목이 틀렸다면
+    어차피 매칭 창(±7일)이 걸러 낸다.
     명시 연도(출사진행날짜 / 제목 YYYY.MM.DD)는 그대로 신뢰. 기존 날짜 정규식 재사용.
     """
     posted_date = posted_dt.date()
@@ -782,12 +802,13 @@ def parse_review_outing_date(
     t = CANCEL_RX.sub("", title or "")
     t = re.sub(r"[<>《》]", " ", t)
 
-    m = re.search(DATE_PATTERN_WITH_YEAR, t)
-    if m:
-        try:
-            return date(2000 + int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            pass
+    for pat in (DATE_PATTERN_WITH_YEAR, DATE_PATTERN_COMPACT):
+        m = re.search(pat, t)
+        if m:
+            try:
+                return date(2000 + int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                pass
 
     md = None
     for pat in DATE_PATTERNS_NO_YEAR:
@@ -809,7 +830,7 @@ def parse_review_outing_date(
             cand = date(posted_date.year + off, mo, day)
         except ValueError:
             continue
-        if cand <= posted_date and (posted_date - cand).days <= REVIEW_LOOKBACK_DAYS:
+        if cand <= posted_date:
             return cand
     return None
 
@@ -867,57 +888,122 @@ def annotate_review_attendees(
     return posts, unknown_freq
 
 
+# 소모임의 "정모" 기능이 자동으로 만드는 게시글. 후기로 분류되지만 후기가 아니고
+# (본문이 `📌 정모 정보 / 📅 날짜 / 📍 장소` 틀 그대로다) 참석자도 없다. 그런데도
+# 매칭에 끼면 **엉뚱한 공지를 선점해 진짜 후기가 못 붙는다.**
+MEETUP_POST_RX = re.compile(r"📌\s*정모 정보|정모에 대한 이야기를 나눠보세요")
+
+# 작성일로 날짜를 재는 약한 매칭에서 요구하는 제목 닮음의 바닥.
+# 0.22("반차 쓰고 벚꽃" ↔ "올공 밤벚꽃" — `벚꽃` 하나만 겹친다)는 통과하면 안 된다.
+TITLE_MIN_AFFINITY = 0.4
+
+_TITLE_NOISE_RX = re.compile(
+    r"[\[\(<《][^\]\)>》]*[\]\)>》]"          # [인풍] (펑) <03.04> 같은 딱지
+    r"|\d+[./\-]?\d*"                        # 날짜·숫자
+    r"|후기|출사|정출|모임|사진|촬영|컨셉|다녀|가기|하기|번개"
+)
+
+
+def title_affinity(a: str, b: str) -> float:
+    """두 제목이 닮은 정도 0~1. 글자 2연 겹침(Dice)으로 잰다.
+
+    낱말 단위로 자르면 띄어쓰기 하나에 무너진다 — 실제로 공지는
+    `비오는 노들섬`, 후기는 `비오는노들섬 후기`였다. 글자 단위로 재면
+    붙여 쓰든 띄어 쓰든 같은 곳을 가리키는 것이 보인다.
+
+    딱지·날짜와 아무 출사에나 붙는 말(후기·출사·정출…)은 먼저 지운다.
+    안 지우면 `[인풍] … 출사 후기`끼리 전부 닮아 보인다.
+    """
+    def grams(s: str) -> set[str]:
+        s = re.sub(r"\s+", "", _TITLE_NOISE_RX.sub(" ", s or ""))
+        return {s[i:i + 2] for i in range(len(s) - 1)}
+
+    ga, gb = grams(a), grams(b)
+    if not ga or not gb:
+        return 0.0
+    return 2 * len(ga & gb) / (len(ga) + len(gb))
+
+
 def match_outings_with_reviews(posts: list[dict]) -> list[dict]:
-    """출사 공지(cat=A)와 후기(cat=E)를 출사일·카테고리로 매칭(in-place).
+    """출사 공지(cat=A)와 후기(cat=E)를 짝지어 준다(in-place).
 
     공지: matched_review_id, attendees(매칭 후기의 참석자), actually_held.
     후기: matched_outing_id.
-    매칭 점수(작을수록 우선) = 날짜거리 − 카테고리일치보너스 − 작성자일치보너스.
-    후기 출사일이 파싱되면 outing_date와 근접(±EXACT) 매칭, 아니면 작성일 근접(±FALLBACK).
+
+    점수(작을수록 우선) = 날짜거리 − 제목닮음×12 − 작성자일치×8 − 카테고리일치×3.
+    후기 출사일이 파싱되면 outing_date와 근접(±EXACT), 아니면 작성일 근접(±FALLBACK).
+
+    **짝은 전체에서 점수가 좋은 순으로 확정한다.** 예전에는 후기를 하나씩 돌며
+    그때그때 제일 나은 공지를 집어갔는데, 같은 날 열린 두 출사의 후기 둘이
+    서로 상대의 공지를 가져가 **맞바꿔 붙는** 일이 생겼다. 전체를 놓고 가장
+    확실한 짝부터 확정하면 그런 뒤바뀜이 안 생긴다.
+
+    **펑 난 출사는 후보에서 뺀다.** 안 간 출사에는 후기가 없다. 그런데도 붙으면
+    `actually_held`가 서고 참석자까지 그 출사에 얹혀, 열리지도 않은 날짜에
+    사람들이 참석한 것으로 집계된다.
     """
-    notices = [p for p in posts if p.get("cat") == "A" and p.get("outing_date")]
-    reviews = [p for p in posts if p.get("cat") == "E"]
+    notices = [p for p in posts
+               if p.get("cat") == "A" and p.get("outing_date")
+               and not p.get("is_canceled")]
+    reviews = []
+    for p in posts:
+        if p.get("cat") != "E":
+            continue
+        p["matched_outing_id"] = None
+        p["is_meetup_post"] = bool(MEETUP_POST_RX.search(p.get("body") or ""))
+        if not p["is_meetup_post"]:
+            reviews.append(p)
+    # 펑 난 공지까지 함께 비운다 — 후보에서 빠졌다고 예전 값이 남아 있으면
+    # 열리지도 않은 출사가 참석자를 달고 집계에 들어간다.
+    for n in posts:
+        if n.get("cat") == "A":
+            n["matched_review_id"] = None
+            n["attendees"] = []
+            n["actually_held"] = False
 
-    for n in notices:
-        n["matched_review_id"] = None
-        n["attendees"] = []
-        n["actually_held"] = False
-    for r in reviews:
-        r.setdefault("matched_outing_id", None)
+    def pairs(rs: list[dict], *, use_posted: bool):
+        """(점수, 후기, 공지) 후보 전부.
 
-    def best_match(r: dict):
-        rod = r.get("review_outing_date")
-        r_date = date.fromisoformat(rod) if rod else r["posted_at"].date()
-        r_cat = r.get("category")
-        limit = MATCH_MAX_DAYS_EXACT if rod else MATCH_MAX_DAYS_FALLBACK
-        best, best_score, best_dist = None, float("inf"), None
-        for n in notices:
-            if n["matched_review_id"]:
+        **출사일을 못 읽어 작성일로 재는 짝은 제목이나 작성자가 걸려야 낸다.**
+        작성일은 출사일이 아니다 — 45일 창을 열어 두고 거리만 보면 아무 후기나
+        아무 공지에 가서 붙고, 실제로 그렇게 붙었다.
+        """
+        out = []
+        for r in rs:
+            rod = None if use_posted else r.get("review_outing_date")
+            r_date = date.fromisoformat(rod) if rod else r["posted_at"].date()
+            limit = MATCH_MAX_DAYS_EXACT if rod else MATCH_MAX_DAYS_FALLBACK
+            for n in notices:
+                dist = abs((r_date - date.fromisoformat(n["outing_date"])).days)
+                if dist > limit:
+                    continue
+                aff = title_affinity(r.get("title", ""), n.get("title", ""))
+                same_author = bool(n.get("author")) and n["author"] == r.get("author")
+                if rod is None and aff < TITLE_MIN_AFFINITY and not same_author:
+                    continue
+                score = dist - aff * TITLE_MATCH_BONUS
+                if same_author:
+                    score -= AUTHOR_MATCH_BONUS
+                if n.get("category") and r.get("category") \
+                        and n["category"] == r["category"]:
+                    score -= CAT_MATCH_BONUS
+                out.append((score, r, n))
+        return sorted(out, key=lambda t: (t[0], t[1]["id"], t[2]["id"]))
+
+    def assign(cands) -> None:
+        for _, r, n in cands:
+            if r["matched_outing_id"] or n["matched_review_id"]:
                 continue
-            dist = abs((r_date - date.fromisoformat(n["outing_date"])).days)
-            if dist > limit:
-                continue
-            score = dist
-            if n.get("category") and r_cat and n["category"] == r_cat:
-                score -= CAT_MATCH_BONUS
-            if n.get("author") and n["author"] == r.get("author"):
-                score -= AUTHOR_MATCH_BONUS
-            if score < best_score:
-                best, best_score, best_dist = n, score, dist
-        return best, best_dist
-
-    # 가장 가까운 후기부터 공지를 선점 → 먼 후기가 가로채는 것 방지
-    order = sorted(
-        reviews,
-        key=lambda r: (best_match(r)[1] if best_match(r)[1] is not None else 10**9),
-    )
-    for r in order:
-        n, _ = best_match(r)
-        if n is not None:
             n["matched_review_id"] = r["id"]
             n["attendees"] = list(r.get("attendees", []))
             n["actually_held"] = True
             r["matched_outing_id"] = n["id"]
+
+    assign(pairs(reviews, use_posted=False))
+    # 제목의 날짜가 틀려 1차에서 못 붙은 후기는 작성일로 한 번 더 본다.
+    left = [r for r in reviews if not r["matched_outing_id"]]
+    if left:
+        assign(pairs(left, use_posted=True))
     return posts
 
 

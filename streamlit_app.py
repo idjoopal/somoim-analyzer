@@ -496,7 +496,14 @@ def attendees_table(posts: list[dict]) -> list[dict]:
 
 
 def orphan_reviews(posts: list[dict]) -> list[dict]:
-    return [p for p in posts if p.get("cat") == "E" and not p.get("matched_outing_id")]
+    """공지와 못 이어진 후기 — 참석자가 집계에서 빠지는 것들.
+
+    소모임이 자동으로 만든 정모 게시글은 뺀다. 후기가 아니라 참석자도 없어서
+    **사람이 할 일이 없는데**, 신뢰도 패널에 남으면 영원히 안 줄어드는 숙제로
+    보인다.
+    """
+    return [p for p in posts if p.get("cat") == "E"
+            and not p.get("matched_outing_id") and not p.get("is_meetup_post")]
 
 
 def activity_ranking(posts: list[dict], photos: list[dict]) -> list[dict]:
