@@ -653,3 +653,260 @@ def test_page_slice_clamps_a_page_that_no_longer_exists():
 def test_page_slice_of_an_empty_list_still_has_one_page():
     from streamlit_app import page_slice
     assert page_slice([], 1, 40) == ([], 1, 0)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 공동 등수 — 같은 숫자면 같은 등수
+# ═══════════════════════════════════════════════════════════════
+
+def test_ties_share_a_rank_and_the_next_one_skips():
+    """5회가 셋이면 7·8·9등이 아니라 전부 같은 등수여야 한다."""
+    from streamlit_app import competition_rank
+    scores = [("가", 9), ("나", 5), ("다", 5), ("라", 1)]
+    assert competition_rank("가", scores) == (1, 4)
+    assert competition_rank("나", scores) == (2, 4)
+    assert competition_rank("다", scores) == (2, 4)
+    assert competition_rank("라", scores) == (4, 4)      # 3등은 건너뛴다
+
+
+def test_rank_does_not_depend_on_input_order():
+    """부르는 쪽마다 정렬이 다르다 — `outing_user_ranking`은 합계 순이다."""
+    from streamlit_app import competition_rank
+    scores = [("가", 9), ("나", 5), ("다", 1)]
+    assert competition_rank("나", scores) == competition_rank("나", scores[::-1])
+
+
+def test_rank_of_someone_who_never_did_it():
+    from streamlit_app import competition_rank
+    assert competition_rank("없는사람", [("가", 1)]) == (None, 1)
+
+
+def test_attendance_rank_no_longer_splits_equals():
+    """지난 판에서는 목록 위치를 등수로 써서 동점자가 갈라졌다."""
+    from streamlit_app import member_profile
+    posts = [notice("n1", "2026-03-01", ["가", "나", "다"]),
+             notice("n2", "2026-03-08", ["가"])]
+    members = [member(f"w{i}", n) for i, n in enumerate("가나다")]
+    ranks = {n: member_profile(n, posts, [], members)["참석 순위"] for n in "가나다"}
+    assert ranks == {"가": 1, "나": 2, "다": 2}
+
+
+def test_host_rank_counts_outings_that_happened_not_the_total():
+    """펑을 많이 낸 사람이 합계로 앞서면 안 된다."""
+    from streamlit_app import member_profile
+    posts = [notice(f"c{i}", "2026-03-01", author="펑쟁이",
+                    is_canceled=True, held=False) for i in range(5)]
+    posts.append(notice("k1", "2026-03-02", ["펑쟁이"], author="펑쟁이"))
+    posts += [notice(f"g{i}", "2026-03-0%d" % (i + 3), ["성실"], author="성실")
+              for i in range(3)]
+    members = [member("w1", "펑쟁이"), member("w2", "성실")]
+    assert member_profile("성실", posts, [], members)["개최 순위"] == 1
+    assert member_profile("펑쟁이", posts, [], members)["개최 순위"] == 2
+
+
+def test_someone_who_only_ever_canceled_is_not_in_the_host_pool():
+    """'펑 아닌 출사를 연 사람들 중 몇 등'이라야 말이 된다."""
+    from streamlit_app import member_profile
+    posts = [notice("c1", "2026-03-01", author="펑만", is_canceled=True, held=False),
+             notice("g1", "2026-03-02", ["연사람"], author="연사람")]
+    members = [member("w1", "펑만"), member("w2", "연사람")]
+    prof = member_profile("펑만", posts, [], members)
+    assert prof["개최 순위"] is None and prof["개최 모수"] == 1
+
+
+def test_like_rank_ignores_people_with_almost_no_photos():
+    """한 장 올려 좋아요 9를 받은 사람이 1등이면 그 등수는 뜻이 없다."""
+    from streamlit_app import LIKE_RANK_MIN_PHOTOS, member_profile
+    photos = [photo("lucky", "한장", likes=99)]
+    photos += [photo(f"m{i}", "꾸준", likes=5)
+               for i in range(LIKE_RANK_MIN_PHOTOS)]
+    members = [member("w1", "한장"), member("w2", "꾸준")]
+    assert member_profile("한장", [], photos, members)["좋아요 순위"] is None
+    assert member_profile("꾸준", [], photos, members)["좋아요 순위"] == 1
+
+
+# ═══════════════════════════════════════════════════════════════
+# 자기 출사 후기율 — 내가 연 출사에 내가 후기를 썼나
+# ═══════════════════════════════════════════════════════════════
+
+def _hosted_with_review(pid, host, writer, day="01"):
+    """개최 공지 + 그 공지에 매칭된 후기 한 쌍."""
+    return [notice(pid, f"2026-03-{day}", ["누구"], author=host,
+                   matched_review_id=f"r{pid}"),
+            review(f"r{pid}", author=writer, matched=pid)]
+
+
+def test_self_review_rate_counts_only_reviews_this_person_wrote():
+    """후기를 꼭 개최자가 쓰는 것은 아니다 — 있는지가 아니라 누가 썼는지를 센다."""
+    from streamlit_app import member_profile
+    posts = (_hosted_with_review("a", "주최", "주최", "01")
+             + _hosted_with_review("b", "주최", "딴사람", "08"))
+    prof = member_profile("주최", posts, [], [member("w1", "주최")])
+    assert prof["개최 진행"] == 2
+    assert prof["자기 출사 후기"] == 1 and prof["자기 출사 후기율"] == 50.0
+
+
+def test_self_review_rate_leaves_canceled_outings_out_of_the_denominator():
+    """취소된 출사는 후기를 쓸 일이 없다 — 분모에 넣으면 펑 낸 사람만 손해다."""
+    from streamlit_app import member_profile
+    posts = _hosted_with_review("a", "주최", "주최", "01")
+    posts.append(notice("c1", "2026-03-08", author="주최",
+                        is_canceled=True, held=False))
+    prof = member_profile("주최", posts, [], [member("w1", "주최")])
+    assert prof["개최"] == 2 and prof["개최 진행"] == 1
+    assert prof["자기 출사 후기율"] == 100.0
+
+
+# ═══════════════════════════════════════════════════════════════
+# 상대 기준 — 고정값이면 아무도 못 받거나 전원이 받는다
+# ═══════════════════════════════════════════════════════════════
+
+def test_a_tiny_pool_gives_the_title_to_nobody():
+    """세 사람뿐인 판의 '상위 25%'는 1등 한 명을 돌려 말한 것뿐이다."""
+    from streamlit_app import top_share
+    tiny = [("가", 9), ("나", 5), ("다", 1)]
+    assert top_share("가", tiny, 0.30) is False
+
+
+def test_everyone_tied_means_everyone_is_in_the_top_share():
+    """같은 값인데 한 명만 빼면 그게 공동 등수가 고친 바로 그 문제다."""
+    from streamlit_app import top_share
+    flat = [(n, 5) for n in "가나다라마"]
+    assert all(top_share(n, flat, 0.30) for n in "가나다라마")
+
+
+def test_top_share_needs_a_minimum_absolute_value_too():
+    """전원이 한 장씩 올린 기간에는 상위 30%도 그냥 한 장이다."""
+    from streamlit_app import top_share
+    scores = [(n, 1) for n in "가나다라마"]
+    assert top_share("가", scores, 0.30, min_value=2) is False
+
+
+def test_bottom_share_finds_the_quiet_end():
+    from streamlit_app import bottom_share
+    scores = [("가", 9), ("나", 7), ("다", 5), ("라", 1)]
+    assert bottom_share("라", scores, 0.25) is True
+    assert bottom_share("가", scores, 0.25) is False
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🏆 칭호
+# ═══════════════════════════════════════════════════════════════
+
+def _club(posts, photos, members, months=None):
+    """(이름 → 칭호 목록). 화면이 하는 것과 같은 순서로 부른다."""
+    from streamlit_app import (club_context, member_companions, member_profile,
+                               member_titles)
+    months = months or [202603]
+    ctx = club_context(posts, photos, members)
+    out = {}
+    for m in members:
+        n = m["mn"]
+        prof = member_profile(n, posts, photos, members, ctx)
+        out[n] = member_titles(n, prof, member_companions(n, posts, ctx["쌍"]),
+                               posts, photos, months, ctx)
+    return out
+
+
+def _names(titles):
+    return [t["칭호"] for t in titles]
+
+
+def test_a_member_with_no_activity_gets_only_the_ghost_title():
+    posts = [notice("n1", "2026-03-01", ["활동가"])]
+    members = [member("w1", "활동가"), member("w2", "유령")]
+    assert _names(_club(posts, [], members)["유령"]) == ["유령 회원"]
+
+
+def test_titles_are_capped_and_sorted_by_rarity():
+    """칭호가 줄줄이 달리면 아무것도 특별해 보이지 않는다."""
+    from streamlit_app import TITLE_LIMIT
+    posts, members = _busy_club()
+    titles = _club(posts, _busy_photos(), members)["으뜸"]
+    assert len(titles) <= TITLE_LIMIT
+    assert [t["우선"] for t in titles] == sorted((t["우선"] for t in titles),
+                                                reverse=True)
+
+
+def test_only_one_title_per_metric():
+    """사진 1등이 `다작왕`·`부지런한 업로더`로 두 칸을 먹으면 안 된다."""
+    posts, members = _busy_club()
+    for titles in _club(posts, _busy_photos(), members).values():
+        지표 = [t["지표"] for t in titles]
+        assert len(지표) == len(set(지표)), 지표
+
+
+def _busy_club():
+    """여섯 명이 활동하는 판 — 칭호가 여러 종류 붙을 만큼."""
+    people = ["으뜸", "버금", "셋째", "넷째", "다섯", "여섯"]
+    posts = []
+    for i in range(12):
+        # 으뜸은 전부 참석, 뒤로 갈수록 드물게.
+        att = [p for j, p in enumerate(people) if i % (j + 1) == 0]
+        posts.append(notice(f"n{i}", "2026-03-%02d" % (i + 1), att,
+                            author=people[i % 3],
+                            category=["풍경", "인물", "GN", "인물&풍경"][i % 4]))
+    return posts, [member(f"w{i}", p) for i, p in enumerate(people)]
+
+
+def _busy_photos():
+    out = []
+    for i, p in enumerate(["으뜸", "버금", "셋째", "넷째", "다섯", "여섯"]):
+        for j in range(20 - i * 3):
+            out.append(photo(f"ph{p}{j}", p, likes=10 - i,
+                             themed=(j % 3 == 0)))
+    return out
+
+
+def test_a_combo_partner_never_also_gets_the_follower_title():
+    """서로 붙어 다니는 것과 한쪽이 쫓아다니는 것은 다른 얘기다."""
+    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), ["나무", "바다"])
+             for i in range(4)]
+    members = [member("w1", "나무"), member("w2", "바다")]
+    got = _names(_club(posts, [], members)["나무"])
+    assert "바다와 환상의 콤비" in got
+    assert not any("따라다녀" in t for t in got)
+
+
+def test_the_follower_title_names_the_person_followed():
+    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), ["따라", "인기"])
+             for i in range(4)]
+    # 인기는 혼자서도 많이 다닌다 → 서로 비율이 안 맞아 콤비가 아니다.
+    posts += [notice(f"s{i}", "2026-04-%02d" % (i + 1), ["인기"])
+              for i in range(8)]
+    members = [member("w1", "따라"), member("w2", "인기")]
+    assert "인기만 따라다녀" in _names(_club(posts, [], members)["따라"])
+
+
+def test_a_lopsided_taste_names_the_category():
+    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), ["풍경러"],
+                    category="풍경") for i in range(5)]
+    posts.append(notice("x", "2026-03-20", ["풍경러"], category="인물"))
+    got = _names(_club(posts, [], [member("w1", "풍경러")])["풍경러"])
+    assert "풍경 사냥꾼" in got
+
+
+def test_nothing_matches_means_no_titles():
+    """조건에 안 걸리면 빈 목록 — 화면은 그때 구역을 안 그린다.
+
+    한 번 왔다 만 사람이라도 **최근에** 왔으면 `새싹`이 붙는다. 아무것도 안
+    붙는 자리는 "예전에 잠깐 왔고 그 뒤로 조용한" 사람이다.
+    """
+    posts = [notice("first", "2026-01-05", ["남", "들"]),
+             notice("n1", "2026-01-15", ["잠깐", "남"]),
+             notice("n2", "2026-03-02", ["남", "들"]),
+             notice("n3", "2026-03-03", ["남", "들"])]
+    members = [member(f"w{i}", n) for i, n in enumerate(["잠깐", "남", "들"])]
+    assert _club(posts, [], members, [202601, 202602, 202603])["잠깐"] == []
+
+
+def test_passing_a_context_does_not_change_the_answer():
+    """`ctx`는 속도를 위한 통로일 뿐 — 값이 달라지면 두 화면이 어긋난다."""
+    from streamlit_app import club_context, member_companions, member_profile
+    posts, members = _busy_club()
+    photos = _busy_photos()
+    ctx = club_context(posts, photos, members)
+    assert (member_profile("으뜸", posts, photos, members)
+            == member_profile("으뜸", posts, photos, members, ctx))
+    assert (member_companions("으뜸", posts)
+            == member_companions("으뜸", posts, ctx["쌍"]))

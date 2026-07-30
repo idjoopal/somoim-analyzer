@@ -643,7 +643,8 @@ CO_ATTENDANCE_COLS = ["사람 A", "사람 B", "함께", "A 참석", "A 기준",
 COMPANION_COLS = ["함께 간 사람", "함께", "내 기준", "상대 참석", "상대 기준"]
 
 
-def member_companions(name: str, posts: list[dict]) -> list[dict]:
+def member_companions(name: str, posts: list[dict],
+                      pairs: tuple[Counter, Counter] | None = None) -> list[dict]:
     """한 사람의 동행 **전원**. 상한을 두지 않는다.
 
     `co_attendance`로는 이 화면을 만들 수 없다 — 그쪽은 **전역 상위 N쌍**이라
@@ -654,8 +655,12 @@ def member_companions(name: str, posts: list[dict]) -> list[dict]:
     주석의 80칸 표 사고와 같은 이유). 다만 `사람 A`/`사람 B`는 쓰지 않는다 —
     여기서는 기준이 되는 사람이 이미 정해져 있어 한 칸이면 되고, 참석 탭의
     표와 헤더가 같으면 어느 화면을 보고 있는지 헷갈린다.
+
+    `pairs`는 이미 세어 둔 `_attendance_pairs` 결과를 넘기는 통로다 — 전 멤버의
+    칭호를 낼 때 쉰 명분 쌍을 쉰 번 다시 세면 그 구역을 열 때마다 멈춘다.
+    안 넘기면 스스로 센다(단독 호출·테스트가 그대로 돈다).
     """
-    pair, solo = _attendance_pairs(posts)
+    pair, solo = pairs if pairs is not None else _attendance_pairs(posts)
     mine = solo.get(name, 0)
     rows = []
     for (a, b), n in pair.items():
@@ -876,6 +881,102 @@ def newcomer_settling(members: list[dict], posts: list[dict],
 # 우회해야 하고, 기간을 좁혔을 때 드롭다운에서 사람이 사라지는 문제도 생긴다.
 # ═══════════════════════════════════════════════════════════════
 
+# 장당 좋아요 순위에 들어가려면 있어야 할 최소 사진 수.
+# 한 장 올려 좋아요 9를 받은 사람이 1등이면 그 등수는 아무 뜻이 없다.
+LIKE_RANK_MIN_PHOTOS = 10
+
+
+def competition_rank(name: str,
+                     scores: list[tuple[str, float]]) -> tuple[int | None, int]:
+    """(공동 등수, 모수). 같은 값이면 같은 등수, 다음은 건너뛴다 — 1·2·2·4.
+
+    목록 위치를 그대로 등수로 쓰면 5회가 셋일 때 7·8·9등으로 갈린다. **같은
+    숫자인데 등수가 다르면 본인 화면에서 그건 그냥 틀린 값이다.**
+
+    입력 순서에 기대지 않고 **여기서 값 기준으로 정렬한다** — 부르는 쪽마다
+    정렬이 다르면(`outing_user_ranking`은 합계 순, `attendance_counts`는 횟수
+    순) 같은 함수가 화면마다 다른 등수를 낸다.
+    """
+    total = len(scores)
+    mine = next((v for n, v in scores if n == name), None)
+    if mine is None:
+        return None, total
+    return sum(1 for _, v in scores if v > mine) + 1, total
+
+
+def top_share(name: str, scores: list[tuple[str, float]], share: float, *,
+              min_people: int = 4, min_value: float = 1) -> bool:
+    """모수 중 **상위 `share`**(0~1)에 드는가.
+
+    고정값(`테마사진 3장 이상`)으로 칭호를 주면 모임 활동량에 따라 아무도 못
+    받거나 전원이 받는다. 분위로 재면 어떤 기간을 봐도 일정 비율이 받는다.
+
+    **모수가 작으면 아무에게도 안 준다** — 세 사람만 사진을 올린 기간의
+    "상위 25%"는 1등 한 명을 돌려 말한 것뿐이라 칭호가 되지 못한다.
+
+    **최소 절대값도 함께 본다** — 전원이 한 장씩 올린 기간에는 상위 30%도 그냥
+    한 장이다. 다만 이 바닥은 낮게 잡고, 걸러 내는 일은 분위가 한다.
+    """
+    if len(scores) < min_people:
+        return False
+    mine = next((v for n, v in scores if n == name), None)
+    if mine is None or mine < min_value:
+        return False
+    rank, total = competition_rank(name, scores)
+    # 동점자가 많아 경계에 걸치면 넣어 준다 — 같은 값인데 한 명만 빼면 그게
+    # `competition_rank`가 고친 바로 그 문제다.
+    return rank is not None and rank <= max(1, round(total * share))
+
+
+def bottom_share(name: str, scores: list[tuple[str, float]], share: float, *,
+                 min_people: int = 4) -> bool:
+    """`top_share`의 반대쪽. `혼자가 편한 사람`처럼 적을수록 걸리는 칭호용."""
+    if len(scores) < min_people:
+        return False
+    flipped = [(n, -v) for n, v in scores]
+    return top_share(name, flipped, share, min_people=min_people,
+                     min_value=float("-inf"))
+
+
+def club_context(posts: list[dict], photos: list[dict],
+                 members: list[dict]) -> dict:
+    """전 멤버 공통 집계 — 순위표·쌍·첫 등장·휴면 명단. **한 번 만들어 돌려 쓴다.**
+
+    `member_profile`은 안에서 `attendance_counts`·`photo_user_ranking`·
+    `outing_user_ranking`·`dormant_members`·`member_first_seen`을 매번 다시
+    돈다. 한 사람만 볼 때는 문제가 없지만 **칭호 분포는 전 멤버를 훑으므로**
+    쉰 명이면 그게 쉰 번이 되어 구역을 열 때마다 몇 초씩 멈춘다.
+    """
+    photo_rows = photo_user_ranking(photos)
+    pair, solo = _attendance_pairs(posts)
+
+    # 쌍 그래프의 차수 = 그 사람이 함께 가 본 사람 수. 쌍을 이미 다 세어
+    # 두었으므로 한 번 더 훑기만 하면 된다.
+    deg: Counter = Counter()
+    for a, b in pair:
+        deg[a] += 1
+        deg[b] += 1
+
+    first, last = member_first_seen(posts)
+    return {
+        "참석": [(r["멤버"], r["참석횟수"]) for r in attendance_counts(posts)],
+        # 펑만 낸 사람은 모수에서 뺀다 — "펑 아닌 출사를 연 사람들 중 몇 등"이라야
+        # 말이 된다. 정렬은 믿지 않는다(`outing_user_ranking`은 합계 순이다).
+        "개최": [(r["작성자"], r["진행"])
+                for r in outing_user_ranking(posts) if r["진행"]],
+        "사진": [(r["작성자"], r["사진수"]) for r in photo_rows],
+        "테마": [(r["작성자"], r["테마예상"]) for r in photo_rows if r["테마예상"]],
+        "좋아요": [(r["작성자"], r["장당좋아요"]) for r in photo_rows
+                if r["사진수"] >= LIKE_RANK_MIN_PHOTOS],
+        "동행자": [(n, c) for n, c in deg.items()],
+        "쌍": (pair, solo),
+        "첫등장": first,
+        "최근": last,
+        "휴면": {r["멤버"] for r in dormant_members(posts, members)},
+        "후기저자": {p["id"]: p.get("author")
+                  for p in posts if p.get("cat") == "E"},
+    }
+
 def member_options(members: list[dict], posts: list[dict],
                    photos: list[dict]) -> list[dict]:
     """드롭다운 후보 — `{이름, 참석, 게시글, 사진}`. 활동이 많은 순.
@@ -967,7 +1068,7 @@ def member_reviews(name: str, posts: list[dict],
 
 
 def member_profile(name: str, posts: list[dict], photos: list[dict],
-                   members: list[dict]) -> dict:
+                   members: list[dict], ctx: dict | None = None) -> dict:
     """한 사람의 모든 스칼라. 화면 맨 위 배지·KPI가 여기서 나온다.
 
     **참석률의 분모는 매칭된 출사뿐이다.** 후기가 없는 출사는 누가 갔는지 알
@@ -976,7 +1077,14 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
     **휴면 판정은 `dormant_members`를 그대로 쓴다.** 여기서 다시 계산하면 🧑‍🤝‍🧑
     멤버 탭의 "최근 조용해진 멤버"와 기준이 어긋나, 같은 사람이 한 화면에선
     휴면이고 다른 화면에선 아닌 상태가 된다.
+
+    **순위는 공동 등수다**(`competition_rank`). 목록 위치를 등수로 쓰면 같은
+    횟수인 사람들이 서로 다른 등수를 받는다.
+
+    `ctx`는 `club_context`를 넘기는 통로다 — 전 멤버를 훑을 때 공통 집계를
+    쉰 번 다시 돌지 않기 위한 것. 안 넘기면 스스로 만든다.
     """
+    ctx = ctx or club_context(posts, photos, members)
     m = next((x for x in members or [] if x.get("mn") == name), {})
     my_posts = [p for p in posts if p.get("author") == name]
     my_photos = [p for p in photos if p.get("author") == name]
@@ -986,45 +1094,225 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
 
     hosted = [p for p in my_posts if p.get("cat") == "A"]
     canceled = [p for p in hosted if p.get("is_canceled")]
+    ran = [p for p in hosted if not p.get("is_canceled")]
     reviews = [p for p in my_posts if p.get("cat") == "E"]
 
-    first, last = member_first_seen(posts)
+    # **"이 출사에 후기가 있나"가 아니라 "그 후기를 이 사람이 썼나"** 를 센다 —
+    # 후기를 반드시 개최자가 쓰는 것은 아니다(매칭은 작성자 일치에 가산점만 준다).
+    # 분모에서 펑을 빼는 이유: 취소된 출사는 애초에 후기를 쓸 일이 없어, 넣으면
+    # 펑을 낸 사람의 후기율이 이유 없이 떨어진다.
+    self_reviewed = sum(
+        1 for p in ran
+        if ctx["후기저자"].get(p.get("matched_review_id")) == name)
+
     themed = [p for p in my_photos if p.get("has_comment")]
     likes = sum(p.get("likes", 0) for p in my_photos)
 
-    # 순위는 전체 랭킹에서의 자리 — "12회 참석"만으로는 그게 많은 건지 모른다.
-    att_rank = [r["멤버"] for r in attendance_counts(posts)]
-    photo_rank = [r["작성자"] for r in photo_user_ranking(photos)]
-
-    dormant = {r["멤버"] for r in dormant_members(posts, members)}
-    return {
+    # 순위는 전체에서의 자리 — "12회 참석"만으로는 그게 많은 건지 모른다.
+    ranks = {k: competition_rank(name, ctx[k])
+             for k in ("참석", "개최", "사진", "테마", "좋아요")}
+    out = {
         "이름": name,
         "운영진": bool(m.get("is_admin")),
         "OS": m.get("os") or "—",
         "가입일": m["joined_at"].strftime("%Y-%m-%d") if m.get("joined_at") else "—",
         "마지막 방문": (m["last_visit"].strftime("%Y-%m-%d")
                     if m.get("last_visit") else "—"),
-        "첫 등장": first.get(name, "—"),
-        "최근 참석": last.get(name, "—"),
+        "첫 등장": ctx["첫등장"].get(name, "—"),
+        "최근 참석": ctx["최근"].get(name, "—"),
         "참석": len(attended),
         "매칭 출사": len(held),
         "참석률": _pct(len(attended), len(held)),
-        "개최": len(hosted), "개최 취소": len(canceled),
+        "개최": len(hosted), "개최 취소": len(canceled), "개최 진행": len(ran),
         "취소율": _pct(len(canceled), len(hosted)),
         "후기": len(reviews),
+        "자기 출사 후기": self_reviewed,
+        "자기 출사 후기율": _pct(self_reviewed, len(ran)),
         "게시글 좋아요": sum(p.get("likes", 0) for p in my_posts),
         "사진": len(my_photos),
         "사진 좋아요": likes,
         "장당 좋아요": round(likes / len(my_photos), 1) if my_photos else 0.0,
         "테마사진": len(themed),
         "테마 참여월": len({ym_of(p["posted_at"]) for p in themed}),
+        "동행자": dict(ctx["동행자"]).get(name, 0),
         "유령": not my_posts and not my_photos and not attended,
-        "휴면": name in dormant,
-        "참석 순위": (att_rank.index(name) + 1) if name in att_rank else None,
-        "참석 모수": len(att_rank),
-        "사진 순위": (photo_rank.index(name) + 1) if name in photo_rank else None,
-        "사진 모수": len(photo_rank),
+        "휴면": name in ctx["휴면"],
     }
+    for k, (rank, total) in ranks.items():
+        out[f"{k} 순위"], out[f"{k} 모수"] = rank, total
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🏆 칭호 — 숫자만 있고 사람이 없던 화면에 "나는 이런 사람"을 붙인다
+#
+# 두 가지가 설계의 전부다.
+#
+# **① 기준은 상대값이다.** `테마사진 3장 이상` 같은 고정값은 모임 활동량에
+# 따라 아무도 못 받거나 전원이 받는다. 분위(`top_share`)로 재면 어떤 기간을
+# 봐도 일정 비율이 받는다. 고정값은 "이 밑으로는 아무리 상위여도 안 준다"는
+# 최소 바닥으로만 쓴다.
+#
+# **② 지표당 하나만 남긴다.** 안 그러면 사진을 많이 올리는 사람이 `다작왕`·
+# `좋아요 수집가`·`부지런한 업로더` 세 개로 세 칸을 다 채워, 칭호 셋이 전부
+# 같은 얘기를 한다. 지표로 묶어 하나만 남기면 **사진 1개 + 다른 지표 2개**가
+# 되어 훨씬 그 사람다워진다.
+# ═══════════════════════════════════════════════════════════════
+
+TITLE_LIMIT = 3
+
+# 카테고리 쏠림 칭호의 이름. 없는 카테고리는 `{이름} 마니아`로 떨어진다.
+CATEGORY_TITLES = {
+    "풍경": "풍경 사냥꾼", "인물": "인물 전문", "인물&풍경": "인풍 애호가",
+    "GN": "GN 마니아", "보정": "보정의 손", "문화": "문화인",
+}
+
+
+def member_titles(name: str, prof: dict, companions: list[dict],
+                  posts: list[dict], photos: list[dict], months: list[int],
+                  ctx: dict | None = None) -> list[dict]:
+    """이 사람에게 붙는 칭호 — 희귀한 것부터 최대 `TITLE_LIMIT`개.
+
+    각 칭호는 **근거 한 줄**을 함께 낸다. 이름만 붙으면 왜 붙었는지 물어볼
+    데가 없고, 잘못 붙었을 때 알아챌 수도 없다.
+
+    하나도 안 걸리면 빈 목록 — 화면은 그때 구역을 아예 안 그린다.
+    """
+    # ctx가 없으면 만든다. 여기서 쓰는 것은 순위표·동행자·첫 등장뿐이라
+    # 멤버 명단이 비어도 값이 달라지지 않는다(휴면은 `prof`에서 본다).
+    ctx = ctx or club_context(posts, photos, [])
+    add = []
+
+    def put(지표, 우선, 아이콘, 칭호, 근거):
+        add.append({"지표": 지표, "우선": 우선, "아이콘": 아이콘,
+                    "칭호": 칭호, "근거": 근거})
+
+    # 유령이면 여기서 끝. 활동 0건인 사람에게 다른 칭호가 걸릴 일도 없지만,
+    # 규칙으로 못 박아 둔다.
+    if prof["유령"]:
+        return [{"지표": "연차", "우선": 50, "아이콘": "👻", "칭호": "유령 회원",
+                 "근거": "이 기간에 글·사진·참석이 하나도 없습니다"}]
+
+    att, hosted_ran = prof["참석"], prof["개최 진행"]
+    n_photo, n_theme = prof["사진"], prof["테마사진"]
+
+    # ── 동행 ────────────────────────────────────────────────
+    top = companions[0] if companions else None
+    combo_with = None
+    if top and top["함께"] >= 3 and top["내 기준"] >= 50 and top["상대 기준"] >= 50:
+        combo_with = top["함께 간 사람"]
+        put("동행", 95, "💞", f"{combo_with}와 환상의 콤비",
+            f"{top['함께']}회 동행 · 서로 {top['내 기준']}% / {top['상대 기준']}%")
+    # 콤비가 붙은 상대에게는 `따라다녀`를 안 붙인다 — 서로 붙어 다니는 것과
+    # 한쪽이 쫓아다니는 것은 다른 얘기라, 같은 상대로 둘 다 붙으면 앞말이
+    # 뒷말을 부정한다.
+    elif top and att >= 4 and top["내 기준"] >= 60:
+        put("동행", 88, "🐾", f"{top['함께 간 사람']}만 따라다녀",
+            f"참석 {att}회 중 {top['함께']}회를 함께 ({top['내 기준']}%)")
+    elif top_share(name, ctx["동행자"], 0.20, min_value=4):
+        put("동행", 80, "🕸", "마당발",
+            f"{prof['동행자']}명과 함께 가 봤습니다")
+    elif att >= 3 and len(ctx["동행자"]) >= 4 and (
+            # 아무와도 안 겹친 사람은 `동행자` 목록에 아예 없다 — 분위로만 재면
+            # 가장 혼자인 사람이 빠져나간다.
+            prof["동행자"] == 0 or bottom_share(name, ctx["동행자"], 0.25)):
+        put("동행", 62, "🕊", "혼자가 편한 사람",
+            f"참석 {att}회 · 함께 간 사람 {prof['동행자']}명")
+
+    # ── 테마 · 개최 · 참석 · 사진 · 좋아요 (1등 → 상위 분위) ──
+    def tier(지표, 위: tuple, 아래: tuple, *, 바닥: bool, 근거: str,
+             share: float = 0.30):
+        """1등이면 윗 칭호, 아니면 상위 `share`에 아랫 칭호. 둘 다 `바닥`을 넘어야.
+
+        `위`·`아래`는 `(우선, 아이콘, 이름)`.
+        """
+        if not 바닥:
+            return
+        # 1등도 모수를 함께 본다 — 두 사람뿐인 판의 1등은 1등이 아니다.
+        if prof[f"{지표} 순위"] == 1 and len(ctx[지표]) >= 4:
+            put(지표, *위, 근거)
+        elif top_share(name, ctx[지표], share, min_value=0):
+            put(지표, *아래, 근거)
+
+    tier("테마", (90, "🎨", "테마사진의 제왕"), (78, "🖌", "테마 단골"),
+         바닥=n_theme >= 2,
+         근거=f"테마사진 {n_theme}장 · {prof['테마 참여월']}개월 참여")
+    tier("개최", (90, "📢", "판을 여는 사람"), (77, "🗣", "자주 여는 사람"),
+         바닥=hosted_ran >= 2,
+         근거=f"펑 아닌 출사 {hosted_ran}건을 열었습니다")
+    tier("참석", (90, "🥾", "개근왕"), (76, "🔥", "열심 참석러"),
+         바닥=att >= 3,
+         근거=f"참석 {att}회 · 참석률 {prof['참석률']}%")
+    tier("사진", (85, "📸", "다작왕"), (75, "🖼", "부지런한 업로더"),
+         바닥=n_photo >= 5,
+         근거=f"사진 {n_photo}장 · 좋아요 {prof['사진 좋아요']}")
+    tier("좋아요", (85, "❤️", "좋아요 수집가"), (74, "💗", "반응 좋은 사진"),
+         바닥=n_photo >= LIKE_RANK_MIN_PHOTOS,
+         근거=f"장당 좋아요 {prof['장당 좋아요']} ({n_photo}장)")
+
+    # ── 습관 ────────────────────────────────────────────────
+    if hosted_ran >= 2 and prof["자기 출사 후기율"] >= 100:
+        put("습관", 80, "✍️", "기록하는 사람",
+            f"본인이 연 출사 {hosted_ran}건 전부에 직접 후기를 썼습니다")
+    elif len(months) >= 4 and prof["테마 참여월"] >= len(months):
+        # 3개월이면 "빠짐없이"가 너무 쉽다 — 우연히 세 달 연속인 사람이 흔하다.
+        put("습관", 72, "🗓", "한결같은 사람",
+            f"{len(months)}개월 내내 빠짐없이 테마사진을 냈습니다")
+    elif prof["개최"] >= 3 and prof["취소율"] >= 40:
+        put("습관", 60, "💥", "펑의 달인",
+            f"개최 {prof['개최']}건 중 {prof['개최 취소']}건 취소 ({prof['취소율']}%)")
+
+    # ── 성향 ────────────────────────────────────────────────
+    pref = member_category_pref(posts).get(name) or Counter()
+    if att >= 4 and pref:
+        cat, cnt = pref.most_common(1)[0]
+        if _pct(cnt, sum(pref.values())) >= 60:
+            put("성향", 73, "🏞", CATEGORY_TITLES.get(cat, f"{cat} 마니아"),
+                f"참석의 {_pct(cnt, sum(pref.values()))}%가 {cat} ({cnt}회)")
+        elif att >= 5 and len(pref) >= 4 and _pct(cnt, sum(pref.values())) <= 40:
+            # 종류만 세면 출사 카테고리가 넷뿐이라 웬만한 사람이 다 걸린다.
+            # **어느 하나에도 쏠리지 않았다**는 조건이 있어야 "가리지 않는다"다.
+            put("성향", 71, "🌈", "가리지 않는 사람",
+                f"{len(pref)}가지를 고루 — 가장 많은 {cat}도 "
+                f"{_pct(cnt, sum(pref.values()))}%뿐")
+
+    # ── 연차 ────────────────────────────────────────────────
+    # 첫 등장은 **분석 기간 안에서만** 잰다 — 기간을 좁히면 터줏대감이 바뀐다.
+    firsts = ctx["첫등장"]
+    mine_first = firsts.get(name)
+    if (att >= 2 and mine_first and firsts
+            and mine_first == min(firsts.values())
+            # 첫 출사에 있었다는 것만으로는 부족하다 — 그날 온 사람이 다
+            # 터줏대감이 된다. **지금도 꾸준히 나오는 사람**이라야 말이 된다.
+            and top_share(name, ctx["참석"], 0.50, min_value=0)):
+        put("연차", 79, "🌳", "터줏대감",
+            f"이 기간에 가장 먼저 나타나 지금까지 {att}회 참석 ({mine_first})")
+    elif att >= 1 and mine_first and months and _is_newcomer(mine_first, months):
+        put("연차", 70, "🌱", "새싹",
+            f"최근에 합류했습니다 (첫 참석 {mine_first})")
+    elif att >= 2 and prof["휴면"]:
+        put("연차", 55, "🌙", "돌아오세요",
+            f"참석 {att}회 · 마지막 참석 {prof['최근 참석']}")
+
+    # 지표당 가장 높은 것 하나만 남기고, 희귀한 것부터 자른다.
+    best: dict[str, dict] = {}
+    for t in add:
+        cur = best.get(t["지표"])
+        if cur is None or t["우선"] > cur["우선"]:
+            best[t["지표"]] = t
+    return sorted(best.values(), key=lambda t: -t["우선"])[:TITLE_LIMIT]
+
+
+def _is_newcomer(first_iso: str, months: list[int], within: int = 2) -> bool:
+    """첫 등장이 **기간 마지막 달** 기준 `within`개월 이내인가.
+
+    오늘 날짜가 아니라 기간 끝을 기준으로 삼는다 — 과거 기간을 들여다보면
+    "지금 신입"이 아니라 "그때 신입"이 궁금하기 때문이다.
+    """
+    ym = int(first_iso[:4]) * 100 + int(first_iso[5:7])
+    end = months[-1]
+    gap = (end // 100 - ym // 100) * 12 + (end % 100 - ym % 100)
+    return 0 <= gap < within
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2362,7 +2650,10 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
     if not name:
         return
 
-    prof = member_profile(name, posts, photos, members)
+    # 공통 집계는 한 번만 만들어 프로필·동행·칭호가 나눠 쓴다.
+    ctx = club_context(posts, photos, members)
+    prof = member_profile(name, posts, photos, members, ctx)
+    comp = member_companions(name, posts, ctx["쌍"])
     my_posts = [p for p in posts if p.get("author") == name]
     my_photos = [p for p in photos if p.get("author") == name]
 
@@ -2385,6 +2676,15 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
         st.warning("같은 닉네임의 활성 멤버가 둘 이상입니다. 후기 본문에서는 둘을 "
                    "가를 수 없어 **아래 숫자는 두 사람이 합쳐진 값**입니다.", icon="⚠️")
 
+    titles = member_titles(name, prof, comp, posts, photos, months, ctx)
+    if titles:
+        with st.container(border=True):
+            for col, t in zip(st.columns(len(titles)), titles):
+                col.markdown(f"##### {t['아이콘']} {t['칭호']}")
+                col.caption(t["근거"])
+        st.caption("칭호는 **선택한 분석 기간 안의 활동**으로만 매깁니다 — 기간을 "
+                   "좁히면 달라집니다. 재미로 붙이는 것이니 너무 진지하게 보지 마세요.")
+
     c = st.columns(5)
     c[0].metric("참석", prof["참석"])
     c[1].metric("개최한 출사", prof["개최"])
@@ -2401,13 +2701,18 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
                "후기가 없는 출사는 누가 갔는지 알 방법이 없어, 분모에 넣으면 아무 "
                "잘못 없이 모두의 참석률이 낮아집니다.")
 
-    pos = []
-    if prof["참석 순위"]:
-        pos.append(f"참석 **{prof['참석 순위']}등** / {prof['참석 모수']}명")
-    if prof["사진 순위"]:
-        pos.append(f"사진 **{prof['사진 순위']}등** / {prof['사진 모수']}명")
-    if pos:
-        st.markdown("🏅 " + " · ".join(pos))
+    st.markdown("#### 🏅 모임 내 순위")
+    # 회색 캡션 한 줄이던 것을 metric으로 올렸다 — 이 화면에서 가장 궁금한
+    # 숫자 축에 드는데 가장 작게 그려져 있어 눈에 걸리지 않았다.
+    #
+    # 모수는 **라벨에** 넣는다. `delta`로 빼면 증감 화살표가 붙어 "18명 늘었다"로
+    # 읽힌다.
+    for col, key in zip(st.columns(3), ("참석", "개최", "사진")):
+        rank = prof[f"{key} 순위"]
+        col.metric(f"{key} ({prof[f'{key} 모수']}명 중)",
+                   f"{rank}등" if rank else "—")
+    st.caption("같은 횟수면 **같은 등수**입니다(1·2·2·4). 모수는 그 활동을 한 번이라도 "
+               "한 사람 수 — 개최는 펑 아닌 출사를 연 사람만 셉니다.")
 
     st.markdown("#### 월별 활동 추이")
     mm, _ = attendance_monthly_matrix(posts)
@@ -2440,6 +2745,26 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
     else:
         st.caption("개최한 출사가 없습니다.")
 
+    # 후기는 **개최한 출사 바로 밑**에 둔다 — 자기가 연 출사를 보고 나서 "그럼
+    # 후기는 쓰고 있나"를 확인하는 것이 한 동작인데, 사이에 표가 끼면 두 번
+    # 스크롤해 눈으로 맞춰야 한다.
+    st.markdown(f"#### 작성한 후기 ({prof['후기']}건)")
+    if prof["개최 진행"]:
+        st.caption(f"본인이 연 출사 {prof['개최 진행']}건(펑 제외) 중 "
+                   f"**{prof['자기 출사 후기']}건은 본인이 후기를 썼습니다 "
+                   f"({prof['자기 출사 후기율']}%).** 나머지는 다른 사람이 썼거나 "
+                   "아직 후기가 없습니다 — 후기를 꼭 개최자가 쓰는 것은 아닙니다.")
+    revs = member_reviews(name, posts, body_cut)
+    if revs:
+        n_cut = sum(1 for r in revs if r["잘림"])
+        if n_cut:
+            st.caption(f"✂️ 본문이 잘린 후기 {n_cut}건 — 그 글에서 뽑은 참석자 명단이 "
+                       "전부가 아닐 수 있습니다. 원문은 👥 참석 & 후기 탭에서 봅니다.")
+        st.dataframe(pd.DataFrame(revs), hide_index=True, width="stretch",
+                     height=min(420, 40 * len(revs) + 40))
+    else:
+        st.caption("작성한 후기가 없습니다.")
+
     st.markdown(f"#### 참석한 출사 ({prof['참석']}건)")
     attended = member_attended_outings(name, posts)
     if attended:
@@ -2449,7 +2774,6 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
         st.caption("참석 기록이 없습니다.")
 
     st.markdown("#### 함께 간 사람")
-    comp = member_companions(name, posts)
     if comp:
         st.caption("이 사람과 같은 출사에 함께 간 **전원**입니다 — 👥 참석 & 후기 "
                    f"탭의 표는 전체 상위 {CO_ATTENDANCE_TOP}쌍만 보여 주므로 여기 "
@@ -2472,18 +2796,6 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
     else:
         st.caption("두 명 이상이 참석한 출사에 함께한 기록이 없습니다.")
 
-    st.markdown(f"#### 작성한 후기 ({prof['후기']}건)")
-    revs = member_reviews(name, posts, body_cut)
-    if revs:
-        n_cut = sum(1 for r in revs if r["잘림"])
-        if n_cut:
-            st.caption(f"✂️ 본문이 잘린 후기 {n_cut}건 — 그 글에서 뽑은 참석자 명단이 "
-                       "전부가 아닐 수 있습니다. 원문은 👥 참석 & 후기 탭에서 봅니다.")
-        st.dataframe(pd.DataFrame(revs), hide_index=True, width="stretch",
-                     height=min(420, 40 * len(revs) + 40))
-    else:
-        st.caption("작성한 후기가 없습니다.")
-
     st.markdown(f"#### 사진 ({prof['사진']}장)")
     if my_photos:
         c = st.columns(4)
@@ -2499,6 +2811,88 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
                           caption=f"👍{p['likes']} 💬{p['comments']}")
     else:
         st.caption("업로드한 사진이 없습니다.")
+
+    st.divider()
+    _title_distribution(names, posts, photos, members, months, ctx)
+
+
+def _title_distribution(names: list[str], posts: list[dict], photos: list[dict],
+                        members: list[dict], months: list[int],
+                        ctx: dict) -> None:
+    """전 멤버에게 칭호가 어떻게 퍼졌는지 — **기준을 조정하려고 보는 화면.**
+
+    칭호는 아무도 못 받아도, 몇 사람이 싹쓸이해도 재미가 없다. 그런데 그건
+    조건을 아무리 들여다봐도 알 수 없고 **실제 데이터에 대고 세어 봐야만**
+    안다. 그래서 세는 화면을 함께 둔다.
+
+    `_theme_section`과 같은 상태 있는 expander다 — **닫혀 있으면 전 멤버
+    계산을 아예 안 한다.** 쉰 명분 칭호를 매 rerun마다 돌릴 이유가 없다.
+    """
+    exp = st.expander("🏆 칭호 분포 — 기준이 적당한지 보는 곳",
+                      key="mf_dist_open", on_change="rerun")
+    with exp:
+        if not exp.open:
+            return
+        st.caption("칭호를 아무도 못 받거나 몇 사람이 싹쓸이하면 재미가 없습니다. "
+                   "**수령 인원 0명인 칭호**와 **하나도 못 받은 사람 수**를 보고 "
+                   "기준(분위·최소 바닥)을 조정하세요.")
+
+        pair = ctx["쌍"]
+        got: dict[str, list[str]] = defaultdict(list)
+        per_person: dict[str, int] = {}
+        for n in names:
+            p = member_profile(n, posts, photos, members, ctx)
+            ts = member_titles(n, p, member_companions(n, posts, pair),
+                               posts, photos, months, ctx)
+            per_person[n] = len(ts)
+            for t in ts:
+                got[t["칭호"]].append(n)
+
+        held = sum(1 for v in per_person.values() if v)
+        c = st.columns(3)
+        c[0].metric("칭호를 받은 사람", f"{held}명")
+        c[1].metric("전체 멤버", f"{len(names)}명")
+        c[2].metric("1인 평균",
+                    f"{round(sum(per_person.values()) / len(names), 2)}개"
+                    if names else "—")
+
+        st.markdown("##### 칭호별 수령 인원")
+        # **수령 0명인 칭호도 행으로 남긴다** — 아무도 못 받는 칭호가 있다는
+        # 사실이 조정에 필요한 정보다. 안 걸린 것을 빼 버리면 화면만 보고는
+        # 그 칭호가 존재하는지도 모른다.
+        rows = [{"칭호": t, "인원": len(got.get(t, [])),
+                 "받은 사람": ", ".join(got.get(t, [])[:8]) or "—"}
+                for t in _all_title_names(got)]
+        st.dataframe(pd.DataFrame(rows).sort_values("인원", ascending=False),
+                     hide_index=True, width="stretch", height=460)
+
+        st.markdown("##### 한 사람이 받은 개수")
+        dist = Counter(per_person.values())
+        st.dataframe(pd.DataFrame(
+            [{"칭호 수": f"{k}개", "인원": dist.get(k, 0)}
+             for k in range(TITLE_LIMIT + 1)]),
+            hide_index=True, width="stretch")
+
+        none_got = [n for n, v in per_person.items() if not v]
+        if none_got:
+            st.caption(f"**하나도 못 받은 {len(none_got)}명** — "
+                       + ", ".join(none_got))
+
+
+# 이름에 사람·카테고리가 박히는 칭호(`{상대}와 환상의 콤비`)는 미리 나열할 수
+# 없다. 그래서 고정 이름 목록에 **이번에 실제로 나온 것**을 합쳐 보여 준다.
+FIXED_TITLE_NAMES = [
+    "테마사진의 제왕", "테마 단골", "판을 여는 사람", "자주 여는 사람",
+    "개근왕", "열심 참석러", "다작왕", "부지런한 업로더",
+    "좋아요 수집가", "반응 좋은 사진", "마당발", "혼자가 편한 사람",
+    "기록하는 사람", "한결같은 사람", "펑의 달인", "가리지 않는 사람",
+    "터줏대감", "새싹", "돌아오세요", "유령 회원",
+    *CATEGORY_TITLES.values(),
+]
+
+
+def _all_title_names(got: dict[str, list[str]]) -> list[str]:
+    return FIXED_TITLE_NAMES + sorted(set(got) - set(FIXED_TITLE_NAMES))
 
 
 # ═══════════════════════════════════════════════════════════════

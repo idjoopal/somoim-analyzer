@@ -1042,3 +1042,113 @@ def test_preference_caption_quotes_the_real_limit():
     at = run(stores=make_stores(PAIRS, [], members=PAIR_MEMBERS))
     assert any(f"최대 {PREF_TOP_N}개" in str(c.value) for c in at.caption), \
         [str(c.value) for c in at.caption]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 멤버 상세 — 자리·등수·칭호
+# ═══════════════════════════════════════════════════════════════
+
+def _headings(at):
+    """`#### 제목` 마크다운을 문서 순서대로."""
+    return [str(m.value) for m in at.markdown if str(m.value).startswith("####")]
+
+
+def test_reviews_sit_right_under_the_outings_this_person_hosted():
+    """자기가 연 출사를 보고 "그럼 후기는 쓰고 있나"를 확인하는 건 한 동작이다.
+
+    사이에 표가 끼면 두 번 스크롤해 눈으로 맞춰야 한다 — 자리 자체가
+    요구사항이라 순서를 못 박는다.
+    """
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    order = [h for h in _headings(at)
+             if any(k in h for k in ("개최한 출사", "작성한 후기", "참석한 출사"))]
+    assert len(order) == 3, order
+    assert "개최한 출사" in order[0]
+    assert "작성한 후기" in order[1]
+    assert "참석한 출사" in order[2]
+
+
+def test_rank_is_a_metric_not_a_grey_caption():
+    """등수는 이 화면에서 가장 궁금한 숫자 축인데 가장 작게 그려져 있었다."""
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    labels = {m.label: m.value for m in at.metric}
+    ranked = {k: v for k, v in labels.items() if k.endswith("명 중)")}
+    assert len(ranked) == 3, labels
+    assert any(k.startswith("참석") for k in ranked)
+    assert any(k.startswith("개최") for k in ranked)
+    assert all(v.endswith("등") or v == "—" for v in ranked.values()), ranked
+
+
+def test_a_member_with_nothing_going_on_gets_no_title_box():
+    """칭호가 없으면 구역을 아예 안 그린다 — 없는 게 흠으로 읽히면 안 된다."""
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    at.selectbox(key="mf_member").set_value("유령").run()
+    assert not at.exception, [str(e) for e in at.exception]
+    # 유령은 `유령 회원` 하나를 받으므로 구역이 그려진다 — 이름과 근거가 함께.
+    assert any("유령 회원" in str(m.value) for m in at.markdown)
+    assert any("글·사진·참석이 하나도 없" in str(c.value) for c in at.caption)
+
+
+def test_titles_come_with_the_reason_they_were_given():
+    """이름만 붙으면 왜 붙었는지 물어볼 데가 없고 잘못 붙어도 못 알아챈다."""
+    from streamlit_app import club_context, member_companions, member_profile, member_titles
+
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    posts = [p for p in at.session_state["_analysis"]["posts"]]
+    photos = at.session_state["_analysis"]["photos"]
+    members = at.session_state["_analysis"]["members"]
+    ctx = club_context(posts, photos, members)
+    prof = member_profile("나무", posts, photos, members, ctx)
+    titles = member_titles("나무", prof, member_companions("나무", posts, ctx["쌍"]),
+                           posts, photos, [202603], ctx)
+    assert titles, "활동이 있는 사람인데 칭호가 하나도 없다"
+    for t in titles:
+        assert t["근거"], t
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🏆 칭호 분포 — 기준이 적당한지 보는 곳
+# ═══════════════════════════════════════════════════════════════
+
+def test_closed_distribution_panel_computes_nothing():
+    """쉰 명분 칭호를 매 rerun마다 돌릴 이유가 없다."""
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    assert not any("칭호별 수령 인원" in str(m.value) for m in at.markdown)
+
+    at.session_state["mf_dist_open"] = True
+    at.run()
+    assert not at.exception, [str(e) for e in at.exception]
+    assert any("칭호별 수령 인원" in str(m.value) for m in at.markdown)
+
+
+def test_distribution_keeps_titles_nobody_earned():
+    """아무도 못 받는 칭호가 있다는 사실이 기준 조정에 필요한 정보다.
+
+    안 걸린 것을 빼 버리면 화면만 보고는 그 칭호가 있는지도 모른다.
+    """
+    from streamlit_app import FIXED_TITLE_NAMES
+
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    at.session_state["mf_dist_open"] = True
+    at.run()
+
+    tables = [d.value for d in at.dataframe if "받은 사람" in list(d.value.columns)]
+    assert tables, "칭호별 수령 인원 표가 없다"
+    df = tables[0]
+    assert set(FIXED_TITLE_NAMES) <= set(df["칭호"]), \
+        set(FIXED_TITLE_NAMES) - set(df["칭호"])
+    assert (df["인원"] == 0).any(), "이 픽스처에서는 못 받는 칭호가 있어야 한다"
+
+
+def test_distribution_counts_everyone_including_the_empty_handed():
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    at.session_state["mf_dist_open"] = True
+    at.run()
+
+    labels = {m.label: m.value for m in at.metric}
+    assert labels.get("전체 멤버") == "4명"          # FOCUS_MEMBERS 네 명
+    counts = [d.value for d in at.dataframe if "칭호 수" in list(d.value.columns)]
+    assert counts, "개수 분포 표가 없다"
+    assert list(counts[0]["칭호 수"]) == ["0개", "1개", "2개", "3개"]
