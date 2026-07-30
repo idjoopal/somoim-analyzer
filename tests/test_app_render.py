@@ -1161,8 +1161,10 @@ def test_distribution_lists_the_renamed_titles_not_the_old_ones():
 
     df = [d.value for d in at.dataframe if "받은 사람" in list(d.value.columns)][0]
     shown = set(df["칭호"])
-    assert {"테마사진 프로 참석러", "감노 때부터 계셨네", "이게 본업이에요"} <= shown
-    assert not ({"테마 단골", "터줏대감", "개근왕", "다작왕"} & shown)
+    assert {"테마사진 프로 참석러", "아이고 어르신", "정출킬러",
+            "여기 제 인스타인데..", "소모임에요? 글쎄.."} <= shown
+    assert not ({"테마 단골", "터줏대감", "개근왕", "다작왕", "마당발",
+                 "한 달도 안 빠졌네", "이분 출사는 항상 만석"} & shown)
 
 
 def test_distribution_explains_the_quota():

@@ -971,7 +971,7 @@ def test_no_title_goes_over_its_quota():
     from streamlit_app import TITLE_QUOTA_DEFAULT
     posts, members = _old_crowd()
     counts = C(t["칭호"] for ts in _club(posts, [], members).values() for t in ts)
-    assert counts["감노 때부터 계셨네"] == TITLE_QUOTA_DEFAULT
+    assert counts["아이고 어르신"] == TITLE_QUOTA_DEFAULT
     assert max(counts.values()) <= TITLE_QUOTA_DEFAULT, counts
 
 
@@ -981,7 +981,7 @@ def test_the_quota_keeps_the_strongest():
     joined = {m["mn"]: m["joined_at"] for m in members}
     got = _club(posts, [], members)
     kept = [n for n, ts in got.items()
-            if any(t["칭호"] == "감노 때부터 계셨네" for t in ts)]
+            if any(t["칭호"] == "아이고 어르신" for t in ts)]
     cut = [m["mn"] for m in members if m["mn"] not in kept]
     assert kept and cut
     assert max(joined[k] for k in kept) <= min(joined[c] for c in cut)
@@ -995,8 +995,8 @@ def test_a_metric_keeps_more_than_one_candidate():
     """
     posts, members = _old_crowd(4)
     연차 = [t for t in _cands(members[0]["mn"], posts, [], members)
-           if t in ("감노 때부터 계셨네", "새싹")]
-    assert set(연차) == {"감노 때부터 계셨네", "새싹"}, 연차
+           if t in ("아이고 어르신", "새싹")]
+    assert set(연차) == {"아이고 어르신", "새싹"}, 연차
 
 
 def test_a_cut_person_still_keeps_titles_from_other_metrics():
@@ -1004,7 +1004,7 @@ def test_a_cut_person_still_keeps_titles_from_other_metrics():
     posts, members = _old_crowd(12)
     got = _club(posts, [], members)
     cut = [m["mn"] for m in members
-           if "감노 때부터 계셨네" not in _names(got[m["mn"]])]
+           if "아이고 어르신" not in _names(got[m["mn"]])]
     assert cut, "정원에 밀린 사람이 없다 — 픽스처가 잘못됐다"
     assert all(got[n] for n in cut), [n for n in cut if not got[n]]
 
@@ -1073,7 +1073,7 @@ def test_fast_reviewer():
         posts.append(_hosted(f"n{i}", "빠름", day, ["빠름"]))
         posts.append(review(f"rn{i}", author="빠름", matched=f"n{i}",
                             posted_at=datetime(2026, 3, int(day) + 1)))
-    assert "후기 총알배송" in _cands("빠름", posts, [], [member("w1", "빠름")])
+    assert "후기는 따끈할때" in _cands("빠름", posts, [], [member("w1", "빠름")])
 
 
 def test_unmatched_reviews_are_not_counted_as_instant():
@@ -1081,41 +1081,27 @@ def test_unmatched_reviews_are_not_counted_as_instant():
     posts = [review(f"r{i}", author="미매칭", matched=None,
                     posted_at=datetime(2026, 3, 5)) for i in range(3)]
     posts.append(notice("n1", "2026-03-01", ["미매칭"]))
-    assert "후기 총알배송" not in _cands("미매칭", posts, [], [member("w1", "미매칭")])
+    assert "후기는 따끈할때" not in _cands("미매칭", posts, [], [member("w1", "미매칭")])
 
 
 def test_flash_organizer():
     """공지 이틀 안에 떠나는 출사를 자주 여는 사람."""
     posts = [_hosted(f"n{i}", "번개", "%02d" % (i * 3 + 2), ["번개"],
                      posted=datetime(2026, 3, i * 3 + 1)) for i in range(4)]
-    assert "내일 갈 사람?" in _cands("번개", posts, [], [member("w1", "번개")])
+    assert "내일 출사가실분?" in _cands("번개", posts, [], [member("w1", "번개")])
 
 
 def test_joined_and_came_right_away():
     posts = [notice("n1", "2026-03-05", ["신입"])]
     members = [member("w1", "신입", datetime(2026, 3, 1))]
-    assert "가입하자마자 출동" in _cands("신입", posts, [], members)
-
-
-def test_attendance_streak():
-    months = [202601, 202602, 202603, 202604]
-    posts = [notice(f"n{i}", "2026-%02d-05" % (i + 1), ["꾸준"]) for i in range(4)]
-    assert "한 달도 안 빠졌네" in _cands("꾸준", posts, [], [member("w1", "꾸준")], months)
-
-
-def test_a_missed_month_breaks_the_streak():
-    months = [202601, 202602, 202603, 202604]
-    posts = [notice("n1", "2026-01-05", ["띄엄"]), notice("n2", "2026-03-05", ["띄엄"]),
-             notice("n3", "2026-04-05", ["띄엄"])]
-    assert "한 달도 안 빠졌네" not in _cands("띄엄", posts, [], [member("w1", "띄엄")],
-                                       months)
+    assert "첫 출사 못 참지" in _cands("신입", posts, [], members)
 
 
 def test_weekday_regular():
     """2026-03의 02·03·04·05·06은 월~금이다."""
     posts = [notice(f"n{i}", "2026-03-%02d" % d, ["평일러"])
              for i, d in enumerate([2, 3, 4, 5, 6])]
-    assert "평일에 시간이 많으시군요" in _cands("평일러", posts, [],
+    assert "프로 평일러" in _cands("평일러", posts, [],
                                        [member("w1", "평일러")])
 
 
@@ -1123,44 +1109,45 @@ def test_a_weekend_goer_gets_no_weekday_title():
     """2026-03의 07·14·21·28은 토요일, 01은 일요일이다."""
     posts = [notice(f"n{i}", "2026-03-%02d" % d, ["주말러"])
              for i, d in enumerate([1, 7, 14, 21, 28])]
-    assert "평일에 시간이 많으시군요" not in _cands("주말러", posts, [],
+    assert "프로 평일러" not in _cands("주말러", posts, [],
                                            [member("w1", "주말러")])
 
 
-def test_the_host_who_fills_the_room():
-    crowd = [f"손님{i}" for i in range(8)]
-    posts = [_hosted(f"b{i}", "모객", "%02d" % (i + 1), ["모객"] + crowd)
-             for i in range(3)]
-    # 모수를 채운다 — 개최자가 넷은 되어야 "상위 25%"가 뜻을 가진다.
-    posts += [_hosted(f"q{j}", f"소규모{j}", "2%d" % j, [f"소규모{j}"])
-              for j in range(4)]
-    members = ([member("w1", "모객")] + [member(f"c{i}", c) for i, c in enumerate(crowd)]
-               + [member(f"s{j}", f"소규모{j}") for j in range(4)])
-    assert "이분 출사는 항상 만석" in _cands("모객", posts, [], members)
+def test_the_one_who_only_shows_up_when_it_is_crowded():
+    """`정출킬러` — 참석한 출사의 평균 인원이 상위 15%."""
+    crowd = [f"떼거리{j}" for j in range(9)]
+    posts = [notice(f"b{i}", "2026-03-0%d" % (i + 1), ["북적"] + crowd)
+             for i in range(4)]
+    # 모수를 채운다 — 조용한 출사만 다니는 사람이 있어야 "상위"가 뜻을 가진다.
+    posts += [notice(f"q{j}", "2026-03-1%d" % j, [f"조용{j}", "짝"]) for j in range(5)]
+    members = ([member("w1", "북적"), member("w2", "짝")]
+               + [member(f"c{j}", c) for j, c in enumerate(crowd)]
+               + [member(f"s{j}", f"조용{j}") for j in range(5)])
+    assert "정출킬러" in _cands("북적", posts, [], members)
 
 
 def test_the_one_who_picks_quiet_outings():
+    """`소수정예` — 같은 자를 반대쪽에서 읽는다."""
     posts = [notice(f"s{i}", "2026-03-0%d" % (i + 1), ["소수", "짝"]) for i in range(4)]
-    posts += [notice(f"b{i}", "2026-03-1%d" % i,
-                     ["소수" if i == 9 else f"떼거리{j}" for j in range(9)])
+    posts += [notice(f"b{i}", "2026-03-1%d" % i, [f"떼거리{j}" for j in range(9)])
               for i in range(4)]
     members = ([member("w1", "소수"), member("w2", "짝")]
                + [member(f"c{j}", f"떼거리{j}") for j in range(9)])
     assert "소수정예" in _cands("소수", posts, [], members)
 
 
-def test_a_host_and_a_quiet_goer_never_share_the_size_slot():
-    """만석과 소수정예는 같은 지표라 한 사람에게 둘 다 붙지 않는다."""
+def test_the_two_size_titles_are_never_both_true():
+    """같은 자의 양 끝이라 한 사람에게 둘 다 붙을 수 없다."""
     from streamlit_app import club_titles
-    crowd = [f"손님{i}" for i in range(8)]
-    posts = [_hosted(f"b{i}", "모객", "%02d" % (i + 1), ["모객"] + crowd)
-             for i in range(3)]
-    posts += [notice(f"s{i}", "2026-03-2%d" % i, ["소수", "짝"]) for i in range(4)]
-    members = ([member("w1", "모객"), member("w2", "소수"), member("w3", "짝")]
-               + [member(f"c{i}", c) for i, c in enumerate(crowd)])
+    crowd = [f"떼거리{j}" for j in range(9)]
+    posts = [notice(f"b{i}", "2026-03-0%d" % (i + 1), ["북적"] + crowd)
+             for i in range(4)]
+    posts += [notice(f"s{i}", "2026-03-1%d" % i, ["소수", "짝"]) for i in range(4)]
+    members = ([member("w1", "북적"), member("w2", "소수"), member("w3", "짝")]
+               + [member(f"c{j}", c) for j, c in enumerate(crowd)])
     for ts in club_titles(posts, [], members, [202603]).values():
         names = _names(ts)
-        assert not ("이분 출사는 항상 만석" in names and "소수정예" in names)
+        assert not ("정출킬러" in names and "소수정예" in names)
 
 
 def test_watcher_and_uploader_are_opposite_ends():
@@ -1170,8 +1157,8 @@ def test_watcher_and_uploader_are_opposite_ends():
     photos = [photo(f"p{i}", "사진만", likes=1) for i in range(12)]
     photos += [photo(f"e{i}", f"들러리{i}", likes=1) for i in range(5)]
     members += [member("w1", "눈으로"), member("w2", "사진만"), member("w3", "남")]
-    assert "눈으로만 담아요" in _cands("눈으로", posts, photos, members)
-    assert "사진으로만 만나요" in _cands("사진만", posts, photos, members)
+    assert "소모임에요? 글쎄.." in _cands("눈으로", posts, photos, members)
+    assert "제가 사진이 좀 많아요" in _cands("사진만", posts, photos, members)
 
 
 def test_never_canceled_host():
@@ -1186,7 +1173,7 @@ def test_someone_else_writes_the_reviews():
         posts.append(_hosted(f"n{i}", "개최만", "%02d" % (i + 1), ["개최만", "딴사람"]))
         posts.append(review(f"rn{i}", author="딴사람", matched=f"n{i}"))
     members = [member("w1", "개최만"), member("w2", "딴사람")]
-    assert "후기는 남이 쓰죠" in _cands("개최만", posts, [], members)
+    assert "아맞다후기" in _cands("개최만", posts, [], members)
 
 
 def test_the_responsible_host_needs_five_outings_now():
@@ -1214,13 +1201,13 @@ def test_old_timer_is_decided_by_the_join_date():
     members = [member("w1", "고참", datetime(2025, 3, 1)),
                member("w2", "신참", datetime(2025, 9, 1))]
     posts = _old_club_posts()
-    assert "감노 때부터 계셨네" in _cands("고참", posts, [], members)
-    assert "감노 때부터 계셨네" not in _cands("신참", posts, [], members)
+    assert "아이고 어르신" in _cands("고참", posts, [], members)
+    assert "아이고 어르신" not in _cands("신참", posts, [], members)
 
 
 def test_old_timer_needs_a_known_join_date():
     members = [member("w1", "고참", None), member("w2", "신참", datetime(2025, 9, 1))]
-    assert "감노 때부터 계셨네" not in _cands("고참", _old_club_posts(), [], members)
+    assert "아이고 어르신" not in _cands("고참", _old_club_posts(), [], members)
 
 
 def test_old_timer_does_not_change_when_the_period_narrows():
@@ -1228,31 +1215,34 @@ def test_old_timer_does_not_change_when_the_period_narrows():
     members = [member("w1", "고참", datetime(2025, 3, 1)),
                member("w2", "신참", datetime(2025, 9, 1))]
     posts = _old_club_posts()
-    wide = "감노 때부터 계셨네" in _cands("고참", posts, [], members,
+    wide = "아이고 어르신" in _cands("고참", posts, [], members,
                                    [202601, 202602, 202603])
-    narrow = "감노 때부터 계셨네" in _cands("고참", posts, [], members, [202603])
+    narrow = "아이고 어르신" in _cands("고참", posts, [], members, [202603])
     assert wide is narrow is True
 
-
-def test_steady_theme_no_longer_needs_every_single_month():
-    """`== 전체 개월`은 14개월 기간에서 사실상 불가능했다(실제 0명)."""
-    months = [202601, 202602, 202603, 202604, 202605]
-    photos = [photo(f"p{i}", "한결", posted=datetime(2026, i + 1, 5), themed=True)
-              for i in range(4)]
-    assert "한결같은 사람" in _cands("한결", [], photos, [member("w1", "한결")], months)
-
-
-# ═══════════════════════════════════════════════════════════════
-# 이름 변경
-# ═══════════════════════════════════════════════════════════════
 
 def test_renamed_titles_use_the_new_strings():
     from streamlit_app import CATEGORY_TITLES, FIXED_TITLE_NAMES
     for gone in ("테마 단골", "판을 여는 사람", "자주 여는 사람", "개근왕", "다작왕",
-                 "기록하는 사람", "혼자가 편한 사람", "터줏대감"):
+                 "기록하는 사람", "혼자가 편한 사람", "터줏대감", "마당발",
+                 "매번 초면", "열심 참석러", "좋아요 수집가", "가리지 않는 사람",
+                 "감노 때부터 계셨네", "이분 출사는 항상 만석",
+                 "한 달도 안 빠졌네", "한결같은 사람"):
         assert gone not in FIXED_TITLE_NAMES, gone
-    for now in ("테마사진 프로 참석러", "출사장도 장이다", "마감 왜이렇게 빨라",
-                "이게 본업이에요", "여기가 내 인스타그램", "책임감 100만점",
-                "매번 초면", "감노 때부터 계셨네"):
+    for now in ("테마사진 프로 참석러", "출사장도 장이다", "심심한데 출사쳐야지",
+                "이게 본업이에요", "여기 제 인스타인데..", "책임감 100만점",
+                "저 신입 아닌데요", "아이고 어르신", "정출킬러", "잡식성",
+                "프로 평일러", "아맞다후기", "후기는 따끈할때", "내일 출사가실분?",
+                "소모임에요? 글쎄..", "제가 사진이 좀 많아요", "첫 출사 못 참지",
+                "다 아는 사람들 이구먼", "사진 좋아요 1위", "느좋 사진러"):
         assert now in FIXED_TITLE_NAMES, now
     assert set(CATEGORY_TITLES.values()) <= set(FIXED_TITLE_NAMES)
+
+
+def test_the_steady_titles_are_gone():
+    """`한 달도 안 빠졌네`·`한결같은 사람`은 뺐다 — 되살리려면 이걸 뒤집는다."""
+    import streamlit_app
+    from streamlit_app import FIXED_TITLE_NAMES
+    assert "한 달도 안 빠졌네" not in FIXED_TITLE_NAMES
+    assert "한결같은 사람" not in FIXED_TITLE_NAMES
+    assert not hasattr(streamlit_app, "_attendance_streak"), "부르는 곳 없는 코드"

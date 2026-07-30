@@ -960,12 +960,6 @@ def club_context(posts: list[dict], photos: list[dict],
 
     first, last = member_first_seen(posts)
 
-    # 개최자별 평균 참석 인원 — "몇 번 열었나"가 아니라 "사람을 잘 모으나".
-    crowd: dict[str, list[int]] = defaultdict(list)
-    for p in posts:
-        if p.get("cat") == "A" and p.get("actually_held"):
-            crowd[p.get("author") or ""].append(len(p.get("attendees") or []))
-
     return {
         "참석": [(r["멤버"], r["참석횟수"]) for r in attendance_counts(posts)],
         # 펑만 낸 사람은 모수에서 뺀다 — "펑 아닌 출사를 연 사람들 중 몇 등"이라야
@@ -977,8 +971,8 @@ def club_context(posts: list[dict], photos: list[dict],
         "좋아요": [(r["작성자"], r["장당좋아요"]) for r in photo_rows
                 if r["사진수"] >= LIKE_RANK_MIN_PHOTOS],
         "동행자": [(n, c) for n, c in deg.items()],
-        # 자기가 연 출사의 평균 인원. 한 건이라도 연 사람만 담는다.
-        "개최인원": [(a, sum(v) / len(v)) for a, v in crowd.items() if a and v],
+        # 참석한 출사의 평균 인원 — `정출킬러`·`소수정예`가 양 끝에서 읽는다.
+        "참석인원": list(_attended_crowd_all(posts).items()),
         "쌍": (pair, solo),
         "첫등장": first,
         "최근": last,
@@ -989,7 +983,6 @@ def club_context(posts: list[dict], photos: list[dict],
         # 전 멤버를 훑는 경로가 생겼으므로 여기서 한 번만 만든다.
         "카테고리": member_category_pref(posts),
         "공지": {p["id"]: p for p in posts if p.get("cat") == "A"},
-        "월별참석": attendance_monthly_matrix(posts)[0],
     }
 
 def member_options(members: list[dict], posts: list[dict],
@@ -1200,7 +1193,7 @@ OLD_CLUB_UNTIL = date(2025, 6, 1)
 # 카테고리 쏠림 칭호의 이름. 없는 카테고리는 `{이름} 마니아`로 떨어진다.
 CATEGORY_TITLES = {
     "풍경": "풍경 사냥꾼", "인물": "인물 전문", "인물&풍경": "인풍 애호가",
-    "GN": "GN 마니아", "보정": "보정의 손", "문화": "문화인",
+    "GN": "GN 마니아", "보정": "모여서 보정하실 분?", "문화": "문화?시민",
 }
 
 
@@ -1331,13 +1324,13 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
             f"상대의 전체 출석률 {_pct(top['상대 참석'], prof['매칭 출사'])}%보다 높습니다",
             top["내 기준"], "관계")
     if top_share(name, ctx["동행자"], 0.20, min_value=4):
-        put("동행", 80, "🕸", "마당발",
+        put("동행", 80, "🕸", "다 아는 사람들 이구먼",
             f"{prof['동행자']}명과 함께 가 봤습니다", prof["동행자"])
     if att >= 3 and len(ctx["동행자"]) >= 4 and (
             # 아무와도 안 겹친 사람은 `동행자` 목록에 아예 없다 — 분위로만 재면
             # 가장 혼자인 사람이 빠져나간다.
             prof["동행자"] == 0 or bottom_share(name, ctx["동행자"], 0.25)):
-        put("동행", 62, "🕊", "매번 초면",
+        put("동행", 62, "🕊", "저 신입 아닌데요",
             f"참석 {att}회 · 함께 간 사람 {prof['동행자']}명", -prof["동행자"])
 
     # ── 테마 · 개최 · 참석 · 사진 · 좋아요 (1등 → 상위 분위) ──
@@ -1360,16 +1353,16 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     tier("테마", (90, "🎨", "테마사진의 제왕"), (78, "🖌", "테마사진 프로 참석러"),
          바닥=n_theme >= 2, 강도=n_theme, share=0.15,
          근거=f"테마사진 {n_theme}장 · {prof['테마 참여월']}개월 참여")
-    tier("개최", (90, "📢", "출사장도 장이다"), (77, "🗣", "마감 왜이렇게 빨라"),
+    tier("개최", (90, "📢", "출사장도 장이다"), (77, "🗣", "심심한데 출사쳐야지"),
          바닥=hosted_ran >= 2, 강도=hosted_ran, share=0.30,
          근거=f"펑 아닌 출사 {hosted_ran}건을 열었습니다")
-    tier("참석", (90, "🥾", "이게 본업이에요"), (76, "🔥", "열심 참석러"),
+    tier("참석", (90, "🥾", "이게 본업이에요"), (76, "🔥", "프로 참석러"),
          바닥=att >= 3, 강도=att, share=0.15,
          근거=f"참석 {att}회 · 참석률 {prof['참석률']}%")
-    tier("사진", (85, "📸", "여기가 내 인스타그램"), (75, "🖼", "부지런한 업로더"),
+    tier("사진", (85, "📸", "여기 제 인스타인데.."), (75, "🖼", "부지런한 업로더"),
          바닥=n_photo >= 5, 강도=n_photo, share=0.30,
          근거=f"사진 {n_photo}장 · 좋아요 {prof['사진 좋아요']}")
-    tier("좋아요", (85, "❤️", "좋아요 수집가"), (74, "💗", "반응 좋은 사진"),
+    tier("좋아요", (85, "❤️", "사진 좋아요 1위"), (74, "💗", "느좋 사진러"),
          바닥=n_photo >= LIKE_RANK_MIN_PHOTOS, 강도=prof["장당 좋아요"], share=0.30,
          근거=f"장당 좋아요 {prof['장당 좋아요']} ({n_photo}장)")
 
@@ -1379,49 +1372,38 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
         put("후기", 80, "✍️", "책임감 100만점",
             f"본인이 연 출사 {hosted_ran}건 전부에 직접 후기를 썼습니다", hosted_ran)
     if hosted_ran >= 3 and prof["자기 출사 후기"] == 0:
-        put("후기", 64, "🙈", "후기는 남이 쓰죠",
+        put("후기", 64, "🙈", "아맞다후기",
             f"출사 {hosted_ran}건을 열었는데 본인이 쓴 후기는 없습니다", hosted_ran)
 
     # ── 속도 (날짜 간격) ────────────────────────────────────
     gap = _review_lag(name, posts, ctx)
     if gap is not None and gap[1] >= 3 and gap[0] <= 1:
-        put("속도", 82, "🚀", "후기 총알배송",
+        put("속도", 82, "🚀", "후기는 따끈할때",
             f"후기 {gap[1]}건 · 출사 다음날까지 평균 {gap[0]}일 만에 올립니다",
             -gap[0])
     flash = _flash_ratio(name, posts)
     if flash is not None and flash[1] >= 3 and flash[0] >= 50:
-        put("속도", 81, "⚡", "내일 갈 사람?",
+        put("속도", 81, "⚡", "내일 출사가실분?",
             f"연 출사 {flash[1]}건 중 {flash[0]}%가 공지 이틀 안에 출발", flash[0])
 
-    # ── 꾸준 ────────────────────────────────────────────────
-    streak = _attendance_streak(name, ctx["월별참석"], months)
-    if streak >= 4:
-        put("꾸준", 84, "📅", "한 달도 안 빠졌네",
-            f"{streak}개월 연속으로 매달 참석했습니다", streak)
-    if len(months) >= 4 and prof["테마 참여월"] >= round(len(months) * 0.8):
-        # `== len(months)`는 14개월 기간에서 사실상 불가능했다(실제 0명).
-        put("꾸준", 72, "🗓", "한결같은 사람",
-            f"{len(months)}개월 중 {prof['테마 참여월']}개월에 테마사진을 냈습니다",
-            prof["테마 참여월"])
-
-    # ── 규모 (인원의 양 끝) ─────────────────────────────────
-    if hosted_ran >= 3 and top_share(name, ctx["개최인원"], 0.25, min_value=0):
-        avg = dict(ctx["개최인원"]).get(name, 0)
-        put("규모", 83, "🎪", "이분 출사는 항상 만석",
-            f"연 출사 {hosted_ran}건의 평균 참석 {avg:.1f}명", avg)
+    # ── 규모 (참석한 출사 인원의 **양 끝**) ─────────────────
+    # 같은 자를 양쪽에서 읽는다 — 늘 북적이는 자리만 가는 사람과 조용한
+    # 자리만 고르는 사람. 정의상 한 사람에게 둘 다 붙지 않는다.
     if att >= 4:
-        mine = _attended_crowd(name, posts)
-        pool = [(n, v) for n, v in _attended_crowd_all(posts).items()]
-        if mine is not None and bottom_share(name, pool, 0.25):
+        mine = dict(ctx["참석인원"]).get(name)
+        if mine is not None and top_share(name, ctx["참석인원"], 0.15, min_value=0):
+            put("규모", 83, "🎪", "정출킬러",
+                f"참석한 출사의 평균 인원 {mine:.1f}명", mine)
+        if mine is not None and bottom_share(name, ctx["참석인원"], 0.15):
             put("규모", 69, "🤏", "소수정예",
                 f"참석한 출사의 평균 인원 {mine:.1f}명", -mine)
 
     # ── 균형 (참석 대 사진의 엇갈림) ────────────────────────
     if att >= 3 and n_photo <= 2 and top_share(name, ctx["참석"], 0.30, min_value=0):
-        put("균형", 67, "👀", "눈으로만 담아요",
+        put("균형", 67, "👀", "소모임에요? 글쎄..",
             f"참석 {att}회 · 올린 사진 {n_photo}장", att)
     if att <= 2 and n_photo >= 5 and top_share(name, ctx["사진"], 0.30, min_value=0):
-        put("균형", 66, "🖨", "사진으로만 만나요",
+        put("균형", 66, "🖨", "제가 사진이 좀 많아요",
             f"사진 {n_photo}장 · 참석 {att}회", n_photo)
 
     # ── 습관 (취소율의 양 끝) ───────────────────────────────
@@ -1445,7 +1427,7 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
             put("성향", 73, "🏞", CATEGORY_TITLES.get(cat, f"{cat} 마니아"),
                 f"참석의 {share}%가 {cat} ({cnt}회)", share, "카테고리")
         elif len(pref) >= 4 and share <= 40:
-            put("성향", 71, "🌈", "가리지 않는 사람",
+            put("성향", 71, "🌈", "잡식성",
                 f"{len(pref)}가지를 고루 — 가장 많은 {cat}도 {share}%뿐", len(pref))
     # 요일은 성향과 **다른 축**이다 — 무엇을 찍느냐(카테고리)와 언제 가느냐는
     # 같이 나와도 서로 겹치는 말이 아니다. 한 지표로 묶으면 둘 중 하나가
@@ -1453,7 +1435,7 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     if att >= 5:
         wd = _weekday_ratio(name, posts)
         if wd is not None and wd >= 60:
-            put("요일", 74, "🗓", "평일에 시간이 많으시군요",
+            put("요일", 74, "🗓", "프로 평일러",
                 f"참석한 출사의 {wd}%가 평일입니다", wd)
 
     # ── 연차 ────────────────────────────────────────────────
@@ -1462,11 +1444,11 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
         # **가입일로 잰다.** 예전에는 "이 기간에 가장 먼저 나타난 사람"이라
         # 분석 기간을 좁히면 터줏대감이 바뀌었다. 다감노 이전부터 자리를
         # 지켜 온 사람이라는 뜻이 기간에 흔들리면 안 된다.
-        put("연차", 79, "🌳", "감노 때부터 계셨네",
+        put("연차", 79, "🌳", "아이고 어르신",
             f"{joined.strftime('%Y-%m-%d')} 가입 — 구-감노 시절부터 계셨습니다",
             -joined.toordinal())
     if prof["가입→첫 참석"] is not None and 0 <= prof["가입→첫 참석"] <= 7:
-        put("연차", 71, "🏃", "가입하자마자 출동",
+        put("연차", 71, "🏃", "첫 출사 못 참지",
             f"가입 {prof['가입→첫 참석']}일 만에 첫 출사", -prof["가입→첫 참석"])
     if att >= 1 and prof["첫 등장"] != "—" and months and _is_newcomer(
             prof["첫 등장"], months):
@@ -1525,16 +1507,6 @@ def _flash_ratio(name: str, posts: list[dict]) -> tuple[float, int] | None:
     return _pct(sum(1 for g in gaps if 0 <= g <= 2), len(gaps)), len(gaps)
 
 
-def _attendance_streak(name: str, monthly: dict, months: list[int]) -> int:
-    """빠짐없이 참석한 **최장 연속 개월**. 중간에 한 달 비면 끊긴다."""
-    mine = monthly.get(name) or {}
-    best = run = 0
-    for m in months:
-        run = run + 1 if mine.get(m) else 0
-        best = max(best, run)
-    return best
-
-
 def _weekday_ratio(name: str, posts: list[dict]) -> float | None:
     """참석한 출사 중 평일 비율. 출사일이 없는 건은 못 센다."""
     days = [date.fromisoformat(p["outing_date"]).weekday()
@@ -1554,10 +1526,6 @@ def _attended_crowd_all(posts: list[dict]) -> dict[str, float]:
         for n in names:
             sizes[n].append(len(names))
     return {n: sum(v) / len(v) for n, v in sizes.items() if v}
-
-
-def _attended_crowd(name: str, posts: list[dict]) -> float | None:
-    return _attended_crowd_all(posts).get(name)
 
 
 def _is_newcomer(first_iso: str, months: list[int], within: int = 2) -> bool:
@@ -3139,14 +3107,14 @@ def _title_distribution(names: list[str],
 # 이름에 사람·카테고리가 박히는 칭호(`{상대}와 환상의 콤비`)는 미리 나열할 수
 # 없다. 그래서 고정 이름 목록에 **이번에 실제로 나온 것**을 합쳐 보여 준다.
 FIXED_TITLE_NAMES = [
-    "테마사진의 제왕", "테마사진 프로 참석러", "출사장도 장이다", "마감 왜이렇게 빨라",
-    "이게 본업이에요", "열심 참석러", "여기가 내 인스타그램", "부지런한 업로더",
-    "좋아요 수집가", "반응 좋은 사진", "마당발", "매번 초면",
-    "책임감 100만점", "후기는 남이 쓰죠", "후기 총알배송", "내일 갈 사람?",
-    "한 달도 안 빠졌네", "한결같은 사람", "이분 출사는 항상 만석", "소수정예",
-    "눈으로만 담아요", "사진으로만 만나요", "펑 한 번 없는 사람", "펑의 달인",
-    "가리지 않는 사람", "평일에 시간이 많으시군요",
-    "감노 때부터 계셨네", "가입하자마자 출동", "새싹", "돌아오세요", "유령 회원",
+    "테마사진의 제왕", "테마사진 프로 참석러", "출사장도 장이다", "심심한데 출사쳐야지",
+    "이게 본업이에요", "프로 참석러", "여기 제 인스타인데..", "부지런한 업로더",
+    "사진 좋아요 1위", "느좋 사진러", "다 아는 사람들 이구먼", "저 신입 아닌데요",
+    "책임감 100만점", "아맞다후기", "후기는 따끈할때", "내일 출사가실분?",
+    "정출킬러", "소수정예",
+    "소모임에요? 글쎄..", "제가 사진이 좀 많아요", "펑 한 번 없는 사람", "펑의 달인",
+    "잡식성", "프로 평일러",
+    "아이고 어르신", "첫 출사 못 참지", "새싹", "돌아오세요", "유령 회원",
     *CATEGORY_TITLES.values(),
 ]
 
