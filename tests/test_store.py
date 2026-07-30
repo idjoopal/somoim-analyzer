@@ -1178,6 +1178,37 @@ def test_intact_review_that_lost_its_names_still_becomes_a_candidate():
     assert rows[0][6] == "온전"           # 본문 탓이 아니라는 것을 밝힌다
 
 
+def test_zero_attendee_review_is_a_candidate_without_any_flag():
+    """참석자 0명이면 그것만으로 보정 대상이다 — 아무도 안 간 출사는 없다.
+
+    앱이 쓰는 `annotate_attendees`는 `attendees_needs_review`를 붙이지 않는다.
+    그래서 이 조건이 없으면 **본문이 짧으면서 이름이 하나도 없는 후기**가
+    영원히 시트에 안 올라온다(실제로 두 건이 새어 나갔다).
+    """
+    rows = attendee_fix_rows([
+        post("r1", cat="E", body="늦은시간까지 참여해주셔서 감사합니다", attendees=[]),
+        post("r2", cat="E", body="짧은 후기", attendees=["구름"]),
+    ])
+    assert [r[0] for r in rows] == ["r1"]
+    assert rows[0][6] == "온전", "본문 탓이 아니라 양식을 안 지킨 것이다"
+
+
+def test_meetup_system_post_is_not_a_candidate():
+    """소모임 정모 게시글은 후기가 아니라 참석자가 있을 수 없다.
+
+    올려 두면 사람이 **영원히 못 채우는 행**이 시트에 남아, 남은 건수가
+    끝까지 0으로 안 떨어진다.
+    """
+    rows = attendee_fix_rows([
+        post("m1", cat="E", attendees=[],
+             body="📌 정모 정보\n📅 4월 2일(목)\n📍 현충원\n💰 1/n"),
+        post("m2", cat="E", attendees=[],
+             body="이 게시글에서 정모에 대한 이야기를 나눠보세요."),
+        post("r1", cat="E", body="후기입니다", attendees=[]),
+    ])
+    assert [r[0] for r in rows] == ["r1"]
+
+
 def test_confirmed_reviews_drop_out_of_the_candidates():
     """`참석자`를 채워 확인했으면 다시 부르지 않는다 — 그래야 건수가 줄어든다."""
     long_body = "가" * 120

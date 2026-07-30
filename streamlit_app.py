@@ -36,6 +36,7 @@ from core.collector import (
     period_tag,
     ym_label,
     ym_of,
+    ym_split,
     ym_valid,
 )
 from core.excel_builder import build_excel
@@ -1014,6 +1015,39 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
         "공지": {p["id"]: p for p in posts if p.get("cat") == "A"},
     }
 
+GHOST_GRACE_DAYS = 30    # 가입 직후 이만큼은 유령이라 부르지 않는다
+
+
+def activity_authors(posts: list[dict], photos: list[dict]) -> set[str]:
+    """활동 흔적이 있는 이름 — **가입인사는 빼고** 센다.
+
+    이 모임은 가입인사를 안 쓰면 12시간 안에 강퇴하므로 **전원이 가입인사를
+    쓴다.** 그것까지 활동으로 세면 유령 멤버가 구조적으로 영원히 0명이 된다
+    (실제로 0명이었다).
+    """
+    return ({p.get("author", "") for p in posts if p.get("cat") != "J"}
+            | {p.get("author", "") for p in photos})
+
+
+def joined_recently(joined, months: list[int],
+                    days: int = GHOST_GRACE_DAYS) -> bool:
+    """가입한 지 `days`일이 안 됐나 — **기간 마지막 달의 말일** 기준.
+
+    오늘이 아니라 기간 끝으로 재는 이유는 `_is_newcomer`와 같다 — 과거 기간을
+    들여다볼 때 궁금한 것은 "지금 신입"이 아니라 "그때 신입"이다.
+
+    달 수가 아니라 날짜로 재는 이유: "가입월이 기간 마지막 달인가"로 재면 짧은
+    달에서 어긋난다 — 1월 31일에 가입한 사람은 2월 말 기준 **28일밖에 안 됐는데**
+    가입월이 달라서 유령이 된다.
+    """
+    if not joined or not months:
+        return False
+    y, m = ym_split(months[-1])
+    last = date(y + m // 12, m % 12 + 1, 1) - timedelta(days=1)
+    j = joined.date() if isinstance(joined, datetime) else joined
+    return 0 <= (last - j).days < days
+
+
 def member_options(members: list[dict], posts: list[dict],
                    photos: list[dict]) -> list[dict]:
     """드롭다운 후보 — `{이름, 참석, 게시글, 사진}`. 활동이 많은 순.
@@ -1021,13 +1055,18 @@ def member_options(members: list[dict], posts: list[dict],
     활동이 0건인 유령 멤버도 남긴다. 그 페이지가 전부 0으로 나오는 것 자체가
     "가입만 하고 아무것도 안 했다"는 정보다 — 목록에서 빼면 그걸 확인할 방법이
     없어진다.
+
+    `게시글`에서 **가입인사는 뺀다.** 안 빼면 아무것도 안 한 사람이 목록에서는
+    `글 1`인데 골라 들어가면 "유령" 배지가 붙어, 같은 사람이 두 화면에서 다르게
+    보인다.
     """
     attended: Counter = Counter()
     for p in posts:
         if p.get("cat") == "A" and p.get("actually_held"):
             for n in p.get("attendees") or []:
                 attended[n] += 1
-    wrote = Counter(p.get("author") for p in posts if p.get("author"))
+    wrote = Counter(p.get("author") for p in posts
+                    if p.get("author") and p.get("cat") != "J")
     shot = Counter(p.get("author") for p in photos if p.get("author"))
 
     rows = [{"이름": m["mn"], "참석": attended.get(m["mn"], 0),
@@ -1142,9 +1181,8 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
     ctx = ctx or club_context(posts, photos, members)
     m = next((x for x in members or [] if x.get("mn") == name), {})
     my_posts = [p for p in posts if p.get("author") == name]
-    # **가입인사는 활동이 아니다.** 이 모임은 가입인사를 안 쓰면 12시간 안에
-    # 강퇴하므로 **전원이 가입인사를 쓴다** — 그것까지 활동으로 세면 유령
-    # 멤버가 구조적으로 영원히 0명이 된다(실제로 0명이었다).
+    # **가입인사는 활동이 아니다** — 이유는 `activity_authors`에 적어 두었다.
+    # 🧑‍🤝‍🧑 멤버 탭도 같은 규칙을 쓴다(갈라지면 같은 사람이 탭마다 달라진다).
     my_real = [p for p in my_posts if p.get("cat") != "J"]
     my_photos = [p for p in photos if p.get("author") == name]
 
@@ -1194,7 +1232,11 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
         "테마사진": len(themed),
         "테마 참여월": len({ym_of(p["posted_at"]) for p in themed}),
         "동행자": dict(ctx["동행자"]).get(name, 0),
+        # `유령`은 **활동 0건이라는 사실 그대로** 둔다. 갓 가입한 사람을 여기서
+        # 빼면 칭호가 `유령 회원`과 `아직 첫 출사 전`을 가를 근거를 잃는다.
+        # 화면에 "유령"이라 쓸지는 `신입`을 함께 보고 정한다.
         "유령": not my_real and not my_photos and not attended,
+        "신입": joined_recently(m.get("joined_at"), ctx.get("_축") or []),
         "휴면": name in ctx["휴면"],
         # 아래 둘은 칭호(`감노 때부터 계셨네`·`가입하자마자 출동`)가 쓴다.
         # `가입일`은 표시용 문자열이라 날짜 비교에 쓸 수 없어 원본을 함께 둔다.
@@ -1363,10 +1405,8 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     if prof["유령"]:
         # 가입한 지 한 달도 안 된 사람에게 "유령"은 가혹하다 — 아직 첫 출사가
         # 안 열렸을 수도 있다. 오래 있었는데 0건인 것과는 다른 얘기다.
-        joined = prof.get("_가입")
-        fresh = joined is not None and months and _is_newcomer(
-            joined.strftime("%Y-%m-%d"), months, within=1)
-        if fresh:
+        # 판정은 `joined_recently` 한 곳에서만 한다(멤버 탭·배지와 같은 규칙).
+        if prof["신입"]:
             return [{"지표": "연차", "우선": 52, "아이콘": "🚪", "칭호": "아직 첫 출사 전",
                      "근거": f"{prof['가입일']} 가입 — 아직 첫 출사 전입니다. "
                             "곧 뵙겠습니다",
@@ -2863,8 +2903,7 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
         [{"mn": _raw_nick(m)} for m in members])
     months = months or []
     posts_A = [p for p in posts if p.get("cat") == "A"]
-    active_authors = ({p.get("author", "") for p in posts}
-                       | {p.get("author", "") for p in photos})
+    active_authors = activity_authors(posts, photos)
     attended = Counter()
     for a in posts_A:
         for n in a.get("attendees", []) or []:
@@ -2872,9 +2911,13 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
 
     admins = sum(1 for m in members if m.get("is_admin"))
     ios = sum(1 for m in members if (m.get("os") or "") == "iOS")
+    # 갓 가입한 사람은 뺀다 — 아직 나갈 출사가 안 열렸을 수도 있다. 안 빼면
+    # 유령 명단이 사실상 **신규 가입자 명단**이 된다(실제로 14명 중 13명이
+    # 그달 가입자였다).
     ghosts = [m for m in members
               if m["mn"] and m["mn"] not in active_authors
-              and attended.get(m["mn"], 0) == 0]
+              and attended.get(m["mn"], 0) == 0
+              and not joined_recently(m.get("joined_at"), months)]
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("활성 멤버", len(members))
@@ -2883,9 +2926,11 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
     c4.metric("유령 멤버", len(ghosts))
     c5.metric("⚠️ 동명이인", len(duplicates))
     st.caption(
-        "**유령 멤버**: 가입했지만 게시글·사진·참석 0건 — 마지막 방문일로 휴면 여부 추정. "
-        "닉네임이 같은 활동 흔적은 매칭. **동명이인**: 같은 닉네임의 활성 멤버가 둘 이상 — "
-        "후기 본문에선 분리 불가하니 보고서에서 합쳐 집계됨."
+        f"**유령 멤버**: 가입인사만 쓰고 그 뒤로 게시글·사진·참석이 0건인 사람. "
+        f"가입인사는 활동으로 세지 않습니다 — 안 쓰면 내보내는 규칙이라 전원이 "
+        f"쓰기 때문입니다. **가입한 지 {GHOST_GRACE_DAYS}일이 안 된 분은 뺍니다** "
+        f"(아직 나갈 출사가 안 열렸을 수도 있습니다). **동명이인**: 같은 닉네임의 "
+        f"활성 멤버가 둘 이상 — 후기 본문에선 분리 불가하니 합쳐 집계됨."
     )
 
     if duplicates:
@@ -3018,13 +3063,17 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
 
     names = [o["이름"] for o in opts]
     by_name = {o["이름"]: o for o in opts}
-    st.caption("활성 멤버 명단에서 고릅니다. 활동이 0건인 유령 멤버도 목록에 "
-               "있습니다 — 아무것도 안 했다는 사실 자체가 확인할 값입니다.")
-    name = st.selectbox(
-        "멤버 선택", names, key="mf_member",
-        format_func=lambda n: (f"{n} · 참석 {by_name[n]['참석']} · "
-                               f"글 {by_name[n]['게시글']} · 사진 {by_name[n]['사진']}"),
-    )
+    # 이 드롭다운이 탭 전체의 조종간인데, 회색 캡션 밑에 평범한 셀렉트박스로
+    # 두면 지나치기 쉽다. 테두리로 묶고 제목을 얹어 눈에 걸리게 한다.
+    with st.container(border=True):
+        st.markdown("#### 👤 어떤 멤버를 볼까요?")
+        name = st.selectbox(
+            "멤버 선택", names, key="mf_member", label_visibility="collapsed",
+            format_func=lambda n: (f"{n} · 참석 {by_name[n]['참석']} · "
+                                   f"글 {by_name[n]['게시글']} · 사진 {by_name[n]['사진']}"),
+            help="활성 멤버 명단에서 고릅니다. 활동이 0건인 유령 멤버도 목록에 "
+                 "있습니다 — 아무것도 안 했다는 사실 자체가 확인할 값입니다.",
+        )
     if not name:
         return
 
@@ -3039,7 +3088,11 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
     badges = []
     if prof["운영진"]:
         badges.append(("운영진", "blue"))
-    if prof["유령"]:
+    if prof["유령"] and prof["신입"]:
+        # 갓 들어온 사람에게 "유령"은 가혹하다 — 아직 나갈 출사가 안 열렸을 수도
+        # 있다. 멤버 탭의 유령 명단도 같은 이유로 이 사람을 빼고 센다.
+        badges.append(("🚪 아직 첫 출사 전 — 가입한 지 얼마 안 됐습니다", "gray"))
+    elif prof["유령"]:
         badges.append(("유령 — 이 기간 활동 0건", "gray"))
     elif prof["휴면"]:
         badges.append(("휴면 — 3개월 넘게 참석 없음", "orange"))

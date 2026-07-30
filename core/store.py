@@ -27,7 +27,8 @@ from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 from .collector import (
-    ALL_CATS, LEFT_MEMBER, NOT_A_NAME, OUTING_CATS, body_cut_length,
+    ALL_CATS, LEFT_MEMBER, MEETUP_POST_RX, NOT_A_NAME, OUTING_CATS,
+    body_cut_length,
 )
 
 # ── 파일·탭 이름 (고정 — URL을 붙여넣지 않고 이름으로 찾는다) ──
@@ -385,16 +386,26 @@ def attendee_fix_rows(posts: list[dict], done_att: Optional[dict] = None,
                       cut: Optional[int] = None) -> list[list]:
     """`참석자보정` 후보 행.
 
-    후보에 드는 조건이 둘이다.
+    후보에 드는 조건이 셋이다.
 
     ① 참석자를 못 뽑았거나 작성자가 명단에 없는 후기 (`attendees_needs_review`)
     ② **본문이 잘린 후기** — 이름을 뽑긴 했어도 뒤쪽이 통째로 안 왔으니
        그 명단이 전부라고 볼 근거가 없다.
+    ③ **참석자가 0명인 후기** — 아무도 안 간 출사는 존재하지 않는다. 후기 양식을
+       안 지켜 본문에 명단을 안 적은 것이라, 사람이 원문을 보고 채우는 수밖에
+       없다. ①만으로는 안 잡힌다 — 앱이 쓰는 `annotate_attendees`는
+       `attendees_needs_review`를 붙이지 않아서, 실질적으로 ②만 후보가 되고
+       **본문이 짧으면서 이름이 하나도 없는 후기가 통째로 새어 나갔다.**
 
-    ②는 사람이 원문을 봐야만 판단이 되므로, 앱이 뽑은 명단·본문 길이·잘림
+    ②·③은 사람이 원문을 봐야만 판단이 되므로, 앱이 뽑은 명단·본문 길이·잘림
     여부를 **미리 채워** 둔다. 그래야 "더 적어야 하는지, 지금이 맞는지"를
     시트만 보고 고를 수 있다. 맞다고 판단했으면 `추출된 참석자`를 `참석자`에
     그대로 붙여 넣어 확인 처리한다 — 빈칸은 끝까지 "아직 안 봄"이다.
+
+    소모임이 자동으로 만드는 정모 게시글은 뺀다. 후기가 아니라 참석자가 있을 수
+    없어서, 올려 두면 **영원히 못 채우는 행**이 남는다. 매칭이 붙여 주는
+    `is_meetup_post` 대신 본문을 다시 보는 이유: 시딩은 수집 직후에도 도는데
+    그 시점엔 매칭이 아직 안 돌아 그 플래그가 없다.
     """
     done_att = done_att or {}
     if cut is None:
@@ -403,9 +414,13 @@ def attendee_fix_rows(posts: list[dict], done_att: Optional[dict] = None,
     for p in posts or []:
         if p.get("cat") != "E" or str(p.get("id")) in done_att:
             continue
-        blen = len(str(p.get("body") or ""))
+        body = str(p.get("body") or "")
+        if MEETUP_POST_RX.search(body):
+            continue
+        blen = len(body)
         cut_here = cut is not None and blen >= cut
-        if not (p.get("attendees_needs_review") or cut_here):
+        empty = not (p.get("attendees") or [])
+        if not (p.get("attendees_needs_review") or cut_here or empty):
             continue
         rows.append([
             str(p["id"]), _to_cell(p.get("title")), "", "",
