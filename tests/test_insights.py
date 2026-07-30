@@ -580,6 +580,88 @@ def test_ghost_is_zero_everywhere_not_just_zero_attendance():
     assert member_profile("사진만", [], photos, members)["유령"] is False
 
 
+def test_join_greeting_is_not_activity():
+    """이 모임은 전원이 가입인사를 쓴다 — 세면 유령이 영원히 0명이 된다."""
+    from streamlit_app import activity_authors
+    posts = [notice("n1", "2026-03-01", author="공지자"),
+             {"id": "j1", "cat": "J", "author": "인사만", "title": "가입인사",
+              "posted_at": datetime(2026, 3, 2)}]
+    got = activity_authors(posts, [])
+    assert "공지자" in got and "인사만" not in got
+
+
+def test_a_brand_new_member_is_not_a_ghost():
+    """갓 들어온 사람에게 유령은 가혹하다 — 아직 나갈 출사가 안 열렸을 수 있다."""
+    from streamlit_app import joined_recently
+    months = [202603]                     # 기간 끝 = 2026-03-31
+    assert joined_recently(datetime(2026, 3, 20), months) is True
+    assert joined_recently(datetime(2026, 3, 2), months) is True     # 29일 전
+    assert joined_recently(datetime(2026, 3, 1), months) is False    # 30일 전
+    assert joined_recently(datetime(2026, 1, 5), months) is False
+    assert joined_recently(None, months) is False
+    assert joined_recently(datetime(2026, 3, 20), []) is False
+
+
+def test_grace_period_counts_days_not_months():
+    """달로 재면 **28일 된 사람이 유령이 된다** — 짧은 달에서 어긋난다.
+
+    2026-01-31 가입, 기간 끝 2026-02-28 → 28일밖에 안 됐다. 그런데 "가입월이
+    기간 마지막 달인가"로 재면 1월 ≠ 2월이라 걸러진다.
+    """
+    from streamlit_app import joined_recently
+    assert joined_recently(datetime(2026, 1, 31), [202602]) is True
+    # 반대쪽 — 딱 30일이면 유예가 끝난다(2026-03-31 → 2026-04-30).
+    assert joined_recently(datetime(2026, 3, 31), [202604]) is False
+
+
+def test_ghost_badge_and_member_tab_agree():
+    """같은 사람이 한 화면에선 유령이고 다른 화면에선 아니면 안 된다."""
+    from streamlit_app import (
+        activity_authors, club_context, joined_recently, member_profile)
+    months = [202603]
+    posts = [notice("n1", "2026-03-01", ["참석자"]),
+             {"id": "j1", "cat": "J", "author": "오래된유령", "title": "가입인사",
+              "posted_at": datetime(2026, 3, 2)},
+             {"id": "j2", "cat": "J", "author": "새내기", "title": "가입인사",
+              "posted_at": datetime(2026, 3, 25)}]
+    members = [member("w1", "참석자", joined=datetime(2025, 1, 1)),
+               member("w2", "오래된유령", joined=datetime(2025, 1, 1)),
+               member("w3", "새내기", joined=datetime(2026, 3, 25))]
+    # 멤버 탭이 세는 방식 그대로
+    act = activity_authors(posts, [])
+    attended = {n for p in posts if p.get("cat") == "A"
+                for n in p.get("attendees") or []}
+    tab_ghosts = {m["mn"] for m in members
+                  if m["mn"] not in act and m["mn"] not in attended
+                  and not joined_recently(m.get("joined_at"), months)}
+    assert tab_ghosts == {"오래된유령"}
+
+    ctx = club_context(posts, [], members, months)
+    badge = {m["mn"] for m in members
+             if member_profile(m["mn"], posts, [], members, ctx)["유령"]
+             and not member_profile(m["mn"], posts, [], members, ctx)["신입"]}
+    assert badge == tab_ghosts
+
+
+def test_a_newcomer_with_no_activity_gets_the_waiting_title_not_the_ghost_one():
+    from streamlit_app import club_titles
+    months = [202603]
+    members = [member("w1", "새내기", joined=datetime(2026, 3, 25)),
+               member("w2", "오래된유령", joined=datetime(2025, 1, 1))]
+    got = club_titles([], [], members, months)
+    assert [t["칭호"] for t in got["새내기"]] == ["아직 첫 출사 전"]
+    assert [t["칭호"] for t in got["오래된유령"]] == ["유령 회원"]
+
+
+def test_dropdown_post_count_excludes_join_greetings():
+    """목록엔 `글 1`인데 들어가면 "유령"이면 같은 사람이 둘로 보인다."""
+    from streamlit_app import member_options
+    posts = [{"id": "j1", "cat": "J", "author": "인사만", "title": "가입인사",
+              "posted_at": datetime(2026, 3, 2)}]
+    opts = {o["이름"]: o for o in member_options([member("w1", "인사만")], posts, [])}
+    assert opts["인사만"]["게시글"] == 0
+
+
 def test_rank_says_where_the_number_sits():
     """'12회 참석'만으로는 그게 많은 건지 알 수 없다."""
     from streamlit_app import member_profile
