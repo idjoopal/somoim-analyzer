@@ -1093,16 +1093,13 @@ def test_a_member_with_nothing_going_on_gets_no_title_box():
 
 def test_titles_come_with_the_reason_they_were_given():
     """이름만 붙으면 왜 붙었는지 물어볼 데가 없고 잘못 붙어도 못 알아챈다."""
-    from streamlit_app import club_context, member_companions, member_profile, member_titles
+    from streamlit_app import club_titles
 
     at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
-    posts = [p for p in at.session_state["_analysis"]["posts"]]
-    photos = at.session_state["_analysis"]["photos"]
-    members = at.session_state["_analysis"]["members"]
-    ctx = club_context(posts, photos, members)
-    prof = member_profile("나무", posts, photos, members, ctx)
-    titles = member_titles("나무", prof, member_companions("나무", posts, ctx["쌍"]),
-                           posts, photos, [202603], ctx)
+    analysis = at.session_state["_analysis"]
+    got = club_titles(analysis["posts"], analysis["photos"],
+                      analysis["members"], [202603])
+    titles = got["나무"]
     assert titles, "활동이 있는 사람인데 칭호가 하나도 없다"
     for t in titles:
         assert t["근거"], t
@@ -1152,3 +1149,27 @@ def test_distribution_counts_everyone_including_the_empty_handed():
     counts = [d.value for d in at.dataframe if "칭호 수" in list(d.value.columns)]
     assert counts, "개수 분포 표가 없다"
     assert list(counts[0]["칭호 수"]) == ["0개", "1개", "2개", "3개"]
+
+
+def test_distribution_lists_the_renamed_titles_not_the_old_ones():
+    """이름을 바꾸면 고정 목록도 갈아 끼워야 한다 — 안 그러면 분포 화면에
+    옛 이름이 0명으로 남고 새 이름은 목록 밖으로 밀려난다."""
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    at.session_state["mf_dist_open"] = True
+    at.run()
+    assert not at.exception, [str(e) for e in at.exception]
+
+    df = [d.value for d in at.dataframe if "받은 사람" in list(d.value.columns)][0]
+    shown = set(df["칭호"])
+    assert {"테마사진 프로 참석러", "감노 때부터 계셨네", "이게 본업이에요"} <= shown
+    assert not ({"테마 단골", "터줏대감", "개근왕", "다작왕"} & shown)
+
+
+def test_distribution_explains_the_quota():
+    """정원에 딱 붙은 숫자는 "조건이 느슨하다"는 뜻이라 읽는 법을 적어 둔다."""
+    from streamlit_app import TITLE_QUOTA_DEFAULT
+
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    at.session_state["mf_dist_open"] = True
+    at.run()
+    assert any(f"{TITLE_QUOTA_DEFAULT}명" in str(c.value) for c in at.caption)
