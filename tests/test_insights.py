@@ -809,8 +809,31 @@ def _names(titles):
 
 def test_a_member_with_no_activity_gets_only_the_ghost_title():
     posts = [notice("n1", "2026-03-01", ["활동가"])]
-    members = [member("w1", "활동가"), member("w2", "유령")]
+    members = [member("w1", "활동가"), member("w2", "유령", datetime(2024, 1, 1))]
     assert _names(_club(posts, [], members)["유령"]) == ["유령 회원"]
+
+
+def test_a_join_greeting_is_not_activity():
+    """이 모임은 가입인사를 안 쓰면 12시간 안에 강퇴한다 — **전원이 쓴다.**
+
+    그것까지 활동으로 세면 유령 멤버가 구조적으로 영원히 0명이 된다.
+    실제 데이터에서 활동 0건인 11명이 아무 칭호도 못 받고 있었다.
+    """
+    posts = [notice("n1", "2026-03-01", ["활동가"]),
+             {"id": "j1", "cat": "J", "author": "인사만", "wid": "w2",
+              "title": "가입인사", "body": "", "outing_date": None,
+              "posted_at": datetime(2026, 3, 2), "category": None,
+              "is_canceled": False, "likes": 0, "comments": 0, "images": 0}]
+    members = [member("w1", "활동가"), member("w2", "인사만", datetime(2024, 1, 1))]
+    assert _names(_club(posts, [], members)["인사만"]) == ["유령 회원"]
+
+
+def test_someone_who_just_joined_is_not_called_a_ghost():
+    """가입한 지 한 달도 안 됐으면 아직 첫 출사가 안 열렸을 수도 있다."""
+    posts = [notice("n1", "2026-03-01", ["활동가"])]
+    members = [member("w1", "활동가"), member("w2", "새로온분", datetime(2026, 3, 5))]
+    assert _names(_club(posts, [], members, [202602, 202603])["새로온분"]) \
+        == ["아직 첫 출사 전"]
 
 
 def test_titles_are_capped_and_sorted_by_rarity():
@@ -981,7 +1004,7 @@ def _cands(name, posts, photos, members, months=None):
     """
     from streamlit_app import (_title_candidates, club_context,
                                member_companions, member_profile)
-    ctx = club_context(posts, photos, members)
+    ctx = club_context(posts, photos, members, months or [202603])
     return [t["칭호"] for t in _title_candidates(
         name, member_profile(name, posts, photos, members, ctx),
         member_companions(name, posts, ctx["쌍"]), posts, photos,
@@ -1279,3 +1302,60 @@ def test_the_steady_titles_are_gone():
     assert "한 달도 안 빠졌네" not in FIXED_TITLE_NAMES
     assert "한결같은 사람" not in FIXED_TITLE_NAMES
     assert not hasattr(streamlit_app, "_attendance_streak"), "부르는 곳 없는 코드"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 1등은 없지만 빠지지도 않는 사람 — 실제 데이터에서 통째로 비어 있었다
+# ═══════════════════════════════════════════════════════════════
+
+def test_doing_all_four_things_earns_a_title():
+    """참석 13·개최 3·후기 2·사진 18인 사람이 칭호가 하나도 없었다.
+
+    어느 지표에서도 상위 15~30%에 못 들었기 때문인데, **네 가지를 다 하는
+    것 자체가 드물다**(실제 데이터에서 94명 중 24명).
+    """
+    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), ["만능", "남들"])
+             for i in range(6)]
+    posts += [notice(f"h{i}", "2026-04-0%d" % (i + 1), ["만능"], author="만능")
+              for i in range(2)]
+    posts += [review(f"r{i}", author="만능", matched=f"n{i}") for i in range(2)]
+    photos = [photo(f"p{i}", "만능") for i in range(5)]
+    members = [member("w1", "만능"), member("w2", "남들")]
+    assert "골고루 하는 사람" in _cands("만능", posts, photos, members)
+
+
+def test_missing_one_of_the_four_earns_nothing():
+    """셋만 하면 "골고루"가 아니다."""
+    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), ["셋만"]) for i in range(6)]
+    posts += [notice(f"h{i}", "2026-04-0%d" % (i + 1), ["셋만"], author="셋만")
+              for i in range(2)]
+    photos = [photo(f"p{i}", "셋만") for i in range(5)]
+    assert "골고루 하는 사람" not in _cands("셋만", posts, photos,
+                                      [member("w1", "셋만")])
+
+
+def test_a_latecomer_is_measured_per_month():
+    """늦게 합류한 사람은 **누적 참석으로는 영원히 위로 못 간다.**
+
+    가입 이후 몇 달을 다녔는지로 나누면 "짧은 기간에 촘촘히"가 보인다.
+    """
+    months = [202601 + i for i in range(6)]
+    # 고참은 여섯 달에 걸쳐 열 번, 늦게 온 사람은 마지막 두 달에 여덟 번.
+    posts = [notice(f"o{i}", "2026-%02d-05" % (i % 6 + 1), ["고참"]) for i in range(10)]
+    posts += [notice(f"l{i}", "2026-0%d-1%d" % (5 + i % 2, i), ["늦둥이"])
+              for i in range(8)]
+    posts += [notice(f"x{i}", "2026-0%d-2%d" % (i % 6 + 1, i), [f"남들{i}"])
+              for i in range(6)]
+    members = ([member("w1", "고참", datetime(2026, 1, 1)),
+                member("w2", "늦둥이", datetime(2026, 5, 1))]
+               + [member(f"w{i+3}", f"남들{i}", datetime(2026, 1, 1)) for i in range(6)])
+    assert "짧은 기간에 진심" in _cands("늦둥이", posts, [], members, months)
+
+
+def test_the_density_pool_divides_by_time_in_the_club():
+    """가입 전 기간까지 분모에 넣으면 늦게 온 사람이 손해를 본다."""
+    from streamlit_app import _active_months
+    months = [202601 + i for i in range(6)]
+    assert _active_months(datetime(2026, 5, 1), months) == 2      # 5·6월
+    assert _active_months(datetime(2020, 1, 1), months) == 6      # 기간 전체
+    assert _active_months(None, months) == 6
