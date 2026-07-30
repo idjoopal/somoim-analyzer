@@ -982,6 +982,10 @@ def club_context(posts: list[dict], photos: list[dict],
         # 아래 셋은 칭호가 멤버마다 다시 돌면 O(게시글×참석자)가 되는 것들이다.
         # 전 멤버를 훑는 경로가 생겼으므로 여기서 한 번만 만든다.
         "카테고리": member_category_pref(posts),
+        # 카테고리별로 **몇 건이나 열렸나**. 카테고리 칭호의 분모다.
+        "카테고리총계": Counter(
+            p.get("category") for p in posts
+            if p.get("cat") == "A" and p.get("actually_held") and p.get("category")),
         "공지": {p["id"]: p for p in posts if p.get("cat") == "A"},
     }
 
@@ -1418,15 +1422,31 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     # ── 성향 ────────────────────────────────────────────────
     pref = ctx["카테고리"].get(name) or Counter()
     total = sum(pref.values())
-    if att >= 6 and pref:
+
+    # **분모는 "내 참석"이 아니라 "그 카테고리 출사 전부"다.**
+    #
+    # 예전에는 "내가 간 출사의 75%가 풍경"이었는데, 이 모임은 인물&풍경이
+    # 압도적이라 나머지 카테고리로는 그 비율이 나올 수가 없었다 — 풍경
+    # 사냥꾼·GN 마니아·문화?시민이 전부 0명이었다.
+    #
+    # 열린 게 적은 카테고리일수록 "그중 몇 건에 나왔나"가 오히려 또렷하다.
+    # 문화 출사가 네 번 있었고 그중 세 번에 나왔다면 그 사람이 문화 담당이다.
+    best = None
+    for cat, cnt in pref.items():
+        held = ctx["카테고리총계"].get(cat, 0)
+        # 두세 건뿐인 카테고리는 한 번만 나와도 비율이 튄다.
+        if held >= 4 and cnt >= 3:
+            ratio = _pct(cnt, held)
+            if best is None or ratio > best[1]:
+                best = (cat, ratio, cnt, held)
+    if best and best[1] >= 40:
+        cat, ratio, cnt, held = best
+        put("성향", 73, "🏞", CATEGORY_TITLES.get(cat, f"{cat} 마니아"),
+            f"{cat} 출사 {held}건 중 {cnt}건에 참석 ({ratio}%)", ratio, "카테고리")
+    elif att >= 6 and pref and len(pref) >= 4:
         cat, cnt = pref.most_common(1)[0]
         share = _pct(cnt, total)
-        # 60%로는 주력 카테고리(인물&풍경)에 스무 명이 걸렸다. 이 모임에서
-        # 60%는 쏠림이 아니라 평균이다.
-        if share >= 75:
-            put("성향", 73, "🏞", CATEGORY_TITLES.get(cat, f"{cat} 마니아"),
-                f"참석의 {share}%가 {cat} ({cnt}회)", share, "카테고리")
-        elif len(pref) >= 4 and share <= 40:
+        if share <= 40:
             put("성향", 71, "🌈", "잡식성",
                 f"{len(pref)}가지를 고루 — 가장 많은 {cat}도 {share}%뿐", len(pref))
     # 요일은 성향과 **다른 축**이다 — 무엇을 찍느냐(카테고리)와 언제 가느냐는

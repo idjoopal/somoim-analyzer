@@ -891,23 +891,56 @@ def test_nobody_follows_the_person_who_goes_to_everything():
         assert not any("출사가세요?" in t for t in _names(_club(posts, [], members)[p]))
 
 
-def test_a_lopsided_taste_names_the_category():
-    """쏠림 기준은 75% — 60%로 두었더니 주력 카테고리에 스무 명이 걸렸다."""
-    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), ["풍경러"],
-                    category="풍경") for i in range(7)]
-    posts.append(notice("x", "2026-03-20", ["풍경러"], category="인물"))
-    got = _names(_club(posts, [], [member("w1", "풍경러")])["풍경러"])
-    assert "풍경 사냥꾼" in got
+def test_a_category_regular_is_measured_against_that_categorys_outings():
+    """**분모는 "내 참석"이 아니라 "그 카테고리 출사 전부"다.**
+
+    예전에는 "내가 간 출사의 75%가 풍경"이었는데, 이 모임은 인물&풍경이
+    압도적이라 나머지 카테고리로는 그 비율이 나올 수가 없었다.
+    """
+    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), ["풍경러"], category="풍경")
+             for i in range(5)]
+    posts += [notice(f"m{i}", "2026-03-2%d" % i, ["남들"], category="인물")
+              for i in range(4)]
+    members = [member("w1", "풍경러"), member("w2", "남들")]
+    assert "풍경 사냥꾼" in _cands("풍경러", posts, [], members)
 
 
-def test_a_merely_common_taste_gets_no_category_title():
-    """이 모임에선 주력 카테고리 60%가 쏠림이 아니라 평균이다."""
-    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), ["보통"], category="풍경")
-             for i in range(4)]
-    posts += [notice(f"m{i}", "2026-03-2%d" % i, ["보통"], category="인물")
-              for i in range(3)]
-    got = _names(_club(posts, [], [member("w1", "보통")])["보통"])
-    assert not any("사냥꾼" in t or "전문" in t or "애호가" in t for t in got), got
+def test_a_small_category_can_earn_a_title_now():
+    """문화 출사가 네 번뿐이어도 그중 셋에 나왔으면 그 사람이 문화 담당이다.
+
+    옛 기준(내 참석의 75%)으로는 주력 카테고리를 함께 다니는 순간 불가능해
+    `문화?시민`·`GN 마니아`·`풍경 사냥꾼`이 전부 0명이었다.
+    """
+    posts = [notice(f"c{i}", "2026-03-0%d" % (i + 1), ["문화인"], category="문화")
+             for i in range(3)]
+    posts.append(notice("c9", "2026-03-09", ["남들"], category="문화"))
+    # 주력 카테고리도 가끔 간다(12건 중 3건). 비율이 가장 높은 카테고리
+    # 하나만 뽑으므로 문화(75%)가 인물&풍경(25%)을 이긴다.
+    posts += [notice(f"p{i}", "2026-03-1%d" % i,
+                     ["문화인", "남들"] if i < 3 else ["남들"],
+                     category="인물&풍경") for i in range(12)]
+    members = [member("w1", "문화인"), member("w2", "남들")]
+    assert "문화?시민" in _cands("문화인", posts, [], members)
+
+
+def test_dropping_by_a_category_now_and_then_earns_nothing():
+    """스무 건 중 세 건이면 그 카테고리 사람이라고 할 수 없다."""
+    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1),
+                    ["가끔"] if i < 3 else ["남들"], category="풍경")
+             for i in range(20)]
+    members = [member("w1", "가끔"), member("w2", "남들")]
+    got = _cands("가끔", posts, [], members)
+    assert not any("사냥꾼" in t or "마니아" in t for t in got), got
+
+
+def test_a_category_with_almost_no_outings_is_ignored():
+    """두세 건뿐인 카테고리는 한 번만 나와도 비율이 튄다."""
+    posts = [notice(f"g{i}", "2026-03-0%d" % (i + 1), ["운좋"], category="GN")
+             for i in range(3)]
+    posts += [notice(f"p{i}", "2026-03-1%d" % i, ["운좋", "남들"],
+                     category="인물&풍경") for i in range(9)]
+    members = [member("w1", "운좋"), member("w2", "남들")]
+    assert "GN 마니아" not in _cands("운좋", posts, [], members)
 
 
 def test_nothing_matches_means_no_titles():
