@@ -605,6 +605,11 @@ def _pct(n: int, total: int) -> float:
     return round(n / total * 100, 1) if total else 0.0
 
 
+def _pctstr(v: float) -> str:
+    """`70.0%`가 아니라 `70%`. 소수점이 필요할 때만 붙인다."""
+    return f"{v:g}%"
+
+
 def co_attendance(posts: list[dict], top_n: int = CO_ATTENDANCE_TOP) -> list[dict]:
     """함께 간 횟수 상위 쌍.
 
@@ -1356,10 +1361,12 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
             joined.strftime("%Y-%m-%d"), months, within=1)
         if fresh:
             return [{"지표": "연차", "우선": 52, "아이콘": "🚪", "칭호": "아직 첫 출사 전",
-                     "근거": f"{prof['가입일']} 가입 — 첫 출사를 기다리는 중",
+                     "근거": f"{prof['가입일']} 가입 — 아직 첫 출사 전입니다. "
+                            "곧 뵙겠습니다",
                      "강도": 0.0, "갈래": "일반"}]
         return [{"지표": "연차", "우선": 50, "아이콘": "👻", "칭호": "유령 회원",
-                 "근거": "이 기간에 글·사진·참석이 하나도 없습니다",
+                 "근거": "이 기간에 글·사진·참석이 하나도 없습니다 "
+                        "(가입인사는 활동으로 세지 않습니다)",
                  "강도": 0.0, "갈래": "일반"}]
 
     att, hosted_ran = prof["참석"], prof["개최 진행"]
@@ -1369,78 +1376,91 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     top = companions[0] if companions else None
     if top and top["함께"] >= 3 and top["내 기준"] >= 50 and top["상대 기준"] >= 50:
         put("동행", 95, "💞", f"{top['함께 간 사람']}와 환상의 콤비",
-            f"{top['함께']}회 동행 · 서로 {top['내 기준']}% / {top['상대 기준']}%",
+            f"{top['함께']}회를 함께 다녔습니다 — 서로에게 절반이 넘는 사이입니다"
+            f"(내 출사의 {_pctstr(top['내 기준'])}, "
+            f"상대 출사의 {_pctstr(top['상대 기준'])})",
             top["함께"], "관계")
     # 콤비가 붙은 상대에게는 `출사가세요?`를 안 붙인다 — 서로 붙어 다니는 것과
     # 한쪽이 쫓아다니는 것은 다른 얘기라, 같은 상대로 둘 다 붙으면 앞말이
     # 뒷말을 부정한다.
     elif top and att >= 4 and _follows(top, prof):
         put("동행", 88, "🐾", f"{top['함께 간 사람']}님 출사가세요?",
-            f"참석 {att}회 중 {top['함께']}회를 함께 ({top['내 기준']}%) — "
-            f"상대의 전체 출석률 {_pct(top['상대 참석'], prof['매칭 출사'])}%보다 높습니다",
+            f"내 출사 {att}회 중 {top['함께']}회가 이분과 함께({_pctstr(top['내 기준'])}) — "
+            f"이분이 전체 출사에 나오는 비율 "
+            f"{_pctstr(_pct(top['상대 참석'], prof['매칭 출사']))}보다 훨씬 높습니다",
             top["내 기준"], "관계")
     if top_share(name, ctx["동행자"], 0.20, min_value=4):
         put("동행", 80, "🕸", "다 아는 사람들 이구먼",
-            f"{prof['동행자']}명과 함께 가 봤습니다", prof["동행자"])
+            f"함께 출사해 본 사람이 {prof['동행자']}명 — 모임에서 아는 얼굴이 "
+            "가장 많은 20% 안에 듭니다", prof["동행자"])
     if att >= 3 and len(ctx["동행자"]) >= 4 and (
             # 아무와도 안 겹친 사람은 `동행자` 목록에 아예 없다 — 분위로만 재면
             # 가장 혼자인 사람이 빠져나간다.
             prof["동행자"] == 0 or bottom_share(name, ctx["동행자"], 0.25)):
         put("동행", 62, "🕊", "저 신입 아닌데요",
-            f"참석 {att}회 · 함께 간 사람 {prof['동행자']}명", -prof["동행자"])
+            f"참석 {att}회에 함께 간 사람 {prof['동행자']}명 — 모임에서 동행이 "
+            "가장 적은 25%입니다", -prof["동행자"])
 
     # ── 테마 · 개최 · 참석 · 사진 · 좋아요 (1등 → 상위 분위) ──
-    def tier(지표, 위: tuple, 아래: tuple, *, 바닥: bool, 근거: str,
-             강도: float, share: float):
+    def tier(지표, 위: tuple, 아래: tuple, *, 바닥: bool, 사실: str,
+             순서말: str, 강도: float, share: float):
         """1등이면 윗 칭호, 아니면 상위 `share`에 아랫 칭호. 둘 다 `바닥`을 넘어야.
 
         `위`·`아래`는 `(우선, 아이콘, 이름)`.
+
+        **근거는 두 갈래로 갈라 쓴다.** 1등과 "상위 15%"는 전혀 다른 얘기인데
+        같은 문구를 쓰면 무엇으로 받았는지 알 수 없다. `사실`(그 사람의 숫자)
+        뒤에 어느 기준으로 걸렸는지를 붙인다.
         """
         if not 바닥:
             return
         # 1등도 모수를 함께 본다 — 두 사람뿐인 판의 1등은 1등이 아니다.
         if prof[f"{지표} 순위"] == 1 and len(ctx[지표]) >= 4:
-            put(지표, *위, 근거, 강도)
+            put(지표, *위, f"{사실}. 모임에서 가장 {순서말} 분입니다", 강도)
         elif top_share(name, ctx[지표], share, min_value=0):
-            put(지표, *아래, 근거, 강도)
+            put(지표, *아래,
+                f"{사실}. {순서말} 순으로 상위 {round(share * 100)}% 안입니다", 강도)
 
-    # 상위 분위는 실제 분포를 보고 정했다 — 30%로 두었더니 모수가 40명 넘는
-    # 참석·테마에서 열두세 명씩 붙었다.
     tier("테마", (90, "🎨", "테마사진의 제왕"), (78, "🖌", "테마사진 프로 참석러"),
-         바닥=n_theme >= 2, 강도=n_theme, share=0.15,
-         근거=f"테마사진 {n_theme}장 · {prof['테마 참여월']}개월 참여")
+         바닥=n_theme >= 2, 강도=n_theme, share=0.15, 순서말="많이 낸",
+         사실=f"테마사진 {n_theme}장을 {prof['테마 참여월']}개월에 걸쳐 냈습니다")
     tier("개최", (90, "📢", "출사장도 장이다"), (77, "🗣", "심심한데 출사쳐야지"),
-         바닥=hosted_ran >= 2, 강도=hosted_ran, share=0.30,
-         근거=f"펑 아닌 출사 {hosted_ran}건을 열었습니다")
+         바닥=hosted_ran >= 2, 강도=hosted_ran, share=0.30, 순서말="많이 연",
+         사실=f"펑이 아닌 출사를 {hosted_ran}건 열었습니다")
     tier("참석", (90, "🥾", "이게 본업이에요"), (76, "🔥", "프로 참석러"),
-         바닥=att >= 3, 강도=att, share=0.15,
-         근거=f"참석 {att}회 · 참석률 {prof['참석률']}%")
+         바닥=att >= 3, 강도=att, share=0.15, 순서말="많이 나온",
+         사실=f"참석 {att}회 — 후기가 매칭된 출사의 "
+              f"{_pctstr(prof['참석률'])}에 나왔습니다")
     tier("사진", (85, "📸", "여기 제 인스타인데.."), (75, "🖼", "부지런한 업로더"),
-         바닥=n_photo >= 5, 강도=n_photo, share=0.30,
-         근거=f"사진 {n_photo}장 · 좋아요 {prof['사진 좋아요']}")
+         바닥=n_photo >= 5, 강도=n_photo, share=0.30, 순서말="많이 올린",
+         사실=f"사진 {n_photo}장 · 받은 좋아요 {prof['사진 좋아요']}")
     tier("좋아요", (85, "❤️", "사진 좋아요 1위"), (74, "💗", "느좋 사진러"),
          바닥=n_photo >= LIKE_RANK_MIN_PHOTOS, 강도=prof["장당 좋아요"], share=0.30,
-         근거=f"장당 좋아요 {prof['장당 좋아요']} ({n_photo}장)")
+         순서말="장당 좋아요가 높은",
+         사실=f"{n_photo}장을 올려 장당 좋아요 {prof['장당 좋아요']}를 받았습니다")
 
     # ── 후기 (자기 출사 후기율의 양 끝) ──────────────────────
     # 개최 2건이면 "둘 다 내가 썼다"가 너무 흔하다(실제로 15명이 받았다).
     if hosted_ran >= 5 and prof["자기 출사 후기율"] >= 100:
         put("후기", 80, "✍️", "책임감 100만점",
-            f"본인이 연 출사 {hosted_ran}건 전부에 직접 후기를 썼습니다", hosted_ran)
+            f"본인이 연 출사 {hosted_ran}건에 **전부** 직접 후기를 썼습니다 (100%)",
+            hosted_ran)
     if hosted_ran >= 3 and prof["자기 출사 후기"] == 0:
         put("후기", 64, "🙈", "아맞다후기",
-            f"출사 {hosted_ran}건을 열었는데 본인이 쓴 후기는 없습니다", hosted_ran)
+            f"출사를 {hosted_ran}건 열었는데 본인이 쓴 후기는 한 건도 없습니다 — "
+            "후기는 다른 분들이 써 주셨네요", hosted_ran)
 
     # ── 속도 (날짜 간격) ────────────────────────────────────
     gap = _review_lag(name, posts, ctx)
     if gap is not None and gap[1] >= 3 and gap[0] <= 1:
         put("속도", 82, "🚀", "후기는 따끈할때",
-            f"후기 {gap[1]}건 · 출사 다음날까지 평균 {gap[0]}일 만에 올립니다",
-            -gap[0])
+            f"후기 {gap[1]}건을 출사일로부터 평균 {gap[0]}일 만에 올렸습니다 — "
+            "다녀온 다음 날이면 올라옵니다", -gap[0])
     flash = _flash_ratio(name, posts)
     if flash is not None and flash[1] >= 3 and flash[0] >= 50:
         put("속도", 81, "⚡", "내일 출사가실분?",
-            f"연 출사 {flash[1]}건 중 {flash[0]}%가 공지 이틀 안에 출발", flash[0])
+            f"연 출사 {flash[1]}건 중 {_pctstr(flash[0])}가 공지한 지 이틀 안에 출발 — "
+            "번개를 자주 여십니다", flash[0])
 
     # ── 규모 (참석한 출사 인원의 **양 끝**) ─────────────────
     # 같은 자를 양쪽에서 읽는다 — 늘 북적이는 자리만 가는 사람과 조용한
@@ -1449,18 +1469,22 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
         mine = dict(ctx["참석인원"]).get(name)
         if mine is not None and top_share(name, ctx["참석인원"], 0.15, min_value=0):
             put("규모", 83, "🎪", "정출킬러",
-                f"참석한 출사의 평균 인원 {mine:.1f}명", mine)
+                f"참석한 출사의 평균 인원이 {mine:.1f}명 — 북적이는 자리만 골라 "
+                "가는 상위 15%입니다", mine)
         if mine is not None and bottom_share(name, ctx["참석인원"], 0.15):
             put("규모", 69, "🤏", "소수정예",
-                f"참석한 출사의 평균 인원 {mine:.1f}명", -mine)
+                f"참석한 출사의 평균 인원이 {mine:.1f}명 — 조용한 자리만 골라 "
+                "가는 하위 15%입니다", -mine)
 
     # ── 균형 (참석 대 사진의 엇갈림) ────────────────────────
     if att >= 3 and n_photo <= 2 and top_share(name, ctx["참석"], 0.30, min_value=0):
         put("균형", 67, "👀", "소모임에요? 글쎄..",
-            f"참석 {att}회 · 올린 사진 {n_photo}장", att)
+            f"참석은 {att}회(상위 30%)인데 올린 사진은 {n_photo}장 — 부지런히 "
+            "다니시면서 사진은 거의 안 올리십니다", att)
     if att <= 2 and n_photo >= 5 and top_share(name, ctx["사진"], 0.30, min_value=0):
         put("균형", 66, "🖨", "제가 사진이 좀 많아요",
-            f"사진 {n_photo}장 · 참석 {att}회", n_photo)
+            f"사진은 {n_photo}장(상위 30%)인데 참석은 {att}회 — 출사보다 "
+            "사진으로 만나는 분입니다", n_photo)
 
     # ── 종합 (네 가지를 다 하는 사람) ───────────────────────
     # 1등은 하나도 없는데 참석·개최·후기·사진을 **전부** 하는 사람이 있다.
@@ -1470,8 +1494,9 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     floors = ((att, 5), (hosted_ran, 2), (prof["후기"], 2), (n_photo, 5))
     if all(v >= f for v, f in floors):
         put("종합", 76, "🎭", "골고루 하는 사람",
-            f"참석 {att} · 개최 {hosted_ran} · 후기 {prof['후기']} · 사진 {n_photo} "
-            "— 네 가지를 다 합니다", min(v / f for v, f in floors))
+            f"참석 {att} · 개최 {hosted_ran} · 후기 {prof['후기']} · 사진 {n_photo} — "
+            "1등은 없어도 네 가지를 **모두** 하십니다. 흔치 않은 조합입니다",
+            min(v / f for v, f in floors))
 
     # ── 밀도 (활동 기간 대비 참석) ──────────────────────────
     # 늦게 합류한 사람은 누적 참석으로는 영원히 위로 못 간다. 가입 이후 몇
@@ -1482,16 +1507,17 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     if att >= 5 and top_share(name, ctx.get("밀도") or [], 0.30, min_value=0):
         rate = dict(ctx.get("밀도") or []).get(name, 0)
         put("밀도", 68, "🔥", "짧은 기간에 진심",
-            f"활동 {prof['활동 개월']}개월 동안 {att}회 — 달마다 {rate:.1f}회꼴", rate)
+            f"가입 후 {prof['활동 개월']}개월 동안 {att}회 — 달마다 {rate:.1f}회꼴로, "
+            "활동 기간 대비 상위 30%입니다", rate)
 
     # ── 습관 (취소율의 양 끝) ───────────────────────────────
     if prof["개최"] >= 5 and prof["개최 취소"] == 0:
         put("습관", 73, "🛡", "펑 한 번 없는 사람",
-            f"출사 {prof['개최']}건을 열면서 취소가 한 번도 없습니다", prof["개최"])
+            f"출사를 {prof['개최']}건 열면서 펑이 한 번도 없었습니다", prof["개최"])
     if prof["개최"] >= 3 and prof["취소율"] >= 40:
         put("습관", 60, "💥", "펑의 달인",
-            f"개최 {prof['개최']}건 중 {prof['개최 취소']}건 취소 ({prof['취소율']}%)",
-            prof["취소율"])
+            f"연 출사 {prof['개최']}건 중 {prof['개최 취소']}건이 펑 "
+            f"({_pctstr(prof['취소율'])}) — 사정이 많으셨나 봅니다", prof["취소율"])
 
     # ── 성향 ────────────────────────────────────────────────
     pref = ctx["카테고리"].get(name) or Counter()
@@ -1525,12 +1551,18 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
             best = (cat, score, cnt, held, own, ratio, lift)
     if best:
         cat, score, cnt, held, own, ratio, lift = best
+        # **어느 자로 걸렸는지 밝힌다.** 셋이 뜻하는 바가 전혀 달라서, 숫자만
+        # 적어 두면 "이 계열을 많이 간다"는 건지 "이 계열이 열리면 꼭 온다"는
+        # 건지 알 수 없다.
         if ratio >= 40:
-            근거 = f"{cat} 출사 {held}건 중 {cnt}건에 참석 ({ratio}%)"
+            근거 = (f"{cat} 출사 {held}건 중 {cnt}건에 나왔습니다({_pctstr(ratio)}) — "
+                  "이 계열이 열리면 거의 오십니다")
         elif own >= 75:
-            근거 = f"참석의 {own}%가 {cat} ({cnt}회)"
+            근거 = (f"참석 {total}회 중 {cnt}회가 {cat}({_pctstr(own)}) — "
+                  "이 계열만 골라 다니십니다")
         else:
-            근거 = f"참석의 {own}%가 {cat} — 모임 평균의 {lift:.1f}배 ({cnt}회)"
+            근거 = (f"참석의 {_pctstr(own)}가 {cat}({cnt}회) — 이 계열은 전체 출사의 "
+                  f"{_pctstr(_pct(held, all_held))}뿐이라 모임 평균의 {lift:.1f}배입니다")
         put("성향", 73, "🏞", CATEGORY_TITLES.get(cat, f"{cat} 마니아"),
             근거, score, "카테고리")
     elif att >= 6 and pref and len(pref) >= 4:
@@ -1538,7 +1570,8 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
         share = _pct(cnt, total)
         if share <= 40:
             put("성향", 71, "🌈", "잡식성",
-                f"{len(pref)}가지를 고루 — 가장 많은 {cat}도 {share}%뿐", len(pref))
+                f"{len(pref)}가지 카테고리를 고루 다니십니다 — 가장 많은 {cat}조차 "
+            f"{_pctstr(share)}뿐이라 어느 한쪽으로 쏠리지 않습니다", len(pref))
     # 요일은 성향과 **다른 축**이다 — 무엇을 찍느냐(카테고리)와 언제 가느냐는
     # 같이 나와도 서로 겹치는 말이 아니다. 한 지표로 묶으면 둘 중 하나가
     # 늘 묻힌다.
@@ -1546,7 +1579,7 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
         wd = _weekday_ratio(name, posts)
         if wd is not None and wd >= 60:
             put("요일", 74, "🗓", "프로 평일러",
-                f"참석한 출사의 {wd}%가 평일입니다", wd)
+                f"참석한 출사의 {_pctstr(wd)}가 평일 — 주말보다 평일에 더 나오십니다", wd)
 
     # ── 연차 ────────────────────────────────────────────────
     joined = prof.get("_가입")
@@ -1555,19 +1588,22 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
         # 분석 기간을 좁히면 터줏대감이 바뀌었다. 다감노 이전부터 자리를
         # 지켜 온 사람이라는 뜻이 기간에 흔들리면 안 된다.
         put("연차", 79, "🌳", "아이고 어르신",
-            f"{joined.strftime('%Y-%m-%d')} 가입 — 구-감노 시절부터 계셨습니다",
+            f"{joined.strftime('%Y-%m-%d')} 가입 — 다감노 이전, 구-감노 시절부터 "
+            "나가지 않고 자리를 지켜 오셨습니다",
             -joined.toordinal())
     if prof["가입→첫 참석"] is not None and 0 <= prof["가입→첫 참석"] <= 7:
         put("연차", 71, "🏃", "첫 출사 못 참지",
-            f"가입 {prof['가입→첫 참석']}일 만에 첫 출사", -prof["가입→첫 참석"])
+            f"가입하고 {prof['가입→첫 참석']}일 만에 첫 출사 — 망설임이 없으셨네요",
+            -prof["가입→첫 참석"])
     if att >= 1 and prof["첫 등장"] != "—" and months and _is_newcomer(
             prof["첫 등장"], months):
         put("연차", 70, "🌱", "새싹",
-            f"최근에 합류했습니다 (첫 참석 {prof['첫 등장']})", att)
+            f"첫 참석이 {prof['첫 등장']} — 최근에 합류하셨습니다", att)
     if att >= 5 and prof["휴면"]:
         # 두 번 나오고 조용해진 사람까지 부르면 열두 명이 된다.
         put("연차", 55, "🌙", "돌아오세요",
-            f"참석 {att}회 · 마지막 참석 {prof['최근 참석']}", att)
+            f"{att}회나 나오시다 {prof['최근 참석']}을 끝으로 3개월 넘게 "
+            "조용하십니다", att)
 
     return add
 

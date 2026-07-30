@@ -996,6 +996,17 @@ def test_passing_a_context_does_not_change_the_answer():
 # 정원 — 스무 명이 받는 것은 칭호가 아니라 그 모임의 평균이다
 # ═══════════════════════════════════════════════════════════════
 
+def _cands_full(name, posts, photos, members, months=None):
+    """`_cands`와 같되 칭호 이름이 아니라 **후보 전체**를 돌려준다."""
+    from streamlit_app import (_title_candidates, club_context,
+                               member_companions, member_profile)
+    ctx = club_context(posts, photos, members, months or [202603])
+    return _title_candidates(
+        name, member_profile(name, posts, photos, members, ctx),
+        member_companions(name, posts, ctx["쌍"]), posts, photos,
+        months or [202603], ctx)
+
+
 def _cands(name, posts, photos, members, months=None):
     """정원·3개 제한을 걸기 **전**의 후보 이름들.
 
@@ -1359,3 +1370,57 @@ def test_the_density_pool_divides_by_time_in_the_club():
     assert _active_months(datetime(2026, 5, 1), months) == 2      # 5·6월
     assert _active_months(datetime(2020, 1, 1), months) == 6      # 기간 전체
     assert _active_months(None, months) == 6
+
+
+# ═══════════════════════════════════════════════════════════════
+# 근거 — 왜 붙었는지 읽고 알 수 있어야 한다
+# ═══════════════════════════════════════════════════════════════
+
+def test_the_two_size_titles_do_not_share_a_reason():
+    """`정출킬러`와 `소수정예`의 근거가 **글자까지 같았다.**
+
+    둘 다 "참석한 출사의 평균 인원 8.2명"이라고만 적혀서, 그게 많다는
+    얘기인지 적다는 얘기인지 화면만 보고는 알 수 없었다.
+    """
+    crowd = [f"떼거리{j}" for j in range(9)]
+    posts = [notice(f"b{i}", "2026-03-0%d" % (i + 1), ["북적"] + crowd)
+             for i in range(4)]
+    posts += [notice(f"s{i}", "2026-03-1%d" % i, ["소수", "짝"]) for i in range(4)]
+    members = ([member("w1", "북적"), member("w2", "소수"), member("w3", "짝")]
+               + [member(f"c{j}", c) for j, c in enumerate(crowd)])
+
+    def reason(n, 칭호):
+        return next((t for t in _cands_full(n, posts, [], members)
+                     if t["칭호"] == 칭호), {}).get("근거")
+
+    big, small = reason("북적", "정출킬러"), reason("소수", "소수정예")
+    assert big and small and big != small, (big, small)
+    assert "상위" in big and "하위" in small
+
+
+def test_a_first_place_reason_differs_from_a_top_share_reason():
+    """1등과 "상위 15%"는 전혀 다른 얘기다 — 근거도 달라야 한다."""
+    people = [f"사람{i:02d}" for i in range(20)]
+    # 뒤로 갈수록 한 번씩 덜 나온다 — 동점 없이 1등과 그 아래가 갈린다.
+    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), people[:20 - i])
+             for i in range(20)]
+    members = [member(f"w{i}", p) for i, p in enumerate(people)]
+    got = _club(posts, [], members)
+
+    첫째 = next(t for t in got["사람00"] if t["칭호"] == "이게 본업이에요")
+    assert "가장 많이 나온" in 첫째["근거"], 첫째["근거"]
+    아래 = [t for ts in got.values() for t in ts if t["칭호"] == "프로 참석러"]
+    assert 아래 and all("상위" in t["근거"] for t in 아래), 아래
+
+
+def test_every_reason_says_more_than_a_bare_number():
+    """숫자만 적혀 있으면 무엇을 의도한 칭호인지 알 수 없다."""
+    posts, members = _old_crowd(12)
+    photos = [photo(f"p{i}", members[i % 12]["mn"], likes=i) for i in range(40)]
+    for ts in _club(posts, photos, members).values():
+        for t in ts:
+            근거 = t["근거"]
+            assert len(근거) >= 20, t
+            # 조사·서술어가 있어야 문장이다 — `참석 13 · 사진 18` 같은
+            # 나열만으로는 기준을 알 수 없다.
+            assert any(k in 근거 for k in ("니다", "입니다", "요", "습니")), t
