@@ -939,8 +939,8 @@ def bottom_share(name: str, scores: list[tuple[str, float]], share: float, *,
                      min_value=float("-inf"))
 
 
-def club_context(posts: list[dict], photos: list[dict],
-                 members: list[dict]) -> dict:
+def club_context(posts: list[dict], photos: list[dict], members: list[dict],
+                 months: list[int] | None = None) -> dict:
     """전 멤버 공통 집계 — 순위표·쌍·첫 등장·휴면 명단. **한 번 만들어 돌려 쓴다.**
 
     `member_profile`은 안에서 `attendance_counts`·`photo_user_ranking`·
@@ -960,6 +960,17 @@ def club_context(posts: list[dict], photos: list[dict],
 
     first, last = member_first_seen(posts)
 
+    # 활동 기간 대비 참석 — 늦게 합류한 사람은 누적으로는 영원히 위로 못 간다.
+    # 월 축을 알아야 재므로 `months`를 준 경우에만 만든다.
+    attended: dict[str, int] = Counter()
+    for p in posts:
+        if p.get("cat") == "A" and p.get("actually_held"):
+            for n in p.get("attendees") or []:
+                attended[n] += 1
+    density = [(m["mn"], round(attended.get(m["mn"], 0)
+                               / _active_months(m.get("joined_at"), months), 2))
+               for m in members or [] if m.get("mn")] if months else []
+
     return {
         "참석": [(r["멤버"], r["참석횟수"]) for r in attendance_counts(posts)],
         # 펑만 낸 사람은 모수에서 뺀다 — "펑 아닌 출사를 연 사람들 중 몇 등"이라야
@@ -977,6 +988,8 @@ def club_context(posts: list[dict], photos: list[dict],
         "첫등장": first,
         "최근": last,
         "휴면": {r["멤버"] for r in dormant_members(posts, members)},
+        "밀도": density,
+        "_축": months,
         "후기저자": {p["id"]: p.get("author")
                   for p in posts if p.get("cat") == "E"},
         # 아래 셋은 칭호가 멤버마다 다시 돌면 O(게시글×참석자)가 되는 것들이다.
@@ -1079,6 +1092,17 @@ def member_reviews(name: str, posts: list[dict],
     return rows
 
 
+def _active_months(joined, months: list[int] | None) -> int:
+    """이 사람이 **다닐 수 있었던 개월 수**. 가입 전 기간은 빼야 공평하다."""
+    if not months:
+        return 1
+    start = months[0]
+    if joined:
+        start = max(start, ym_of(joined))
+    end = months[-1]
+    return max(1, (end // 100 - start // 100) * 12 + (end % 100 - start % 100) + 1)
+
+
 def _days_to_first(joined, first_iso: str | None) -> int | None:
     """가입일 → 첫 참석까지 걸린 날. 둘 중 하나라도 없으면 잴 수 없다."""
     if not joined or not first_iso:
@@ -1106,6 +1130,10 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
     ctx = ctx or club_context(posts, photos, members)
     m = next((x for x in members or [] if x.get("mn") == name), {})
     my_posts = [p for p in posts if p.get("author") == name]
+    # **가입인사는 활동이 아니다.** 이 모임은 가입인사를 안 쓰면 12시간 안에
+    # 강퇴하므로 **전원이 가입인사를 쓴다** — 그것까지 활동으로 세면 유령
+    # 멤버가 구조적으로 영원히 0명이 된다(실제로 0명이었다).
+    my_real = [p for p in my_posts if p.get("cat") != "J"]
     my_photos = [p for p in photos if p.get("author") == name]
 
     held = [p for p in posts if p.get("cat") == "A" and p.get("actually_held")]
@@ -1154,11 +1182,12 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
         "테마사진": len(themed),
         "테마 참여월": len({ym_of(p["posted_at"]) for p in themed}),
         "동행자": dict(ctx["동행자"]).get(name, 0),
-        "유령": not my_posts and not my_photos and not attended,
+        "유령": not my_real and not my_photos and not attended,
         "휴면": name in ctx["휴면"],
         # 아래 둘은 칭호(`감노 때부터 계셨네`·`가입하자마자 출동`)가 쓴다.
         # `가입일`은 표시용 문자열이라 날짜 비교에 쓸 수 없어 원본을 함께 둔다.
         "_가입": m.get("joined_at"),
+        "활동 개월": _active_months(m.get("joined_at"), ctx.get("_축")),
         "가입→첫 참석": _days_to_first(m.get("joined_at"), ctx["첫등장"].get(name)),
     }
     for k, (rank, total) in ranks.items():
@@ -1211,17 +1240,16 @@ def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
     순서가 중요하다:
 
     1. 전원의 **후보**를 만든다(`_title_candidates`)
-    2. **칭호 이름별로 정원 초과분을 강도 낮은 순으로 잘라 낸다**
-    3. 사람별로 지표당 하나만 남긴다
-    4. 우선순위 상위 `TITLE_LIMIT`개
+    2. 사람별로 지표당 하나만 남기고 우선순위 상위 `TITLE_LIMIT`개를 뽑는다
+    3. **화면에 뜬 것**을 세어 정원을 넘긴 칭호는 약한 쪽을 뺀다
+    4. 빠진 사람은 다음 후보로 다시 뽑는다 — 넘치지 않을 때까지 반복
 
-    2를 3보다 **먼저** 하는 이유: 정원에 밀린 사람이 그 자리를 다음 칭호로
-    채울 수 있다. 순서를 뒤집으면 잘린 자리가 그냥 빈칸으로 남는다.
+    정원을 후보 단계에서만 세면 **화면에 안 뜰 사람이 자리를 잡아먹는다.**
 
     비용은 멤버 94명·사진 1만 장에서 0.1초대다 — `ctx`가 공통 집계를 들고
     있어서 사람마다 다시 도는 것이 거의 없다.
     """
-    ctx = ctx or club_context(posts, photos, members)
+    ctx = ctx or club_context(posts, photos, members, months)
     pair = ctx["쌍"]
 
     cand: dict[str, list[dict]] = {}
@@ -1233,37 +1261,52 @@ def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
         cand[n] = _title_candidates(
             n, prof, member_companions(n, posts, pair), posts, photos, months, ctx)
 
-    # ── ② 정원 ────────────────────────────────────────────────
-    holders: dict[str, list[tuple[float, str]]] = defaultdict(list)
-    for n, ts in cand.items():
-        for t in ts:
-            holders[t["칭호"]].append((t["강도"], n))
-    keep: dict[str, set[str]] = {}
-    for 칭호, rows in holders.items():
-        quota = TITLE_QUOTA.get(_quota_kind(cand, 칭호), TITLE_QUOTA_DEFAULT)
-        # 강도 내림차순, **동점은 칭호마다 다른 순서로** 끊는다.
-        #
-        # 이름순으로 끊으면 활동량이 비슷한 사람들 사이에서 **늘 같은 사람이
-        # 모든 칭호에서 밀린다** — 가나다순 뒤쪽에 있다는 이유로 한 명은 세
-        # 칸이 차고 다른 한 명은 빈손이 된다. 칭호 이름을 섞어 해시하면
-        # 칭호마다 순서가 달라져 동점자들에게 골고루 돌아간다.
-        #
-        # `hash()`는 실행마다 값이 달라져 못 쓴다(같은 데이터인데 새로고침할
-        # 때마다 칭호가 바뀐다). md5는 어디서 돌려도 같은 값이다.
-        rows.sort(key=lambda r: (-r[0], _tiebreak(칭호, r[1])))
-        keep[칭호] = {n for _, n in rows[:quota]}
+    # ── ②③④ 정원 · 지표당 하나 · 상위 N개를 **함께** 푼다 ────────
+    #
+    # 정원을 후보 단계에서만 세면 **화면에 안 뜰 사람이 자리를 잡아먹는다.**
+    # 실제로 `인풍 애호가`의 유일한 후보가 이미 세 칸이 찬 사람이라 그 칭호가
+    # 0명이 됐다. 정원은 **화면에 실제로 뜬 것**을 세야 뜻이 맞는다.
+    #
+    # 그래서 "뽑고 → 넘치면 약한 쪽을 빼고 → 빠진 사람은 다음 후보로 다시
+    # 뽑는" 것을 더 이상 넘치지 않을 때까지 반복한다. 뺀 사람은 계속 쌓이기만
+    # 하므로 반드시 멈춘다.
+    banned: dict[str, set[str]] = defaultdict(set)
 
-    # ── ③④ 사람별 지표당 하나 → 상위 TITLE_LIMIT개 ─────────────
-    out: dict[str, list[dict]] = {}
-    for n, ts in cand.items():
+    def pick(n: str) -> list[dict]:
         best: dict[str, dict] = {}
-        for t in ts:
-            if n not in keep.get(t["칭호"], set()):
-                continue                     # 정원에 밀렸다
+        for t in cand[n]:
+            if n in banned[t["칭호"]]:
+                continue                     # 정원에 밀린 칭호는 건너뛴다
             cur = best.get(t["지표"])
             if cur is None or t["우선"] > cur["우선"]:
                 best[t["지표"]] = t
-        out[n] = sorted(best.values(), key=lambda t: -t["우선"])[:TITLE_LIMIT]
+        return sorted(best.values(), key=lambda t: -t["우선"])[:TITLE_LIMIT]
+
+    while True:
+        out = {n: pick(n) for n in cand}
+        holders: dict[str, list[tuple[float, str]]] = defaultdict(list)
+        for n, ts in out.items():
+            for t in ts:
+                holders[t["칭호"]].append((t["강도"], n))
+        cut = False
+        for 칭호, rows in holders.items():
+            quota = TITLE_QUOTA.get(_quota_kind(cand, 칭호), TITLE_QUOTA_DEFAULT)
+            if len(rows) <= quota:
+                continue
+            # 강도 내림차순, **동점은 칭호마다 다른 순서로** 끊는다.
+            #
+            # 이름순으로 끊으면 활동량이 비슷한 사람들 사이에서 **늘 같은
+            # 사람이 모든 칭호에서 밀린다** — 가나다순 뒤쪽에 있다는 이유로
+            # 한 명은 세 칸이 차고 다른 한 명은 빈손이 된다.
+            #
+            # `hash()`는 실행마다 값이 달라져 못 쓴다(같은 데이터인데 새로고침할
+            # 때마다 칭호가 바뀐다). md5는 어디서 돌려도 같은 값이다.
+            rows.sort(key=lambda r: (-r[0], _tiebreak(칭호, r[1])))
+            for _, n in rows[quota:]:
+                banned[칭호].add(n)
+                cut = True
+        if not cut:
+            return out
     return out
 
 
@@ -1306,6 +1349,15 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     # 유령이면 여기서 끝. 활동 0건인 사람에게 다른 칭호가 걸릴 일도 없지만,
     # 규칙으로 못 박아 둔다.
     if prof["유령"]:
+        # 가입한 지 한 달도 안 된 사람에게 "유령"은 가혹하다 — 아직 첫 출사가
+        # 안 열렸을 수도 있다. 오래 있었는데 0건인 것과는 다른 얘기다.
+        joined = prof.get("_가입")
+        fresh = joined is not None and months and _is_newcomer(
+            joined.strftime("%Y-%m-%d"), months, within=1)
+        if fresh:
+            return [{"지표": "연차", "우선": 52, "아이콘": "🚪", "칭호": "아직 첫 출사 전",
+                     "근거": f"{prof['가입일']} 가입 — 첫 출사를 기다리는 중",
+                     "강도": 0.0, "갈래": "일반"}]
         return [{"지표": "연차", "우선": 50, "아이콘": "👻", "칭호": "유령 회원",
                  "근거": "이 기간에 글·사진·참석이 하나도 없습니다",
                  "강도": 0.0, "갈래": "일반"}]
@@ -1410,6 +1462,28 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
         put("균형", 66, "🖨", "제가 사진이 좀 많아요",
             f"사진 {n_photo}장 · 참석 {att}회", n_photo)
 
+    # ── 종합 (네 가지를 다 하는 사람) ───────────────────────
+    # 1등은 하나도 없는데 참석·개최·후기·사진을 **전부** 하는 사람이 있다.
+    # 대부분은 한두 가지만 한다 — 실제로 넷 다 하는 사람은 94명 중 24명뿐이다.
+    # 강도는 **가장 약한 축이 바닥의 몇 배인가** — "골고루"니까 제일 처지는
+    # 쪽으로 잰다.
+    floors = ((att, 5), (hosted_ran, 2), (prof["후기"], 2), (n_photo, 5))
+    if all(v >= f for v, f in floors):
+        put("종합", 76, "🎭", "골고루 하는 사람",
+            f"참석 {att} · 개최 {hosted_ran} · 후기 {prof['후기']} · 사진 {n_photo} "
+            "— 네 가지를 다 합니다", min(v / f for v, f in floors))
+
+    # ── 밀도 (활동 기간 대비 참석) ──────────────────────────
+    # 늦게 합류한 사람은 누적 참석으로는 영원히 위로 못 간다. 가입 이후 몇
+    # 달을 다녔는지로 나누면 "짧은 기간에 얼마나 촘촘히 다녔나"가 보인다.
+    #
+    # 우선순위를 낮게 둔 것은 의도다 — 누적 상위권은 어차피 세 칸이 차서
+    # 이 칭호를 표시하지 않고, 그러면 정원이 아래로 흘러 중간층에 닿는다.
+    if att >= 5 and top_share(name, ctx.get("밀도") or [], 0.30, min_value=0):
+        rate = dict(ctx.get("밀도") or []).get(name, 0)
+        put("밀도", 68, "🔥", "짧은 기간에 진심",
+            f"활동 {prof['활동 개월']}개월 동안 {att}회 — 달마다 {rate:.1f}회꼴", rate)
+
     # ── 습관 (취소율의 양 끝) ───────────────────────────────
     if prof["개최"] >= 5 and prof["개최 취소"] == 0:
         put("습관", 73, "🛡", "펑 한 번 없는 사람",
@@ -1423,26 +1497,42 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     pref = ctx["카테고리"].get(name) or Counter()
     total = sum(pref.values())
 
-    # **분모는 "내 참석"이 아니라 "그 카테고리 출사 전부"다.**
+    # **큰 계열과 작은 계열은 서로 다른 자로 재야 한다.** 셋 중 하나면 붙인다.
     #
-    # 예전에는 "내가 간 출사의 75%가 풍경"이었는데, 이 모임은 인물&풍경이
-    # 압도적이라 나머지 카테고리로는 그 비율이 나올 수가 없었다 — 풍경
-    # 사냥꾼·GN 마니아·문화?시민이 전부 0명이었다.
+    # ① 내 참석의 75%가 그 카테고리 — "이 사람은 인풍만 간다".
+    # ② 그 카테고리 출사의 40%에 참석 — "문화 18건 중 9건에 나왔다".
+    # ③ 그 카테고리를 **평균의 세 배로** 다닌다 — 배수(쏠림 ÷ 그 계열의 전체
+    #    비중). 풍경은 전체의 7.6%뿐이라, 내 참석의 31%가 풍경이면 평균의
+    #    네 배다. ①에는 한참 못 미치고 ②도 못 넘지만 분명히 풍경 사람이다.
     #
-    # 열린 게 적은 카테고리일수록 "그중 몇 건에 나왔나"가 오히려 또렷하다.
-    # 문화 출사가 네 번 있었고 그중 세 번에 나왔다면 그 사람이 문화 담당이다.
+    # 하나만 쓰면 반대쪽 크기의 계열이 통째로 0명이 된다 — 실제로 ①만 썼을 때
+    # 풍경·보정·문화가, ②만 썼을 때 인물&풍경·인물이 0명이었다. ③이 그 사이
+    # 크기(19~28건)의 계열을 메운다.
+    all_held = sum(ctx["카테고리총계"].values())
     best = None
     for cat, cnt in pref.items():
         held = ctx["카테고리총계"].get(cat, 0)
+        own = _pct(cnt, total)
         # 두세 건뿐인 카테고리는 한 번만 나와도 비율이 튄다.
-        if held >= 4 and cnt >= 3:
-            ratio = _pct(cnt, held)
-            if best is None or ratio > best[1]:
-                best = (cat, ratio, cnt, held)
-    if best and best[1] >= 40:
-        cat, ratio, cnt, held = best
+        ratio = _pct(cnt, held) if held >= 4 and cnt >= 3 else 0.0
+        lift = ((cnt / total) / (held / all_held)
+                if held >= 4 and cnt >= 3 and total >= 5 and all_held else 0.0)
+        if not ((att >= 6 and own >= 75) or ratio >= 40 or lift >= 3):
+            continue
+        # 어느 쪽으로 걸렸든 가장 또렷한 숫자를 근거로 보여 준다.
+        score = max(own if att >= 6 and own >= 75 else 0, ratio, lift * 10)
+        if best is None or score > best[1]:
+            best = (cat, score, cnt, held, own, ratio, lift)
+    if best:
+        cat, score, cnt, held, own, ratio, lift = best
+        if ratio >= 40:
+            근거 = f"{cat} 출사 {held}건 중 {cnt}건에 참석 ({ratio}%)"
+        elif own >= 75:
+            근거 = f"참석의 {own}%가 {cat} ({cnt}회)"
+        else:
+            근거 = f"참석의 {own}%가 {cat} — 모임 평균의 {lift:.1f}배 ({cnt}회)"
         put("성향", 73, "🏞", CATEGORY_TITLES.get(cat, f"{cat} 마니아"),
-            f"{cat} 출사 {held}건 중 {cnt}건에 참석 ({ratio}%)", ratio, "카테고리")
+            근거, score, "카테고리")
     elif att >= 6 and pref and len(pref) >= 4:
         cat, cnt = pref.most_common(1)[0]
         share = _pct(cnt, total)
@@ -3134,7 +3224,9 @@ FIXED_TITLE_NAMES = [
     "정출킬러", "소수정예",
     "소모임에요? 글쎄..", "제가 사진이 좀 많아요", "펑 한 번 없는 사람", "펑의 달인",
     "잡식성", "프로 평일러",
-    "아이고 어르신", "첫 출사 못 참지", "새싹", "돌아오세요", "유령 회원",
+    "골고루 하는 사람", "짧은 기간에 진심",
+    "아이고 어르신", "첫 출사 못 참지", "새싹", "돌아오세요",
+    "아직 첫 출사 전", "유령 회원",
     *CATEGORY_TITLES.values(),
 ]
 
