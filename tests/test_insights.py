@@ -394,3 +394,262 @@ def test_last_activity_includes_photos():
                "posted_at": datetime(2026, 2, 10)}]
     rows = departed_joiners(posts, photos, [member("w1", "다른사람")])
     assert rows[0]["마지막 활동"] == "2026-02-10"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 표에 몇 개를 싣나 — 캡션과 값이 어긋나면 화면이 거짓말을 한다
+# ═══════════════════════════════════════════════════════════════
+
+def test_preference_label_shows_up_to_five():
+    """2개만 보이던 시절엔 3위 이하가 잘린 줄 모르고 읽었다."""
+    from collections import Counter
+
+    from streamlit_app import PREF_TOP_N, top_category_label
+    pref = Counter({"인물": 9, "풍경": 8, "GN": 7, "보정": 6,
+                    "문화": 5, "인물&풍경": 4, "일반공지": 3})
+    label = top_category_label(pref)
+    assert label.count(",") == PREF_TOP_N - 1
+    assert label.startswith("인물(9), 풍경(8)")
+    assert "일반공지" not in label            # 7위는 잘린다
+
+
+def test_preference_label_of_an_empty_counter():
+    from collections import Counter
+
+    from streamlit_app import top_category_label
+    assert top_category_label(Counter()) == "—"
+
+
+def _chain(n):
+    """서로 다른 사람 두 명씩 짝지은 출사 n건 — 겹치지 않는 쌍 n개."""
+    return [notice(f"n{i}", "2026-03-01", [f"사람{i}a", f"사람{i}b"])
+            for i in range(n)]
+
+
+def test_pair_table_is_capped_at_the_documented_number():
+    from streamlit_app import CO_ATTENDANCE_TOP
+    rows = co_attendance(_chain(CO_ATTENDANCE_TOP + 5))
+    assert len(rows) == CO_ATTENDANCE_TOP
+
+
+# ═══════════════════════════════════════════════════════════════
+# 함께 간 사람 — 전역 상위와 개인 화면이 같은 규칙을 봐야 한다
+# ═══════════════════════════════════════════════════════════════
+
+def test_global_and_personal_views_agree_on_the_same_pair():
+    """쌍 세는 규칙이 두 벌이면 참석 탭과 멤버 상세 탭이 다른 숫자를 말한다."""
+    from streamlit_app import member_companions
+    posts = [notice("n1", "2026-03-01", ["나무", "바다"]),
+             notice("n2", "2026-03-08", ["나무", "바다"]),
+             notice("n3", "2026-03-15", ["바다"])]
+    pair = co_attendance(posts)[0]
+    mine = member_companions("나무", posts)[0]
+    assert mine["함께 간 사람"] == "바다"
+    assert mine["함께"] == pair["함께"] == 2
+    assert mine["내 기준"] == pair["A 기준"]
+    assert mine["상대 참석"] == pair["B 참석"] == 3
+    assert mine["상대 기준"] == pair["B 기준"]
+
+
+def test_personal_view_finds_pairs_outside_the_global_top_n():
+    """전역 상위 N에 못 드는 사람도 동행이 있다 — 이 헬퍼의 존재 이유."""
+    from streamlit_app import CO_ATTENDANCE_TOP, member_companions
+    # 상위를 가득 채울 만큼 자주 함께 간 쌍들 + 딱 한 번 간 조용한 쌍 하나
+    posts = [notice(f"n{i}_{k}", "2026-03-01", [f"사람{i}a", f"사람{i}b"])
+             for i in range(CO_ATTENDANCE_TOP) for k in range(2)]
+    posts.append(notice("quiet", "2026-03-20", ["조용", "한사람"]))
+
+    top = co_attendance(posts)
+    assert "조용" not in {r["사람 A"] for r in top} | {r["사람 B"] for r in top}
+    assert member_companions("조용", posts) == [
+        {"함께 간 사람": "한사람", "함께": 1, "내 기준": 100.0,
+         "상대 참석": 1, "상대 기준": 100.0}]
+
+
+def test_companion_columns_do_not_carry_user_names():
+    """`co_attendance`와 같은 이유 — 이름을 키로 쓰면 표가 옆으로 늘어난다."""
+    from streamlit_app import COMPANION_COLS, member_companions
+    posts = [notice("n1", "2026-03-01", ["나무", "바다"]),
+             notice("n2", "2026-03-08", ["나무", "하늘"])]
+    rows = member_companions("나무", posts)
+    assert {k for r in rows for k in r} == set(COMPANION_COLS)
+
+
+def test_companion_headers_differ_from_the_global_table():
+    """헤더가 같으면 어느 화면을 보고 있는지 알 수 없다.
+
+    렌더 테스트가 `사람 A` 컬럼으로 전역 표를 골라내기도 한다 — 개인 표가
+    같은 헤더를 쓰면 엉뚱한 표를 집는다.
+    """
+    from streamlit_app import CO_ATTENDANCE_COLS, COMPANION_COLS
+    assert "사람 A" in CO_ATTENDANCE_COLS
+    assert not (set(COMPANION_COLS) & set(CO_ATTENDANCE_COLS) - {"함께"})
+
+
+def test_a_solo_attendee_has_no_companions():
+    from streamlit_app import member_companions
+    assert member_companions("나무", [notice("n1", attendees=["나무"])]) == []
+
+
+# ═══════════════════════════════════════════════════════════════
+# 멤버 상세 — 한 사람의 숫자
+# ═══════════════════════════════════════════════════════════════
+
+def photo(pid, author="닉", posted=None, likes=0, comments=0, themed=False, **kw):
+    return {"id": pid, "author": author, "wid": "w1",
+            "posted_at": posted or datetime(2026, 3, 5),
+            "likes": likes, "comments": comments, "has_comment": themed,
+            "url_large": f"https://example.invalid/{pid}.png",
+            "url_medium": f"https://example.invalid/{pid}m.png",
+            "url_small": f"https://example.invalid/{pid}s.png",
+            "url_thumb": f"https://example.invalid/{pid}n.png", **kw}
+
+
+def test_options_keep_members_with_no_activity_at_all():
+    """가입만 하고 아무것도 안 했다는 사실 자체가 확인할 값이다."""
+    from streamlit_app import member_options
+    opts = member_options([member("w1", "유령")], [], [])
+    assert opts == [{"이름": "유령", "참석": 0, "게시글": 0, "사진": 0}]
+
+
+def test_options_are_ordered_by_activity():
+    from streamlit_app import member_options
+    posts = [notice("n1", "2026-03-01", ["바쁜사람"])]
+    opts = member_options([member("w1", "유령"), member("w2", "바쁜사람")],
+                          posts, [])
+    assert [o["이름"] for o in opts] == ["바쁜사람", "유령"]
+
+
+def test_attendance_rate_denominator_is_matched_outings_only():
+    """후기 없는 출사는 누가 갔는지 알 수 없다 — 분모에 넣으면 모두가 낮아진다."""
+    from streamlit_app import member_profile
+    posts = [notice("n1", "2026-03-01", ["나무"], held=True),
+             notice("n2", "2026-03-08", [], held=False)]
+    prof = member_profile("나무", posts, [], [member("w1", "나무")])
+    assert prof["매칭 출사"] == 1
+    assert prof["참석률"] == 100.0
+
+
+def test_hosted_outings_include_canceled_ones():
+    """취소를 빼면 '이 사람이 몇 번 펑을 냈나'를 볼 수 없다."""
+    from streamlit_app import member_hosted_outings, member_profile
+    posts = [notice("n1", "2026-03-01", author="주최"),
+             notice("n2", "2026-03-08", author="주최", is_canceled=True, held=False)]
+    rows = member_hosted_outings("주최", posts)
+    assert [r["상태"] for r in rows] == ["취소", "진행"]      # 최신 출사일 순
+    prof = member_profile("주최", posts, [], [member("w1", "주최")])
+    assert prof["개최"] == 2 and prof["개최 취소"] == 1 and prof["취소율"] == 50.0
+
+
+def test_attended_list_does_not_match_a_name_inside_another_name():
+    """참석자를 이어 붙인 문자열로 거르면 `나무`가 `나무늘보`를 집는다."""
+    from streamlit_app import member_attended_outings
+    posts = [notice("n1", "2026-03-01", ["나무늘보"])]
+    assert member_attended_outings("나무", posts) == []
+    assert len(member_attended_outings("나무늘보", posts)) == 1
+
+
+def test_photo_stats_count_only_that_persons_photos():
+    from streamlit_app import member_profile
+    photos = [photo("p1", "나무", likes=10, themed=True),
+              photo("p2", "나무", likes=4, posted=datetime(2026, 4, 5)),
+              photo("p3", "바다", likes=99)]
+    prof = member_profile("나무", [], photos, [member("w1", "나무")])
+    assert prof["사진"] == 2 and prof["사진 좋아요"] == 14
+    assert prof["장당 좋아요"] == 7.0
+    assert prof["테마사진"] == 1 and prof["테마 참여월"] == 1
+
+
+def test_dormant_badge_uses_the_member_tabs_definition():
+    """같은 사람이 한 화면에선 휴면이고 다른 화면에선 아니면 안 된다."""
+    from streamlit_app import member_profile
+    posts = [notice("n1", "2026-01-01", ["옛날사람"]),
+             notice("n2", "2026-06-01", ["요즘사람"])]
+    members = [member("w1", "옛날사람"), member("w2", "요즘사람")]
+    dorm = {r["멤버"] for r in dormant_members(posts, members)}
+    assert member_profile("옛날사람", posts, [], members)["휴면"] is ("옛날사람" in dorm)
+    assert member_profile("옛날사람", posts, [], members)["휴면"] is True
+    assert member_profile("요즘사람", posts, [], members)["휴면"] is False
+
+
+def test_ghost_is_zero_everywhere_not_just_zero_attendance():
+    from streamlit_app import member_profile
+    members = [member("w1", "유령"), member("w2", "사진만")]
+    photos = [photo("p1", "사진만")]
+    assert member_profile("유령", [], photos, members)["유령"] is True
+    assert member_profile("사진만", [], photos, members)["유령"] is False
+
+
+def test_rank_says_where_the_number_sits():
+    """'12회 참석'만으로는 그게 많은 건지 알 수 없다."""
+    from streamlit_app import member_profile
+    posts = [notice("n1", "2026-03-01", ["1등", "2등"]),
+             notice("n2", "2026-03-08", ["1등"])]
+    prof = member_profile("2등", posts, [], [member("w1", "2등")])
+    assert prof["참석 순위"] == 2 and prof["참석 모수"] == 2
+
+
+# ═══════════════════════════════════════════════════════════════
+# 갤러리 — 올라온 사진 전부에 닿는다
+# ═══════════════════════════════════════════════════════════════
+
+def test_gallery_keeps_photos_without_comments():
+    """테마 미리보기와 달리 갤러리는 전부를 보여 준다."""
+    from streamlit_app import photos_by_month, themed_photos_by_month
+    photos = [photo("p1", themed=True), photo("p2", themed=False)]
+    assert len(photos_by_month(photos)[202603]) == 2
+    assert len(themed_photos_by_month(photos)[202603]) == 1
+
+
+def test_sort_orders_are_what_they_say():
+    from streamlit_app import gallery_photos
+    photos = [photo("p1", posted=datetime(2026, 3, 1), likes=1, comments=9),
+              photo("p2", posted=datetime(2026, 3, 9), likes=5, comments=0)]
+    ids = lambda s: [p["id"] for p in gallery_photos(photos, sort=s)]  # noqa: E731
+    assert ids("최신순") == ["p2", "p1"]
+    assert ids("오래된순") == ["p1", "p2"]
+    assert ids("좋아요순") == ["p2", "p1"]
+    assert ids("댓글순") == ["p1", "p2"]
+
+
+def test_ties_break_deterministically():
+    """정렬이 흔들리면 페이지를 넘길 때 같은 사진이 두 번 나오거나 사라진다."""
+    from streamlit_app import gallery_photos
+    photos = [photo(f"p{i}", likes=3) for i in range(10)]
+    once = [p["id"] for p in gallery_photos(photos, sort="좋아요순")]
+    twice = [p["id"] for p in gallery_photos(list(reversed(photos)), sort="좋아요순")]
+    assert once == twice
+
+
+def test_gallery_filters_by_uploader_and_theme():
+    from streamlit_app import gallery_photos
+    photos = [photo("p1", "나무", themed=True), photo("p2", "나무"),
+              photo("p3", "바다")]
+    # 업로드 시각이 같아 id로 끊긴다 — 그래서 순서가 정해진다.
+    assert [p["id"] for p in gallery_photos(photos, author="나무")] == ["p1", "p2"]
+    assert [p["id"] for p in gallery_photos(photos, themed_only=True)] == ["p1"]
+
+
+def test_uploader_options_include_people_who_left():
+    """나간 사람이 올린 사진도 찾을 수 있어야 한다 — 사진은 남아 있다."""
+    from streamlit_app import photo_uploaders
+    photos = [photo("p1", "떠난사람", is_active=False), photo("p2", "남은사람")]
+    assert {u["작성자"] for u in photo_uploaders(photos)} == {"떠난사람", "남은사람"}
+
+
+def test_page_slice_reports_pages_and_start():
+    from streamlit_app import page_slice
+    rows, pages, start = page_slice(list(range(45)), 2, 40)
+    assert rows == list(range(40, 45)) and pages == 2 and start == 40
+
+
+def test_page_slice_clamps_a_page_that_no_longer_exists():
+    """필터를 좁히면 페이지 수가 준다 — 예전 번호가 남으면 빈 화면이 된다."""
+    from streamlit_app import page_slice
+    rows, pages, start = page_slice(list(range(5)), 9, 40)
+    assert rows == list(range(5)) and pages == 1 and start == 0
+
+
+def test_page_slice_of_an_empty_list_still_has_one_page():
+    from streamlit_app import page_slice
+    assert page_slice([], 1, 40) == ([], 1, 0)

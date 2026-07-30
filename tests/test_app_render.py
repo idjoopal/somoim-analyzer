@@ -816,3 +816,229 @@ def test_no_theme_photos_says_so():
         photo("q1", datetime(2026, 3, 9, 9, 0), has_comment=False)]))
     assert not at.exception, [str(e) for e in at.exception]
     assert any("테마사진" in i.value and "없습니다" in i.value for i in at.info)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🖼 갤러리 — 올라온 사진 전부에 닿는다
+#
+# 지연 로딩을 위젯 키로 판정한다. 이미지 개수로 보면 📷 사진 탭이 이미 인기
+# 12장을 그려 기준선이 0이 아니라, "닫힌 달이 안 그려졌다"를 구분할 수 없다.
+# ═══════════════════════════════════════════════════════════════
+
+def _many(pid, posted, author="닉", likes=3):
+    p = photo(pid, posted, has_comment=False)
+    p["author"] = author
+    p["likes"] = likes
+    return p
+
+
+# 5월에 45장(두 페이지), 6월에 1장. 6월이 가장 최근이라 자동으로 펼쳐지므로
+# **5월은 닫힌 채로 남는다** — 그래야 "닫힌 달은 안 그린다"를 볼 수 있다.
+MANY_PHOTOS = (
+    [_many(f"m{i}", datetime(2026, 5, i % 28 + 1, 9, 0),
+           author="닉" if i % 3 else "다른사람", likes=i)
+     for i in range(45)]
+    + [_many("newest", datetime(2026, 6, 1, 9, 0))]
+)
+
+
+def test_gallery_tab_exists_next_to_the_photo_tab():
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS))
+    assert not at.exception, [str(e) for e in at.exception]
+    labels = [t.label for t in at.tabs]
+    assert "🖼 갤러리" in labels and "🔎 멤버 상세" in labels
+    assert labels.index("🖼 갤러리") == labels.index("📷 사진") + 1
+    assert labels.index("🔎 멤버 상세") == labels.index("🧑‍🤝‍🧑 멤버") + 1
+
+
+def test_gallery_is_a_fragment():
+    """필터·정렬·페이지 조작이 앱 전체를 다시 그릴 이유가 없다."""
+    from streamlit_app import _gallery_section
+
+    assert getattr(_gallery_section, "__wrapped__", None) is not None
+    assert "fragment" in _gallery_section.__code__.co_filename
+
+
+def gallery_months(at):
+    return [e for e in all_expanders(at) if e.label.endswith("장")]
+
+
+def open_gallery_month(at, ym, page=None):
+    """갤러리 달을 펼친다(필요하면 페이지도 지정).
+
+    `open_theme_month`과 같은 이유로 매번 다시 세팅한다 — AppTest에서 위젯을
+    건드리면 expander가 등록해 둔 상태(닫힘)로 돌아간다. 실제 브라우저에서는
+    `key`+`on_change` 덕에 열린 채로 남는다.
+    """
+    at.session_state[f"gal_open_{ym}"] = True
+    if page is not None:
+        at.session_state[f"gal_page_{ym}"] = page
+    at.run()
+    return at
+
+
+def test_gallery_month_expanders_are_stateful():
+    """상태 없는 expander는 리런마다 접힌다 — 페이지를 넘길 수가 없다."""
+    at = run(stores=make_stores(MULTI_YEAR, MANY_PHOTOS))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    months = gallery_months(at)
+    assert months, [e.label for e in all_expanders(at)]
+    for e in months:
+        assert e.proto.id, f"{e.label} — 상태를 안 가지면 페이지를 넘길 때 접힌다"
+
+
+def test_closed_gallery_month_requests_nothing():
+    """사진 한 장이 곧 CDN 요청 한 번이다 — 닫힌 달을 그리면 안 된다."""
+    at = run(stores=make_stores(MULTI_YEAR, MANY_PHOTOS))
+    assert not at.exception, [str(e) for e in at.exception]
+    keys = lambda: [n.key for n in at.number_input]      # noqa: E731
+    assert "gal_page_202605" not in keys(), "닫힌 5월이 그려졌다"
+
+    open_gallery_month(at, 202605)
+    assert "gal_page_202605" in keys()
+
+
+def test_gallery_reaches_photos_beyond_the_popular_twelve():
+    """인기 12장 밖의 사진에 닿는 것이 이 탭의 존재 이유다."""
+    at = open_gallery_month(run(stores=make_stores(MULTI_YEAR, MANY_PHOTOS)), 202605)
+    assert not at.exception, [str(e) for e in at.exception]
+    assert at.number_input(key="gal_page_202605").max == 2, "45장이면 40장씩 두 페이지"
+
+    open_gallery_month(at, 202605, page=2)
+    assert not at.exception, [str(e) for e in at.exception]
+    assert any("41–45 / 45장" in str(c.value) for c in at.caption), \
+        [str(c.value) for c in at.caption]
+
+
+def test_whole_period_view_sorts_across_every_month():
+    """월별 보기만 두면 정렬이 달 안에서만 걸려 '전 기간 좋아요 1등'을 볼 수 없다."""
+    at = run(stores=make_stores(MULTI_YEAR, MANY_PHOTOS))
+    at.radio(key="gal_mode").set_value("전체").run()
+    at.selectbox(key="gal_sort").set_value("좋아요순").run()
+    assert not at.exception, [str(e) for e in at.exception]
+
+    # 46장 전체가 한 목록이다 — 월별이었다면 45 / 1로 갈렸다.
+    assert any("1–40 / 46장" in str(c.value) for c in at.caption)
+    assert not gallery_months(at), "전체 보기에서는 월 목록을 그리지 않는다"
+
+
+def test_narrowing_the_uploader_filter_does_not_crash():
+    """페이지 번호가 남아 있는데 페이지 수가 줄면 그대로 예외가 된다."""
+    at = run(stores=make_stores(MULTI_YEAR, MANY_PHOTOS))
+    at.radio(key="gal_mode").set_value("전체").run()
+    at.number_input(key="gal_page_all").set_value(2).run()
+    assert not at.exception, [str(e) for e in at.exception]
+
+    at.selectbox(key="gal_author").set_value("다른사람").run()
+    assert not at.exception, [str(e) for e in at.exception]
+    assert at.session_state["gal_page_all"] == 1
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🔎 멤버 상세
+# ═══════════════════════════════════════════════════════════════
+
+def test_member_focus_is_a_fragment():
+    """드롭박스를 바꿀 때마다 앱 전체를 다시 그리면 이어서 훑을 수가 없다."""
+    from streamlit_app import _tab_member_focus
+
+    assert getattr(_tab_member_focus, "__wrapped__", None) is not None
+    assert "fragment" in _tab_member_focus.__code__.co_filename
+
+
+def test_member_focus_has_a_picker_and_draws_that_person():
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=PAIR_MEMBERS))
+    assert not at.exception, [str(e) for e in at.exception]
+
+    pick = at.selectbox(key="mf_member")
+    assert pick.value == "나무", "참석이 가장 많은 사람이 먼저 온다"
+    # 표시 문자열에 활동량을 붙여 둔다 — 누구를 볼지 고르는 단서가 이름뿐이면
+    # 활동이 없는 사람을 골라 놓고 화면이 빈 줄 모른다.
+    assert [o.split(" · ")[0] for o in pick.options] == ["나무", "바다", "하늘"]
+    assert all("참석" in o and "사진" in o for o in pick.options)
+    assert "참석률" in [m.label for m in at.metric]
+
+
+def test_member_focus_switches_person():
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=PAIR_MEMBERS))
+    at.selectbox(key="mf_member").set_value("하늘").run()
+    assert not at.exception, [str(e) for e in at.exception]
+    assert any("### 하늘" in str(m.value) for m in at.markdown)
+
+
+def test_member_focus_shows_companions_the_global_table_would_hide():
+    """전역 표는 상위 N쌍이라 조용한 사람은 한 줄도 못 올라간다."""
+    from streamlit_app import COMPANION_COLS
+
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=PAIR_MEMBERS))
+    at.selectbox(key="mf_member").set_value("하늘").run()
+
+    tables = [d.value for d in at.dataframe
+              if "함께 간 사람" in list(d.value.columns)]
+    assert tables, "동행 표가 없다"
+    assert list(tables[0].columns) == COMPANION_COLS
+    assert set(tables[0]["함께 간 사람"]) == {"나무"}
+
+
+FOCUS_MEMBERS = [
+    ["mid", "mn", "is_admin", "joined_at", "last_visit", "os", "push"],
+    ["w1", "나무", "TRUE", "2025-08-01 00:00:00", "2026-03-01 00:00:00", "iOS", "TRUE"],
+    ["w2", "바다", "FALSE", "2025-08-01 00:00:00", "2026-03-01 00:00:00", "iOS", "TRUE"],
+    ["w3", "하늘", "FALSE", "2025-08-01 00:00:00", "2026-03-01 00:00:00", "iOS", "TRUE"],
+    ["w4", "유령", "FALSE", "2025-08-01 00:00:00", "2026-03-01 00:00:00", "iOS", "TRUE"],
+]
+
+
+def test_member_focus_marks_who_this_person_is():
+    """운영진·유령은 숫자만 봐서는 알 수 없다 — 표 위에 배지로 세운다."""
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    assert not at.exception, [str(e) for e in at.exception]
+    badges = lambda: [str(m.value) for m in at.markdown if "badge[" in str(m.value)]  # noqa: E731
+    assert badges() == [":blue-badge[운영진]"]
+
+    at.selectbox(key="mf_member").set_value("유령").run()
+    assert not at.exception, [str(e) for e in at.exception]
+    assert badges() == [":gray-badge[유령 — 이 기간 활동 0건]"]
+
+
+def test_member_with_no_activity_draws_every_section_anyway():
+    """빈 구역을 통째로 지우면 화면이 고장 난 것처럼 보인다."""
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    at.selectbox(key="mf_member").set_value("유령").run()
+    assert not at.exception, [str(e) for e in at.exception]
+    said = [str(c.value) for c in at.caption]
+    for missing in ("개최한 출사가 없습니다.", "참석 기록이 없습니다.",
+                    "작성한 후기가 없습니다.", "업로드한 사진이 없습니다."):
+        assert missing in said, missing
+
+
+def test_member_focus_without_a_member_list_says_so():
+    at = run(stores=make_stores(MULTI_YEAR, PHOTOS, members=[
+        ["mid", "mn", "is_admin", "joined_at", "last_visit", "os", "push"]]))
+    assert not at.exception, [str(e) for e in at.exception]
+    assert any("멤버 정보가 없습니다" in i.value for i in at.info)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 캡션과 값이 어긋나지 않는다 — 상수를 둔 이유 그 자체
+# ═══════════════════════════════════════════════════════════════
+
+def test_pair_caption_quotes_the_real_limit():
+    """캡션에 숫자를 손으로 적어 두면 값을 올릴 때 화면이 거짓말을 한다."""
+    from streamlit_app import CO_ATTENDANCE_COLS, CO_ATTENDANCE_TOP
+
+    at = run(stores=make_stores(PAIRS, [], members=PAIR_MEMBERS))
+    assert any(f"상위 {CO_ATTENDANCE_TOP}쌍" in str(c.value) for c in at.caption), \
+        [str(c.value) for c in at.caption]
+    df = [d.value for d in at.dataframe
+          if list(d.value.columns) == CO_ATTENDANCE_COLS][0]
+    assert len(df) <= CO_ATTENDANCE_TOP
+
+
+def test_preference_caption_quotes_the_real_limit():
+    from streamlit_app import PREF_TOP_N
+
+    at = run(stores=make_stores(PAIRS, [], members=PAIR_MEMBERS))
+    assert any(f"최대 {PREF_TOP_N}개" in str(c.value) for c in at.caption), \
+        [str(c.value) for c in at.caption]

@@ -54,6 +54,16 @@ CAT_OPTIONS = ALL_CATS + ["(없음)"]
 SHOW_EXPORT = False
 STATUS_OPTIONS = ["진행", "취소"]
 
+# 표에 몇 개를 실을지는 **한 곳에서만 정한다.**
+#
+# 캡션에 숫자를 손으로 적어 두면 값을 올릴 때 캡션이 그대로 남는다 — 실제로
+# "상위 20쌍"이라 써 놓고 40쌍을 그리게 된다. 화면이 제 숫자를 잘못 설명하면
+# 어느 쪽이 맞는지 사용자가 알 방법이 없다.
+CO_ATTENDANCE_TOP = 40      # 함께 간 사람 — 표시할 쌍 수
+PREF_TOP_N = 5              # 선호 카테고리 — 멤버당 표시할 개수
+GALLERY_COLS = 4            # 갤러리 격자 — 인기 사진 갤러리와 같은 열 수
+GALLERY_PAGE = 40           # 한 페이지에 그릴 사진 수 (4열 × 10줄)
+
 
 # ═══════════════════════════════════════════════════════════════
 # 순수 계산 헬퍼 (Streamlit 비의존 — 단독 테스트 가능)
@@ -404,6 +414,18 @@ def member_category_pref(posts: list[dict]) -> dict[str, Counter]:
     return pref
 
 
+def top_category_label(pref: Counter, n: int = PREF_TOP_N) -> str:
+    """`인물(12), 풍경(9), …` 한 줄. 비면 `—`.
+
+    2개만 보이던 시절엔 "이 사람은 인물·풍경만 간다"처럼 읽혔는데, 실제로는
+    3위 이하가 잘려 있었을 뿐이다. 카테고리가 7종뿐이라 5개면 사실상 전부다.
+
+    **표 안에서 f-string으로 조립하지 않는다** — 그러면 상한을 확인하려고
+    앱을 통째로 렌더해야 한다. 여기 있으면 한 줄 테스트로 고정된다.
+    """
+    return ", ".join(f"{c}({v})" for c, v in pref.most_common(n)) or "—"
+
+
 def attendance_monthly_matrix(posts: list[dict]):
     """(member_month dict[name->dict[ym->count]], members_sorted_by_total). 월 키는 YYYYMM."""
     mm: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
@@ -555,7 +577,34 @@ def avg_attendance_trend(posts: list[dict],
             for m, v in per_month.items()}
 
 
-def co_attendance(posts: list[dict], top_n: int = 20) -> list[dict]:
+def _attendance_pairs(posts: list[dict]) -> tuple[Counter, Counter]:
+    """(쌍 횟수, 사람별 참석 횟수). 매칭된(actually_held) 출사만 센다.
+
+    전역 상위 쌍(`co_attendance`)과 한 사람의 동행 순위(`member_companions`)가
+    **같은 규칙을 봐야 한다** — 한 출사에 같은 이름이 두 번 적혀도 자기 자신과
+    짝이 되지 않고(그래서 `set`), A-B와 B-A는 한 쌍이다(그래서 `sorted`).
+    두 곳에서 따로 세면 참석 탭과 멤버 상세 탭이 다른 숫자를 말하게 되는데,
+    사용자는 그걸 버그로 읽는다.
+    """
+    pair: Counter = Counter()
+    solo: Counter = Counter()
+    for p in posts:
+        if p.get("cat") != "A" or not p.get("actually_held"):
+            continue
+        names = sorted({n for n in (p.get("attendees") or []) if n})
+        for n in names:
+            solo[n] += 1
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                pair[(a, b)] += 1
+    return pair, solo
+
+
+def _pct(n: int, total: int) -> float:
+    return round(n / total * 100, 1) if total else 0.0
+
+
+def co_attendance(posts: list[dict], top_n: int = CO_ATTENDANCE_TOP) -> list[dict]:
     """함께 간 횟수 상위 쌍.
 
     쌍은 정렬해 담으므로 A-B와 B-A가 한 행으로 합쳐진다. 참석자가 한 명뿐인
@@ -570,22 +619,11 @@ def co_attendance(posts: list[dict], top_n: int = 20) -> list[dict]:
     자기 행이 아닌 칸은 전부 빈칸이었다. 표가 옆으로 끝없이 길어질 뿐
     아니라, 이름이 박힌 헤더만 봐서는 그 숫자가 횟수인지 퍼센트인지도
     알 수 없었다.
+
+    `top_n` 기본값은 `CO_ATTENDANCE_TOP`이다 — 화면 캡션도 같은 상수를 읽어야
+    "상위 N쌍"이라는 말과 실제 행 수가 어긋나지 않는다.
     """
-    pair: Counter = Counter()
-    solo: Counter = Counter()
-    for p in posts:
-        if p.get("cat") != "A" or not p.get("actually_held"):
-            continue
-        names = sorted({n for n in (p.get("attendees") or []) if n})
-        for n in names:
-            solo[n] += 1
-        for i, a in enumerate(names):
-            for b in names[i + 1:]:
-                pair[(a, b)] += 1
-
-    def pct(n, total):
-        return round(n / total * 100, 1) if total else 0.0
-
+    pair, solo = _attendance_pairs(posts)
     rows = []
     for (a, b), n in pair.most_common(top_n):
         rows.append({
@@ -593,14 +631,46 @@ def co_attendance(posts: list[dict], top_n: int = 20) -> list[dict]:
             # 얘기인지 헤더만 보고 안다. `나무 · 바다`로 붙여 두면 왼쪽
             # 숫자가 누구 것인지 표 어디에도 단서가 없다.
             "사람 A": a, "사람 B": b, "함께": n,
-            "A 참석": solo[a], "A 기준": pct(n, solo[a]),
-            "B 참석": solo[b], "B 기준": pct(n, solo[b]),
+            "A 참석": solo[a], "A 기준": _pct(n, solo[a]),
+            "B 참석": solo[b], "B 기준": _pct(n, solo[b]),
         })
     return rows
 
 
 CO_ATTENDANCE_COLS = ["사람 A", "사람 B", "함께", "A 참석", "A 기준",
                       "B 참석", "B 기준"]
+
+COMPANION_COLS = ["함께 간 사람", "함께", "내 기준", "상대 참석", "상대 기준"]
+
+
+def member_companions(name: str, posts: list[dict]) -> list[dict]:
+    """한 사람의 동행 **전원**. 상한을 두지 않는다.
+
+    `co_attendance`로는 이 화면을 만들 수 없다 — 그쪽은 **전역 상위 N쌍**이라
+    참석이 적은 사람은 목록에 한 줄도 못 올라간다. 그 사람 화면에서 "함께 간
+    사람이 없다"로 보이면 **사실이 아니다.**
+
+    컬럼은 `COMPANION_COLS`로 고정하고 이름은 값으로만 넣는다(`co_attendance`
+    주석의 80칸 표 사고와 같은 이유). 다만 `사람 A`/`사람 B`는 쓰지 않는다 —
+    여기서는 기준이 되는 사람이 이미 정해져 있어 한 칸이면 되고, 참석 탭의
+    표와 헤더가 같으면 어느 화면을 보고 있는지 헷갈린다.
+    """
+    pair, solo = _attendance_pairs(posts)
+    mine = solo.get(name, 0)
+    rows = []
+    for (a, b), n in pair.items():
+        if a == name:
+            other = b
+        elif b == name:
+            other = a
+        else:
+            continue
+        rows.append({
+            "함께 간 사람": other, "함께": n,
+            "내 기준": _pct(n, mine),
+            "상대 참석": solo[other], "상대 기준": _pct(n, solo[other]),
+        })
+    return sorted(rows, key=lambda r: (-r["함께"], -r["상대 기준"], r["함께 간 사람"]))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -790,6 +860,241 @@ def newcomer_settling(members: list[dict], posts: list[dict],
         })
     return sorted(rows, key=lambda r: r["가입일"], reverse=True), skipped
 
+
+# ═══════════════════════════════════════════════════════════════
+# 멤버 상세 — 흩어져 있는 한 사람의 숫자를 한곳에 모은다
+#
+# 다른 탭은 전부 "한 행이 한 사람"인 전체 집계다. 사람 하나를 알아보려면 탭
+# 다섯 개를 오가며 표에서 그 이름을 눈으로 찾아야 했다.
+#
+# **이름은 표시 이름(`닉네임(실명)`) 하나로 조인한다.** `core.store.relabel_names`가
+# posts.author · photos.author · attendees[] · members.mn 네 곳에 **같은 문자열**을
+# 박아 두므로 별도의 키가 필요 없다.
+#
+# **대상은 활성 멤버(`members`)뿐이다.** 탈퇴자까지 넣으면 `_mark_active`가
+# 붙인 `is_active=False` 때문에 랭킹 헬퍼들이 그 사람을 통째로 빼는 것을 매번
+# 우회해야 하고, 기간을 좁혔을 때 드롭다운에서 사람이 사라지는 문제도 생긴다.
+# ═══════════════════════════════════════════════════════════════
+
+def member_options(members: list[dict], posts: list[dict],
+                   photos: list[dict]) -> list[dict]:
+    """드롭다운 후보 — `{이름, 참석, 게시글, 사진}`. 활동이 많은 순.
+
+    활동이 0건인 유령 멤버도 남긴다. 그 페이지가 전부 0으로 나오는 것 자체가
+    "가입만 하고 아무것도 안 했다"는 정보다 — 목록에서 빼면 그걸 확인할 방법이
+    없어진다.
+    """
+    attended: Counter = Counter()
+    for p in posts:
+        if p.get("cat") == "A" and p.get("actually_held"):
+            for n in p.get("attendees") or []:
+                attended[n] += 1
+    wrote = Counter(p.get("author") for p in posts if p.get("author"))
+    shot = Counter(p.get("author") for p in photos if p.get("author"))
+
+    rows = [{"이름": m["mn"], "참석": attended.get(m["mn"], 0),
+             "게시글": wrote.get(m["mn"], 0), "사진": shot.get(m["mn"], 0)}
+            for m in members or [] if m.get("mn")]
+    return sorted(rows, key=lambda r: (-r["참석"], -r["게시글"], -r["사진"], r["이름"]))
+
+
+def member_hosted_outings(name: str, posts: list[dict]) -> list[dict]:
+    """그 사람이 연 출사 공지. **취소(펑) 건도 포함**하고 최신 출사일 순.
+
+    `outings_table`을 필터링하지 않는다 — 거기엔 참석자수가 없다. 누군가의
+    출사를 평가할 때 정작 궁금한 것이 "몇 명이나 왔나"인데 그게 빠진다.
+    """
+    rows = []
+    for p in sorted((p for p in posts
+                     if p.get("cat") == "A" and p.get("author") == name),
+                    key=lambda x: (x.get("outing_date") or "0000",
+                                   x["posted_at"]), reverse=True):
+        rows.append({
+            "출사일": p.get("outing_date") or "-",
+            "카테고리": p.get("category") or "-",
+            "상태": "취소" if p.get("is_canceled") else
+                    ("진행" if p.get("actually_held") else "후기 없음"),
+            "제목": p.get("title") or "",
+            "참석자수": len(p.get("attendees") or []),
+            "좋아요": p.get("likes", 0),
+            "댓글": p.get("comments", 0),
+        })
+    return rows
+
+
+def member_attended_outings(name: str, posts: list[dict]) -> list[dict]:
+    """그 사람이 참석한 출사. 매칭된(actually_held) 출사만.
+
+    **`attendees_table`의 행을 걸러 만들지 않는다.** 그 표는 참석자를 한
+    문자열로 이어 붙여 두어서 `"나무" in row["참석자"]`가 `나무늘보`만 참석한
+    출사까지 집어 온다. 명단은 리스트로 있을 때 정확히 비교해야 한다.
+    """
+    rows = []
+    for p in sorted((p for p in posts
+                     if p.get("cat") == "A" and p.get("actually_held")
+                     and name in (p.get("attendees") or [])),
+                    key=lambda x: x.get("outing_date") or "0000", reverse=True):
+        rows.append({
+            "출사일": p.get("outing_date") or "-",
+            "카테고리": p.get("category") or "-",
+            "공지자": p.get("author") or "-",
+            "제목": p.get("title") or "",
+            "참석자수": len(p.get("attendees") or []),
+        })
+    return rows
+
+
+def member_reviews(name: str, posts: list[dict],
+                   body_cut: int | None = None) -> list[dict]:
+    """그 사람이 쓴 후기. 참석 추적의 근거가 되는 글이다.
+
+    본문이 잘린 글은 ✂️로 표시한다 — 그 후기에서 뽑아낸 참석자 명단이 전부가
+    아닐 수 있다는 뜻이라, 목록을 훑을 때 바로 보여야 한다.
+    """
+    rows = []
+    for p in sorted((p for p in posts
+                     if p.get("cat") == "E" and p.get("author") == name),
+                    key=lambda x: x["posted_at"], reverse=True):
+        rows.append({
+            "작성일": p["posted_at"].strftime("%Y-%m-%d"),
+            "제목": p.get("title") or "",
+            "참석자수": len(p.get("attendees") or []),
+            "매칭": "✓" if p.get("matched_outing_id") else "⚠️ 없음",
+            "잘림": "✂️" if _is_truncated(p, body_cut) else "",
+            "좋아요": p.get("likes", 0),
+        })
+    return rows
+
+
+def member_profile(name: str, posts: list[dict], photos: list[dict],
+                   members: list[dict]) -> dict:
+    """한 사람의 모든 스칼라. 화면 맨 위 배지·KPI가 여기서 나온다.
+
+    **참석률의 분모는 매칭된 출사뿐이다.** 후기가 없는 출사는 누가 갔는지 알
+    방법이 없어서, 분모에 넣으면 아무 잘못 없이 모두의 참석률이 낮아진다.
+
+    **휴면 판정은 `dormant_members`를 그대로 쓴다.** 여기서 다시 계산하면 🧑‍🤝‍🧑
+    멤버 탭의 "최근 조용해진 멤버"와 기준이 어긋나, 같은 사람이 한 화면에선
+    휴면이고 다른 화면에선 아닌 상태가 된다.
+    """
+    m = next((x for x in members or [] if x.get("mn") == name), {})
+    my_posts = [p for p in posts if p.get("author") == name]
+    my_photos = [p for p in photos if p.get("author") == name]
+
+    held = [p for p in posts if p.get("cat") == "A" and p.get("actually_held")]
+    attended = [p for p in held if name in (p.get("attendees") or [])]
+
+    hosted = [p for p in my_posts if p.get("cat") == "A"]
+    canceled = [p for p in hosted if p.get("is_canceled")]
+    reviews = [p for p in my_posts if p.get("cat") == "E"]
+
+    first, last = member_first_seen(posts)
+    themed = [p for p in my_photos if p.get("has_comment")]
+    likes = sum(p.get("likes", 0) for p in my_photos)
+
+    # 순위는 전체 랭킹에서의 자리 — "12회 참석"만으로는 그게 많은 건지 모른다.
+    att_rank = [r["멤버"] for r in attendance_counts(posts)]
+    photo_rank = [r["작성자"] for r in photo_user_ranking(photos)]
+
+    dormant = {r["멤버"] for r in dormant_members(posts, members)}
+    return {
+        "이름": name,
+        "운영진": bool(m.get("is_admin")),
+        "OS": m.get("os") or "—",
+        "가입일": m["joined_at"].strftime("%Y-%m-%d") if m.get("joined_at") else "—",
+        "마지막 방문": (m["last_visit"].strftime("%Y-%m-%d")
+                    if m.get("last_visit") else "—"),
+        "첫 등장": first.get(name, "—"),
+        "최근 참석": last.get(name, "—"),
+        "참석": len(attended),
+        "매칭 출사": len(held),
+        "참석률": _pct(len(attended), len(held)),
+        "개최": len(hosted), "개최 취소": len(canceled),
+        "취소율": _pct(len(canceled), len(hosted)),
+        "후기": len(reviews),
+        "게시글 좋아요": sum(p.get("likes", 0) for p in my_posts),
+        "사진": len(my_photos),
+        "사진 좋아요": likes,
+        "장당 좋아요": round(likes / len(my_photos), 1) if my_photos else 0.0,
+        "테마사진": len(themed),
+        "테마 참여월": len({ym_of(p["posted_at"]) for p in themed}),
+        "유령": not my_posts and not my_photos and not attended,
+        "휴면": name in dormant,
+        "참석 순위": (att_rank.index(name) + 1) if name in att_rank else None,
+        "참석 모수": len(att_rank),
+        "사진 순위": (photo_rank.index(name) + 1) if name in photo_rank else None,
+        "사진 모수": len(photo_rank),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# 갤러리 — 올라온 사진 전부에 닿는다
+#
+# 지금까지는 `top_photos`로 좋아요 상위 12장만 볼 수 있었고 나머지 수천 장은
+# 앱에서 볼 방법이 아예 없었다. 사진 한 장을 그리는 것이 곧 CloudFront 요청
+# 한 번이라, "전부 보여 준다"는 곧 "한 번에 몇 장을 그릴지 정한다"는 뜻이다.
+# ═══════════════════════════════════════════════════════════════
+
+GALLERY_SORTS = ["최신순", "오래된순", "좋아요순", "댓글순"]
+
+
+def gallery_photos(photos: list[dict], *, author: str | None = None,
+                   themed_only: bool = False,
+                   sort: str = "최신순") -> list[dict]:
+    """필터·정렬을 마친 사진 목록.
+
+    **동률은 id로 끊는다.** 좋아요가 같은 사진이 수두룩한데 정렬이 흔들리면
+    페이지를 넘길 때마다 순서가 바뀌어, 같은 사진이 두 페이지에 나오거나 아예
+    한 번도 안 나오는 사진이 생긴다.
+    """
+    sel = [p for p in photos
+           if (author is None or p.get("author") == author)
+           and (not themed_only or p.get("has_comment"))]
+    keys = {
+        "최신순":   lambda p: (-p["posted_at"].timestamp(), str(p["id"])),
+        "오래된순": lambda p: (p["posted_at"].timestamp(), str(p["id"])),
+        "좋아요순": lambda p: (-p.get("likes", 0), -p.get("comments", 0), str(p["id"])),
+        "댓글순":   lambda p: (-p.get("comments", 0), -p.get("likes", 0), str(p["id"])),
+    }
+    return sorted(sel, key=keys.get(sort, keys["최신순"]))
+
+
+def photos_by_month(photos: list[dict]) -> dict[int, list[dict]]:
+    """월(ym)별 묶음. 들어온 순서를 그대로 유지한다(정렬은 호출 전에 끝낸다).
+
+    `themed_photos_by_month`와 합치지 않는다 — 그쪽은 **댓글 달린 사진만**
+    담고 **작성자순**으로 정렬한다. 같은 사람 사진을 나란히 놓고 테마인지
+    판별하는 화면이라 그 정렬이 목적이기 때문이다. 갤러리는 "무엇이 있나"를
+    보는 화면이라 기준이 다르다.
+    """
+    out: dict[int, list[dict]] = defaultdict(list)
+    for p in photos:
+        out[ym_of(p["posted_at"])].append(p)
+    return dict(out)
+
+
+def photo_uploaders(photos: list[dict]) -> list[dict]:
+    """업로더 필터 옵션 `{작성자, 사진수}`.
+
+    `photo_user_ranking`을 쓰지 않는다 — 그쪽은 활성 멤버만 센다. 갤러리는
+    **올라온 사진 전부에 닿는 것**이 목적이라, 나간 사람이 올린 사진도 찾을
+    수 있어야 한다.
+    """
+    cnt = Counter(p.get("author") or "—" for p in photos)
+    return [{"작성자": a, "사진수": n} for a, n in cnt.most_common()]
+
+
+def page_slice(items: list, page: int, per_page: int) -> tuple[list, int, int]:
+    """(그 페이지 항목, 전체 페이지 수, 0-based 시작 인덱스).
+
+    범위를 벗어난 `page`는 자른다 — 업로더 필터를 좁히면 페이지 수가 줄어드는데,
+    그때 예전 페이지 번호가 남아 있으면 빈 화면이 나온다.
+    """
+    per_page = max(1, int(per_page))
+    pages = max(1, -(-len(items) // per_page))
+    page = min(max(1, int(page)), pages)
+    start = (page - 1) * per_page
+    return items[start:start + per_page], pages, start
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1102,8 +1407,14 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
 
     duplicates = master.get("duplicates") if isinstance(master, dict) else set()
 
+    # 예전의 10→5 통합은 **서로의 상위집합이던 탭**을 합친 것이었다(`_tab_overview`의
+    # "👤 사용자 탭을 흡수", `_tab_photos`의 "같은 사진 데이터를 두 탭에서" 주석).
+    # 새로 붙는 둘은 기존 집계의 중복이 아니라 각각 *열람 모드*와 *드릴다운
+    # 모드*라 그 규칙에 걸리지 않는다. 자리는 소재 인접 — 갤러리는 사진 옆,
+    # 멤버 상세는 멤버 옆.
     tabs = st.tabs(
-        ["📊 개요", "📌 출사", "👥 참석 & 후기", "📷 사진", "🧑‍🤝‍🧑 멤버"]
+        ["📊 개요", "📌 출사", "👥 참석 & 후기", "📷 사진", "🖼 갤러리",
+         "🧑‍🤝‍🧑 멤버", "🔎 멤버 상세"]
     )
 
     with tabs[0]:
@@ -1115,8 +1426,13 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
     with tabs[3]:
         _tab_photos(photos, months, fix_store=fix_store)
     with tabs[4]:
+        _gallery_section(photos, months)
+    with tabs[5]:
         _tab_members(members or [], posts, photos, duplicates or set(), months,
                      since_ym=start_ym)
+    with tabs[6]:
+        _tab_member_focus(posts, photos, members or [], months,
+                          duplicates=duplicates or set(), body_cut=body_cut)
 
 
 def render_confidence(posts: list[dict], pending: dict[str, int] | None,
@@ -1367,13 +1683,15 @@ def _tab_attendance(posts: list[dict], months: list[int],
     c3.metric("실제 진행률", f"{rate['진행률']}%")
 
     st.markdown("#### 멤버별 참석 횟수")
+    st.caption(f"`선호 카테고리`는 그 사람이 많이 간 순으로 최대 {PREF_TOP_N}개. "
+               f"카테고리가 모두 {len(ALL_CATS)}종이라 사실상 전체 분포이고, "
+               "한 사람만 자세히 보려면 🔎 멤버 상세 탭으로 가세요.")
     counts = attendance_counts(posts)
     if counts:
         pref = member_category_pref(posts)
         first, last = member_first_seen(posts)
         for r in counts:
-            top = pref[r["멤버"]].most_common(2)
-            r["선호 카테고리"] = ", ".join(f"{c}({n})" for c, n in top) or "—"
+            r["선호 카테고리"] = top_category_label(pref[r["멤버"]])
             r["첫 등장"] = first.get(r["멤버"], "—")
             r["최근"] = last.get(r["멤버"], "—")
         st.dataframe(
@@ -1383,6 +1701,10 @@ def _tab_attendance(posts: list[dict], months: list[int],
                 "참석횟수": st.column_config.ProgressColumn(
                     "참석횟수", min_value=0,
                     max_value=max(r["참석횟수"] for r in counts) or 1, format="%d"),
+                # 5개면 `인물(12), 인물&풍경(9), 풍경(7), GN(3), 보정(1)`까지
+                # 들어가 기본 폭에서는 말줄임으로 잘린다.
+                "선호 카테고리": st.column_config.TextColumn(
+                    "선호 카테고리", width="large"),
             },
         )
     else:
@@ -1420,10 +1742,12 @@ def _tab_attendance(posts: list[dict], months: list[int],
         st.dataframe(styled, hide_index=True, width="stretch", height=400)
 
     st.markdown("#### 함께 간 사람")
-    st.caption("같은 출사에 함께 참석한 횟수 상위 20쌍. "
+    st.caption(f"같은 출사에 함께 참석한 횟수 상위 {CO_ATTENDANCE_TOP}쌍. "
                "`A 참석`은 그 사람의 전체 참석 횟수, `A 기준`은 그중 상대와 "
                "함께한 비율입니다 — 같은 8회라도 한쪽에겐 대부분, 다른 쪽에겐 "
-               "일부일 수 있습니다.")
+               "일부일 수 있습니다. **여기는 전체 상위 쌍이라 참석이 적은 "
+               "사람은 올라오지 않습니다** — 특정인의 동행 전체는 🔎 멤버 상세 "
+               "탭에서 봅니다.")
     pairs = co_attendance(posts)
     if pairs:
         # 횟수는 `회`, 비율은 막대. 두 종류가 같은 숫자 모양이면 무엇을 보고
@@ -1435,7 +1759,8 @@ def _tab_attendance(posts: list[dict], months: list[int],
 
         st.dataframe(
             pd.DataFrame(pairs, columns=CO_ATTENDANCE_COLS),
-            hide_index=True, width="stretch", height=320,
+            # 40쌍을 320px에 담으면 아홉 줄만 보인다 — 상한을 올린 뜻이 없다.
+            hide_index=True, width="stretch", height=520,
             column_config={
                 "사람 A": st.column_config.TextColumn("사람 A", width="medium"),
                 "사람 B": st.column_config.TextColumn("사람 B", width="medium"),
@@ -1693,6 +2018,101 @@ def _rebuild_analysis() -> None:
     st.session_state["_analysis"] = analysis
 
 
+def _photo_grid(items: list[dict]) -> None:
+    """인기 사진 갤러리와 **같은 형태**의 격자. 사진 한 장 = CDN 요청 한 번."""
+    for i in range(0, len(items), GALLERY_COLS):
+        for col, p in zip(st.columns(GALLERY_COLS), items[i:i + GALLERY_COLS]):
+            mark = " 🎨" if p.get("has_comment") else ""
+            col.image(p["url_medium"], width="stretch",
+                      caption=f"{p.get('author', '')}{mark} · "
+                              f"👍{p.get('likes', 0)} 💬{p.get('comments', 0)}")
+
+
+def _gallery_page(items: list[dict], key: str) -> None:
+    """한 묶음을 페이지로 끊어 그린다.
+
+    **위젯을 만들기 전에 페이지 번호를 자른다.** 업로더 필터를 좁히면 페이지
+    수가 줄어드는데, 세션에 남은 예전 번호는 `number_input`의 범위를 벗어나
+    그대로 예외가 된다 — 필터를 거는 평범한 동작에서 앱이 죽는다.
+    """
+    _, pages, _ = page_slice(items, 1, GALLERY_PAGE)
+    if int(st.session_state.get(key, 1) or 1) > pages:
+        st.session_state[key] = pages
+    page = 1
+    if pages > 1:
+        page = st.number_input(f"페이지 (1–{pages})", min_value=1, max_value=pages,
+                               step=1, key=key)
+    rows, _, start = page_slice(items, page, GALLERY_PAGE)
+    st.caption(f"{start + 1}–{start + len(rows)} / {len(items)}장")
+    _photo_grid(rows)
+
+
+@st.fragment
+def _gallery_section(photos: list[dict], months: list[int]) -> None:
+    """🖼 올라온 사진 전부를 열람하는 화면.
+
+    **보기 방식이 둘이다.** 월별 펼치기만 두면 정렬이 달 안에서만 걸려서
+    "전 기간 좋아요 1등"을 볼 방법이 아예 없다. 반대로 전체 페이지만 두면
+    "작년 3월에 뭘 찍었더라"를 찾을 축이 사라진다. 둘 다 필요하다.
+
+    | 보기 | 하는 일 |
+    |---|---|
+    | 월별 | 펼친 달만 그린다. 정렬은 그 달 안에서 |
+    | 전체 | 달 구분 없이 전 기간에 정렬·필터. 1페이지 첫 장이 곧 전체 1등 |
+
+    **닫힌 달은 아예 그리지 않는다**(`if not exp.open: continue`). 사진 한 장이
+    곧 CloudFront 요청 한 번이라 비용은 데이터 양이 아니라 **그린 장 수**에
+    비례한다. 🎨 테마사진 구역이 월별 expander만으로 충분했던 것은 거기가
+    댓글 달린 일부만 그리기 때문이고, 갤러리는 전부를 그리므로 한 달에도
+    수백 장이 들어 있을 수 있다 — 그래서 달 안에서도 페이지로 끊는다.
+
+    **프래그먼트다.** 필터·정렬·페이지 조작이 앱 전체를 다시 그릴 이유가 없다.
+    """
+    st.caption("이 탭은 위쪽 **분석 기간**을 그대로 따릅니다(기본값이 수집 전 "
+               "기간이라 평소엔 올라온 사진 전부입니다). 닫힌 달은 불러오지 "
+               f"않고, 한 번에 {GALLERY_PAGE}장씩 받습니다.")
+
+    uploaders = photo_uploaders(photos)
+    c1, c2, c3, c4 = st.columns([1, 2, 2, 1])
+    mode = c1.radio("보기", ["월별", "전체"], horizontal=True, key="gal_mode",
+                    help="전 기간 좋아요·댓글 순위를 보려면 **전체**를 고르세요 — "
+                         "월별에서는 정렬이 그 달 안에서만 걸립니다.")
+    author = c2.selectbox("업로더", ["전체"] + [u["작성자"] for u in uploaders],
+                          key="gal_author",
+                          format_func=lambda a: a if a == "전체" else
+                          f"{a} ({next(u['사진수'] for u in uploaders if u['작성자'] == a)}장)")
+    sort = c3.selectbox("정렬", GALLERY_SORTS, key="gal_sort")
+    themed_only = c4.toggle("테마사진만", key="gal_themed")
+
+    sel = gallery_photos(photos, author=None if author == "전체" else author,
+                         themed_only=themed_only, sort=sort)
+    if not sel:
+        st.info("조건에 맞는 사진이 없습니다.")
+        return
+    st.caption(f"총 {len(sel)}장 · 업로더 {len(uploaders)}명")
+
+    if mode == "전체":
+        _gallery_page(sel, "gal_page_all")
+        return
+
+    by_month = photos_by_month(sel)
+    multi = is_multi_year(months[0], months[-1]) if months else True
+    open_months = sorted(by_month, reverse=True)
+    # 가장 최근 달 하나만 펼쳐 둔다 — 전부 접힌 탭은 고장 난 것처럼 보이는데,
+    # 비용은 한 페이지뿐이다.
+    st.session_state.setdefault(f"gal_open_{open_months[0]}", True)
+    for m in open_months:
+        items = by_month[m]
+        # 라벨에 `테마사진`·`— 후기`를 넣지 않는다 — 테스트가 expander를 라벨
+        # 부분문자열로 분류하므로 겹치면 갤러리 달이 그쪽으로 잘못 분류된다.
+        exp = st.expander(f"{ym_label(m, multi_year=multi)} — {len(items)}장",
+                          key=f"gal_open_{m}", on_change="rerun")
+        with exp:
+            if not exp.open:
+                continue        # 닫힌 달은 CDN 요청이 한 건도 나가지 않는다
+            _gallery_page(items, f"gal_page_{m}")
+
+
 def _category_section(posts: list[dict], months: list[int]) -> None:
     st.caption("출사 공지(cat=A) 제목의 [카테고리] 태그 기준. 출사: 인물(1:1인물·1:1인물출사 포함)·인물&풍경·풍경·GN / 활동: 보정·문화.")
     rows = category_counts(posts)
@@ -1905,6 +2325,180 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
         st.dataframe(pd.DataFrame(settle), hide_index=True, width="stretch", height=280)
     else:
         st.caption("수집 기간 안에 가입한 멤버가 없습니다.")
+
+
+@st.fragment
+def _tab_member_focus(posts: list[dict], photos: list[dict],
+                      members: list[dict], months: list[int],
+                      duplicates: set[str] | None = None,
+                      body_cut: int | None = None) -> None:
+    """🔎 한 사람만 골라서 세로로 보는 화면.
+
+    나머지 여섯 탭은 전부 "한 행이 한 사람"인 가로 집계라, 사람 하나를
+    알아보려면 탭을 오가며 표에서 이름을 눈으로 찾아야 했다.
+
+    **프래그먼트다.** 드롭박스를 바꿀 때마다 앱 전체를 다시 그리면 사진 수천
+    장에 이름을 다시 붙이고 여섯 탭을 통째로 재계산한다 — 사람을 이어서
+    훑어볼 수가 없다(🎨 테마사진 체크박스와 똑같은 이유).
+    """
+    if not members:
+        st.info("멤버 정보가 없습니다. 사이드바의 **📥 수집**으로 받아오면 이 탭이 채워집니다.")
+        return
+
+    opts = member_options(members, posts, photos)
+    if not opts:
+        st.info("분석할 멤버가 없습니다.")
+        return
+
+    names = [o["이름"] for o in opts]
+    by_name = {o["이름"]: o for o in opts}
+    st.caption("활성 멤버 명단에서 고릅니다. 활동이 0건인 유령 멤버도 목록에 "
+               "있습니다 — 아무것도 안 했다는 사실 자체가 확인할 값입니다.")
+    name = st.selectbox(
+        "멤버 선택", names, key="mf_member",
+        format_func=lambda n: (f"{n} · 참석 {by_name[n]['참석']} · "
+                               f"글 {by_name[n]['게시글']} · 사진 {by_name[n]['사진']}"),
+    )
+    if not name:
+        return
+
+    prof = member_profile(name, posts, photos, members)
+    my_posts = [p for p in posts if p.get("author") == name]
+    my_photos = [p for p in photos if p.get("author") == name]
+
+    st.markdown(f"### {name}")
+    badges = []
+    if prof["운영진"]:
+        badges.append(("운영진", "blue"))
+    if prof["유령"]:
+        badges.append(("유령 — 이 기간 활동 0건", "gray"))
+    elif prof["휴면"]:
+        badges.append(("휴면 — 3개월 넘게 참석 없음", "orange"))
+    dup_hit = any(_raw_nick(m) in (duplicates or set())
+                  for m in members if m.get("mn") == name)
+    if dup_hit:
+        badges.append(("⚠️ 동명이인", "red"))
+    if badges:
+        for col, (text, color) in zip(st.columns(len(badges)), badges):
+            col.badge(text, color=color)
+    if dup_hit:
+        st.warning("같은 닉네임의 활성 멤버가 둘 이상입니다. 후기 본문에서는 둘을 "
+                   "가를 수 없어 **아래 숫자는 두 사람이 합쳐진 값**입니다.", icon="⚠️")
+
+    c = st.columns(5)
+    c[0].metric("참석", prof["참석"])
+    c[1].metric("개최한 출사", prof["개최"])
+    c[2].metric("후기", prof["후기"])
+    c[3].metric("사진", prof["사진"])
+    c[4].metric("테마사진", prof["테마사진"])
+    c = st.columns(5)
+    c[0].metric("참석률", f"{prof['참석률']}%")
+    c[1].metric("첫 등장", prof["첫 등장"])
+    c[2].metric("최근 참석", prof["최근 참석"])
+    c[3].metric("가입일", prof["가입일"])
+    c[4].metric("마지막 방문", prof["마지막 방문"])
+    st.caption(f"**참석률의 분모는 후기가 매칭된 출사 {prof['매칭 출사']}건**입니다. "
+               "후기가 없는 출사는 누가 갔는지 알 방법이 없어, 분모에 넣으면 아무 "
+               "잘못 없이 모두의 참석률이 낮아집니다.")
+
+    pos = []
+    if prof["참석 순위"]:
+        pos.append(f"참석 **{prof['참석 순위']}등** / {prof['참석 모수']}명")
+    if prof["사진 순위"]:
+        pos.append(f"사진 **{prof['사진 순위']}등** / {prof['사진 모수']}명")
+    if pos:
+        st.markdown("🏅 " + " · ".join(pos))
+
+    st.markdown("#### 월별 활동 추이")
+    mm, _ = attendance_monthly_matrix(posts)
+    mine = mm.get(name, {})
+    mt = monthly_table(my_posts, my_photos)
+    st.bar_chart(pd.DataFrame({
+        "참석": [mine.get(m, 0) for m in months],
+        "개최": axis_values(mt["진행 출사"], months),
+        "후기": axis_values(mt["후기글"], months),
+        "사진": axis_values(mt["사진"], months),
+    }, index=axis_labels(months)), height=260)
+    st.caption("개최는 출사일, 후기·사진은 작성일 기준 — 다른 탭의 월별 추이와 같습니다. "
+               "취소된 출사는 `개최`에 들어가지 않습니다.")
+
+    pref = member_category_pref(posts).get(name)
+    if pref:
+        st.markdown("#### 선호 카테고리")
+        st.caption("참석한 출사의 카테고리 **전체 분포**입니다. "
+                   f"👥 참석 & 후기 탭의 표는 상위 {PREF_TOP_N}개만 보여 줍니다.")
+        st.altair_chart(donut(dict(pref.most_common()), "참석 카테고리"),
+                        width="stretch")
+
+    st.markdown(f"#### 개최한 출사 ({prof['개최']}건)")
+    hosted = member_hosted_outings(name, posts)
+    if hosted:
+        st.caption(f"취소(펑) {prof['개최 취소']}건 포함 · 취소율 {prof['취소율']}%. "
+                   "`후기 없음`은 공지는 있었지만 짝이 될 후기를 못 찾은 출사입니다.")
+        st.dataframe(pd.DataFrame(hosted), hide_index=True, width="stretch",
+                     height=min(420, 40 * len(hosted) + 40))
+    else:
+        st.caption("개최한 출사가 없습니다.")
+
+    st.markdown(f"#### 참석한 출사 ({prof['참석']}건)")
+    attended = member_attended_outings(name, posts)
+    if attended:
+        st.dataframe(pd.DataFrame(attended), hide_index=True, width="stretch",
+                     height=min(420, 40 * len(attended) + 40))
+    else:
+        st.caption("참석 기록이 없습니다.")
+
+    st.markdown("#### 함께 간 사람")
+    comp = member_companions(name, posts)
+    if comp:
+        st.caption("이 사람과 같은 출사에 함께 간 **전원**입니다 — 👥 참석 & 후기 "
+                   f"탭의 표는 전체 상위 {CO_ATTENDANCE_TOP}쌍만 보여 주므로 여기 "
+                   "있는 사람이 거기엔 없을 수 있습니다. `내 기준`은 이 사람의 "
+                   "전체 참석 중 상대와 함께한 비율, `상대 기준`은 그 반대입니다.")
+        st.dataframe(
+            pd.DataFrame(comp, columns=COMPANION_COLS),
+            hide_index=True, width="stretch", height=min(460, 40 * len(comp) + 40),
+            column_config={
+                "함께": st.column_config.NumberColumn("함께", format="%d회"),
+                "상대 참석": st.column_config.NumberColumn("상대 참석", format="%d회"),
+                "내 기준": st.column_config.ProgressColumn(
+                    "내 기준", min_value=0, max_value=100, format="%.0f%%",
+                    help=f"{name}이(가) 간 전체 출사 중 이 사람과 함께한 비율"),
+                "상대 기준": st.column_config.ProgressColumn(
+                    "상대 기준", min_value=0, max_value=100, format="%.0f%%",
+                    help="상대가 간 전체 출사 중 이 사람과 함께한 비율"),
+            },
+        )
+    else:
+        st.caption("두 명 이상이 참석한 출사에 함께한 기록이 없습니다.")
+
+    st.markdown(f"#### 작성한 후기 ({prof['후기']}건)")
+    revs = member_reviews(name, posts, body_cut)
+    if revs:
+        n_cut = sum(1 for r in revs if r["잘림"])
+        if n_cut:
+            st.caption(f"✂️ 본문이 잘린 후기 {n_cut}건 — 그 글에서 뽑은 참석자 명단이 "
+                       "전부가 아닐 수 있습니다. 원문은 👥 참석 & 후기 탭에서 봅니다.")
+        st.dataframe(pd.DataFrame(revs), hide_index=True, width="stretch",
+                     height=min(420, 40 * len(revs) + 40))
+    else:
+        st.caption("작성한 후기가 없습니다.")
+
+    st.markdown(f"#### 사진 ({prof['사진']}장)")
+    if my_photos:
+        c = st.columns(4)
+        c[0].metric("좋아요 합", prof["사진 좋아요"])
+        c[1].metric("장당 좋아요", prof["장당 좋아요"])
+        c[2].metric("테마사진", prof["테마사진"])
+        c[3].metric("테마 참여월", f"{prof['테마 참여월']}개월")
+        tops = top_photos(my_photos, 8)
+        st.caption("좋아요 상위 8장. 전체는 🖼 갤러리 탭에서 업로더로 걸러 보세요.")
+        for i in range(0, len(tops), GALLERY_COLS):
+            for col, p in zip(st.columns(GALLERY_COLS), tops[i:i + GALLERY_COLS]):
+                col.image(p["url_medium"], width="stretch",
+                          caption=f"👍{p['likes']} 💬{p['comments']}")
+    else:
+        st.caption("업로드한 사진이 없습니다.")
 
 
 # ═══════════════════════════════════════════════════════════════
