@@ -619,18 +619,6 @@ def _pctstr(v: float) -> str:
     return f"{v:g}%"
 
 
-def _josa(name: str) -> str:
-    """받침에 맞는 `와`/`과`. `엄태진와`가 아니라 `엄태진과`.
-
-    표시 이름에는 `Bale(이상현)`·`🍭(김민규)`처럼 괄호와 영문·이모지가 섞이므로
-    **마지막 한글 음절**을 찾아 판정한다. 한글이 하나도 없으면 `와`로 둔다.
-    """
-    for ch in reversed(name):
-        if "가" <= ch <= "힣":
-            return "과" if (ord(ch) - 0xAC00) % 28 else "와"
-    return "와"
-
-
 def _wilson_low(k: int, n: int, z: float = 1.96) -> float:
     """비율 `k/n`의 95% 신뢰구간 하한. **표본이 얇을수록 더 깎는다.**
 
@@ -1536,10 +1524,18 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     # 이름을 관찰 말투로 둔다. 여기서 말할 수 있는 것은 "많이 겹쳤다"까지이고,
     # 그게 우연인지 아닌지는 아래 `인연`이 따로 말한다. 예전 이름
     # (`환상의 콤비`·`출사가세요?`)은 특별한 인연처럼 읽혀 두 얘기가 섞였다.
+    #
+    # **사람 이름 뒤에는 늘 `님`을 붙인다.** 높임말이라 읽기 좋기도 하지만,
+    # 조사가 붙는 자리를 `님`이 대신 받아 주는 것이 더 크다 — `님`은 받침이
+    # 있으므로 뒤따르는 조사가 **이름과 무관하게 언제나 `과`**로 고정된다.
+    # 이름을 그대로 쓰면 `엄태진과`/`바다와`를 받침으로 갈라 줘야 하는데,
+    # 표시 이름에는 `Bale(이상현)`·`🍭(김민규)`처럼 괄호·영문·이모지가 섞여
+    # 마지막 한글 음절을 찾아내는 판정이 따로 필요했다. `님`이 그 문제를
+    # 통째로 없앤다.
     top = companions[0] if companions else None
     combo = _combo_partner(companions)
     if combo:
-        put("동행", 95, "💞", f"{combo}{_josa(combo)} 2인 1조",
+        put("동행", 95, "💞", f"{combo}님과 2인 1조",
             f"{top['함께']}회를 함께 다녔습니다 — 내 출사의 "
             f"{_pctstr(top['내 기준'])}, 상대 출사의 "
             f"{_pctstr(top['상대 기준'])}가 서로 겹칩니다. "
@@ -1570,7 +1566,7 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     if me and me["하한"] >= PAIR_MIN_LIFT:
         저쪽 = (ctx.get("인연1위") or {}).get(me["상대"])
         if 저쪽 and 저쪽["상대"] == name:
-            put("인연", 87, "💞", f"{me['상대']}{_josa(me['상대'])} 짜고 나오시나요?",
+            put("인연", 87, "💞", f"{me['상대']}님과 짜고 나오시나요?",
                 f"같은 출사에 {me['함께']}회 함께했습니다. {_chance_phrase(me)}했고, "
                 "두 분 다 서로를 1순위로 꼽습니다",
                 me["하한"], "관계")
@@ -3495,7 +3491,7 @@ def _title_distribution(names: list[str],
                        + ", ".join(none_got))
 
 
-# 이름에 사람·카테고리가 박히는 칭호(`{상대}과 2인 1조`)는 미리 나열할 수
+# 이름에 사람·카테고리가 박히는 칭호(`{상대}님과 2인 1조`)는 미리 나열할 수
 # 없다. 그래서 고정 이름 목록에 **이번에 실제로 나온 것**을 합쳐 보여 준다.
 FIXED_TITLE_NAMES = [
     "테마사진의 제왕", "테마사진 프로 참석러", "출사장도 장이다", "심심한데 출사쳐야지",
