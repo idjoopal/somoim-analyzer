@@ -3766,11 +3766,37 @@ def load_analysis(stores) -> dict | None:
             corrections = fix_store.load()
             analysis = build_analysis(raw, corrections)
         except Exception as e:  # noqa: BLE001
-            st.error(f"구글 시트를 읽지 못했습니다: {e}")
+            # **원인별 안내가 아니라 확인 순서를 적는다.** 구글 API 예외는
+            # 같은 원인에도 메시지가 제각각이라(404/403/`invalid_grant`…)
+            # 문자열로 갈라 짚으면 틀린 쪽을 가리키기 쉽다. 대신 흔한 순서로
+            # 늘어놓아 사용자가 위에서부터 지워 나가게 한다.
+            from core.store import RAW_TABS
+
+            st.session_state["_read_failed"] = True
+            st.error(
+                "**구글 시트를 읽지 못했습니다.** 쌓인 데이터는 시트에 그대로 "
+                "있고, 앱이 그것을 못 가져온 상태입니다.\n\n"
+                "위에서부터 확인해 주세요.\n\n"
+                "1. **잠시 뒤 새로고침** — 구글 API가 잠깐 막히면(429·503) "
+                "다시 시도하는 것만으로 풀립니다.\n"
+                "2. **폴더 공유** — `[gsheets] folder_id`의 폴더가 서비스 계정 "
+                "이메일에 **편집자**로 공유돼 있는지 봅니다. 공유가 풀리면 "
+                "폴더가 아예 없는 것처럼 보입니다.\n"
+                "3. **탭 이름** — 시트에서 탭을 지웠거나 이름을 바꿨다면 "
+                f"되돌립니다(raw: {' · '.join(RAW_TABS)}).\n\n"
+                "다 맞는데도 그대로면 사이드바 **📥 수집**으로 다시 받아 "
+                "시트를 새로 세울 수 있습니다.",
+                icon="⚠️",
+            )
+            # 원문은 접어 둔다. `st.exception`은 트레이스백을 통째로 쏟아
+            # 안내를 밀어내고, 대부분의 사용자에게는 읽을 것이 없다.
+            with st.expander("오류 원문"):
+                st.code(f"{type(e).__name__}: {e}")
             return None
         # 테마 해제 후 시트를 다시 읽지 않고 재조립하려면 raw가 필요하다.
         st.session_state["_raw"] = raw
         analysis["pending"] = seed_and_count(fix_store, raw, corrections, analysis)
+    st.session_state.pop("_read_failed", None)
     st.session_state["_analysis"] = analysis
     return analysis
 
@@ -3821,6 +3847,11 @@ def main() -> None:
 
     if stores is None:
         st.info("👈 먼저 구글 연동을 설정해 주세요.")
+        return
+    # 읽기가 **실패**한 것과 아직 **안 받은** 것은 다르다. 실패했는데
+    # "수집에서 받아오세요"를 띄우면 시트에 데이터가 멀쩡히 있는 사람에게
+    # 엉뚱한 일을 시키게 되고, 위에 뜬 진짜 안내와 말이 어긋난다.
+    if st.session_state.get("_read_failed"):
         return
     if not analysis or not (analysis.get("posts") or analysis.get("photos")):
         st.info("👈 사이드바 **📥 수집**에서 기간을 지정해 데이터를 받아오세요.")
