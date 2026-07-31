@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 
@@ -618,6 +619,84 @@ def _pctstr(v: float) -> str:
     return f"{v:g}%"
 
 
+def _josa(name: str) -> str:
+    """받침에 맞는 `와`/`과`. `엄태진와`가 아니라 `엄태진과`.
+
+    표시 이름에는 `Bale(이상현)`·`🍭(김민규)`처럼 괄호와 영문·이모지가 섞이므로
+    **마지막 한글 음절**을 찾아 판정한다. 한글이 하나도 없으면 `와`로 둔다.
+    """
+    for ch in reversed(name):
+        if "가" <= ch <= "힣":
+            return "과" if (ord(ch) - 0xAC00) % 28 else "와"
+    return "와"
+
+
+def _wilson_low(k: int, n: int, z: float = 1.96) -> float:
+    """비율 `k/n`의 95% 신뢰구간 하한. **표본이 얇을수록 더 깎는다.**
+
+    3회 중 3회(100%)와 30회 중 30회(100%)는 관측 비율이 같지만 믿을 만한
+    정도가 다르다. 그대로 쓰면 두세 번 만난 쌍이 순위를 다 차지한다.
+    """
+    if n <= 0:
+        return 0.0
+    p = k / n
+    d = 1 + z * z / n
+    c = p + z * z / (2 * n)
+    m = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return max(0.0, (c - m) / d)
+
+
+def _affinity(n: int, mine: int, theirs: int, total: int) -> dict:
+    """두 사람의 겹침을 연관 규칙으로 잰 값.
+
+    `lift`는 "우연히 겹칠 때보다 몇 배 자주 만나나"다. 함께 간 **횟수**만 보면
+    전체 출사의 절반에 나오는 사람이 늘 1등이 된다 — 그 사람과 겹치는 건
+    따라다녀서가 아니라 그냥 확률이다. lift는 그 확률을 나눠서 지운다.
+
+    다만 생 lift를 그대로 고르는 데 쓰면 **표본이 얇을 때 폭발한다**(3회
+    만나고 18.8배). 그래서 **고르고 자르는 데에는 `하한`을 쓰고**, 사람에게
+    보여 주는 문구에는 관측값 `lift`를 쓴다.
+
+    `기대`는 lift를 말로 풀기 위한 값이다 — "우연이라면 0.5회쯤 겹쳤을 텐데".
+    lift 4.5는 일반인에게 아무 뜻이 없지만 이 문장은 읽으면 안다.
+    """
+    if not mine or not theirs or not total:
+        return {"기대": 0.0, "lift": 0.0, "하한": 0.0}
+    base = theirs / total
+    return {"기대": mine * theirs / total,
+            "lift": (n / mine) / base,
+            "하한": _wilson_low(n, mine) / base}
+
+
+def _held_count(posts: list[dict]) -> int:
+    """실제로 다녀온 출사 수 — `_affinity`의 분모."""
+    return sum(1 for p in posts
+               if p.get("cat") == "A" and p.get("actually_held"))
+
+
+def _affinity_top(pair: Counter, solo: Counter, total: int) -> dict[str, dict]:
+    """`{이름: 우연 대비 1순위}`. **전원분을 한 번에 만든다.**
+
+    비율은 원 정수(`pair`·`solo`)에서 바로 잰다 — `member_companions`의
+    `내 기준`은 소수점 한 자리로 반올림한 표시용 값이라 나눗셈에 쓰면 오차가
+    쌓인다.
+
+    1순위는 **하한**으로 고른다. 관측 lift로 고르면 세 번 만난 쌍이 늘 이긴다.
+    """
+    cands: defaultdict[str, list] = defaultdict(list)
+    for (a, b), n in pair.items():
+        if n < PAIR_MIN_JOINT:
+            continue
+        for me, other in ((a, b), (b, a)):
+            mine, theirs = solo.get(me, 0), solo.get(other, 0)
+            row = _affinity(n, mine, theirs, total)
+            cands[me].append({"상대": other, "함께": n,
+                              "내비율": _pct(n, mine), **row})
+    # 동점은 이름으로 끊는다 — 같은 데이터면 늘 같은 짝이 나와야 한다.
+    return {me: max(rows, key=lambda r: (r["하한"], r["함께"], r["상대"]))
+            for me, rows in cands.items()}
+
+
 def co_attendance(posts: list[dict], top_n: int = CO_ATTENDANCE_TOP) -> list[dict]:
     """함께 간 횟수 상위 쌍.
 
@@ -998,6 +1077,10 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
         # 참석한 출사의 평균 인원 — `정출킬러`·`소수정예`가 양 끝에서 읽는다.
         "참석인원": list(_attended_crowd_all(posts).items()),
         "쌍": (pair, solo),
+        # 우연 대비 1순위. **전원분을 여기서 한 번에 만든다** — "서로가 서로의
+        # 1순위"는 상대 것도 알아야 판정되므로, 사람마다 다시 세면 전 멤버
+        # 칭호를 뽑을 때 O(사람 × 쌍)이 된다.
+        "인연1위": _affinity_top(pair, solo, _held_count(posts)),
         "첫등장": first,
         "최근": last,
         "휴면": {r["멤버"] for r in dormant_members(posts, members)},
@@ -1289,6 +1372,16 @@ TITLE_LIMIT = 3                 # 한 사람에게 붙는 최대 개수
 TITLE_QUOTA_DEFAULT = 9         # 한 칭호를 받을 수 있는 최대 인원
 TITLE_QUOTA = {"관계": 5, "카테고리": 5, "유일": 1}    # 갈래별 정원
 
+# ── 인연 칭호(우연 대비) ────────────────────────────────────────
+# `동행`이 **함께 간 횟수와 비율**로 짝을 고르는 데 반해, `인연`은 **우연히
+# 겹칠 양을 빼고 남는 것**으로 고른다. 실제 데이터에서 두 지표의 1위는
+# 대부분 다른 사람이다 — 서동훈↔엄태진은 69회를 함께 다녔지만 둘 다 전체의
+# 절반쯤 나와서 우연 기대치가 58.5회, 겨우 1.18배다. 반대로 김준영↔김희규는
+# 6회뿐이지만 우연의 11.5배다. 그래서 두 지표를 **따로** 둔다.
+PAIR_MIN_JOINT = 3      # 이보다 적게 만난 쌍은 우연과 구분되지 않는다
+PAIR_MIN_LIFT = 1.4     # lift **하한**의 문턱(생 lift가 아니다)
+BOND_MIN_SHARE = 50     # 짝사랑 쪽에 요구하는 내 출사 비중
+
 # `아맞다후기`를 받을 수 있는 후기율의 위 끝. 후기는 늘 쓰는 것이 맞으니
 # 여기까지가 "낮다"고 부를 수 있는 선이고, 그보다 잘 쓰면 아무도 안 받는다.
 AWOL_REVIEW_MAX = 80
@@ -1438,23 +1531,55 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     att, hosted_ran = prof["참석"], prof["개최 진행"]
     n_photo, n_theme = prof["사진"], prof["테마사진"]
 
-    # ── 동행 ────────────────────────────────────────────────
+    # ── 동행 — **횟수와 비율**로만 잰다 ────────────────────────
+    #
+    # 이름을 관찰 말투로 둔다. 여기서 말할 수 있는 것은 "많이 겹쳤다"까지이고,
+    # 그게 우연인지 아닌지는 아래 `인연`이 따로 말한다. 예전 이름
+    # (`환상의 콤비`·`출사가세요?`)은 특별한 인연처럼 읽혀 두 얘기가 섞였다.
     top = companions[0] if companions else None
-    if top and top["함께"] >= 3 and top["내 기준"] >= 50 and top["상대 기준"] >= 50:
-        put("동행", 95, "💞", f"{top['함께 간 사람']}와 환상의 콤비",
-            f"{top['함께']}회를 함께 다녔습니다 — 서로에게 절반이 넘는 사이입니다"
-            f"(내 출사의 {_pctstr(top['내 기준'])}, "
-            f"상대 출사의 {_pctstr(top['상대 기준'])})",
+    combo = _combo_partner(companions)
+    if combo:
+        put("동행", 95, "💞", f"{combo}{_josa(combo)} 2인 1조",
+            f"{top['함께']}회를 함께 다녔습니다 — 내 출사의 "
+            f"{_pctstr(top['내 기준'])}, 상대 출사의 "
+            f"{_pctstr(top['상대 기준'])}가 서로 겹칩니다. "
+            "한 분이 보이면 다른 한 분도 있는 셈입니다",
             top["함께"], "관계")
-    # 콤비가 붙은 상대에게는 `출사가세요?`를 안 붙인다 — 서로 붙어 다니는 것과
+    # 콤비가 붙은 상대에게는 일방형을 안 붙인다 — 서로 붙어 다니는 것과
     # 한쪽이 쫓아다니는 것은 다른 얘기라, 같은 상대로 둘 다 붙으면 앞말이
     # 뒷말을 부정한다.
     elif top and att >= 4 and _follows(top, prof):
-        put("동행", 88, "🐾", f"{top['함께 간 사람']}님 출사가세요?",
-            f"내 출사 {att}회 중 {top['함께']}회가 이분과 함께({_pctstr(top['내 기준'])}) — "
-            f"이분이 전체 출사에 나오는 비율 "
-            f"{_pctstr(_pct(top['상대 참석'], prof['매칭 출사']))}보다 훨씬 높습니다",
+        put("동행", 88, "🐾", f"{top['함께 간 사람']}님 오늘도 뵙네요",
+            f"내 출사 {att}회 중 {top['함께']}회에 이분이 계셨습니다"
+            f"({_pctstr(top['내 기준'])}). 이분이 전체 출사에 나오는 비율"
+            f"({_pctstr(_pct(top['상대 참석'], prof['매칭 출사']))})보다 "
+            "훨씬 자주 만나셨네요",
             top["내 기준"], "관계")
+
+    # ── 인연 — **우연히 겹칠 양을 뺀 뒤** 남는 것 ───────────────
+    #
+    # `동행`과 자리를 다투지 않도록 지표를 따로 판다. 한 사람이 두 지표에서
+    # **서로 다른 사람**을 받을 수 있고, 그게 오히려 이 칭호의 핵심이다.
+    me = (ctx.get("인연1위") or {}).get(name)
+    # 콤비와 상대가 같으면 인연은 **아무 말도 안 한다.** 여기서 끊어야지
+    # 상호형 조건에만 붙이면 조건을 못 지난 사람이 아래 짝사랑 가지로
+    # 흘러내려 "정작 이분의 1순위는 따로 있고요"라고 하는데, 서로가 서로를
+    # 1순위로 꼽는 쌍이므로 그 말은 거짓이 된다.
+    if me and combo == me["상대"]:
+        me = None
+    if me and me["하한"] >= PAIR_MIN_LIFT:
+        저쪽 = (ctx.get("인연1위") or {}).get(me["상대"])
+        if 저쪽 and 저쪽["상대"] == name:
+            put("인연", 87, "💞", f"{me['상대']}{_josa(me['상대'])} 짜고 나오시나요?",
+                f"같은 출사에 {me['함께']}회 함께했습니다. {_chance_phrase(me)}했고, "
+                "두 분 다 서로를 1순위로 꼽습니다",
+                me["하한"], "관계")
+        elif me["내비율"] >= BOND_MIN_SHARE:
+            put("인연", 84, "🐾", f"{me['상대']}님 알림 켜두셨죠?",
+                f"내 출사 {att}회 중 {me['함께']}회가 이분과 함께"
+                f"({_pctstr(me['내비율'])}). {_chance_phrase(me)}했습니다 — "
+                "정작 이분의 1순위는 따로 있고요",
+                me["하한"], "관계")
     if top_share(name, ctx["동행자"], 0.20, min_value=4):
         put("동행", 80, "🕸", "다 아는 사람들 이구먼",
             f"함께 출사해 본 사람이 {prof['동행자']}명 — 모임에서 아는 얼굴이 "
@@ -1687,8 +1812,35 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     return add
 
 
+def _combo_partner(companions: list[dict]) -> str | None:
+    """`2인 1조` 조건을 통과한 상대 이름. 없으면 `None`.
+
+    `동행` 블록과 `인연` 블록이 **같은 판정을 두 군데 적지 않도록** 한 곳에
+    둔다. 조건이 갈리면 같은 상대로 💞가 두 번 붙는다.
+    """
+    top = companions[0] if companions else None
+    if top and top["함께"] >= 3 and top["내 기준"] >= 50 and top["상대 기준"] >= 50:
+        return top["함께 간 사람"]
+    return None
+
+
+def _chance_phrase(me: dict) -> str:
+    """우연 대비를 **일반인이 읽는 말**로. lift라는 낱말은 안 쓴다.
+
+    `lift 4.5`는 아무 뜻이 없지만 "우연이라면 1.4회쯤 겹쳤을 텐데 5.7배나
+    함께"는 읽으면 안다. 기대 겹침이 1회 미만이면 배수를 **빼고** 실제 횟수로
+    말한다 — "한 번도 안 겹쳤을 법한데 18.8배나 함께했고"는 앞뒤가 어긋나
+    보인다(0.2회의 18.8배가 3회라는 뜻이지만 그렇게 안 읽힌다).
+    """
+    if me["기대"] >= 1:
+        return (f"우연이라면 {me['기대']:.1f}회쯤 겹쳤을 텐데 "
+                f"{me['lift']:.1f}배나 함께")
+    return ("서로 상관없이 다니셨다면 한 번 겹칠까 말까인데 "
+            f"{me['함께']}회나 함께")
+
+
 def _follows(top: dict, prof: dict) -> bool:
-    """`{상대}님 출사가세요?`를 붙일 만한가 — **상대의 출석률을 기준선으로 뺀다.**
+    """`{상대}님 오늘도 뵙네요`를 붙일 만한가 — **상대의 출석률을 기준선으로 뺀다.**
 
     실제 데이터에서 한 사람에게 17명이 붙었다. 그 사람이 거의 모든 출사에
     나오기 때문인데, 그러면 **누구의 내 기준이든 높게 나온다.** 따라다니는
@@ -3343,7 +3495,7 @@ def _title_distribution(names: list[str],
                        + ", ".join(none_got))
 
 
-# 이름에 사람·카테고리가 박히는 칭호(`{상대}와 환상의 콤비`)는 미리 나열할 수
+# 이름에 사람·카테고리가 박히는 칭호(`{상대}과 2인 1조`)는 미리 나열할 수
 # 없다. 그래서 고정 이름 목록에 **이번에 실제로 나온 것**을 합쳐 보여 준다.
 FIXED_TITLE_NAMES = [
     "테마사진의 제왕", "테마사진 프로 참석러", "출사장도 장이다", "심심한데 출사쳐야지",
