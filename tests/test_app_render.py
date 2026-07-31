@@ -413,6 +413,52 @@ def test_a_failed_read_does_not_tell_the_user_to_go_collect():
     assert not any("수집" in i.value for i in at.info), [i.value for i in at.info]
 
 
+def _btn(at, label):
+    return next(b for b in at.button if label in b.label)
+
+
+def test_the_guide_offers_both_a_retry_and_a_reconnect():
+    """둘은 **하는 일이 다르다.** 읽기만 다시 하는 것과 캐시된 연결까지 버리는 것.
+
+    어느 쪽이 필요한지 사용자가 스스로 알아내기는 어려우므로 둘 다 내놓는다.
+    """
+    at = run(stores=_boom_stores())
+    labels = [b.label for b in at.button]
+    assert any("다시 읽기" in x for x in labels), labels
+    assert any("연결 다시 맺기" in x for x in labels), labels
+
+
+def test_retrying_the_read_recovers_once_the_sheet_answers():
+    at = run(stores=_boom_stores())
+    at.session_state["_stores"] = make_stores(MULTI_YEAR, PHOTOS)
+    _btn(at, "다시 읽기").click().run()
+    assert not at.exception, [str(e) for e in at.exception]
+    assert "_read_failed" not in at.session_state
+    assert at.tabs
+
+
+def test_the_connection_is_cached_and_can_be_dropped():
+    """`연결 다시 맺기`가 기대는 API를 못 박는다.
+
+    연결이 `@st.cache_resource`라 **브라우저 새로고침으로는 안 풀린다** —
+    서버에 캐시돼 세션을 넘어 살아남는다. 버튼은 `.clear()`로 그것을 버리는데,
+    데코레이터가 빠지면 `.clear`가 사라져 버튼이 터진다.
+    """
+    import streamlit_app
+
+    assert callable(getattr(streamlit_app._open_stores, "clear", None))
+
+
+def test_reconnecting_retries_and_does_not_crash():
+    """캐시를 버린 뒤에도 앱이 멀쩡히 다시 그려지고, 읽기를 다시 시도한다."""
+    at = run(stores=_boom_stores())
+    at.session_state["_stores"] = make_stores(MULTI_YEAR, PHOTOS)
+    _btn(at, "연결 다시 맺기").click().run()
+    assert not at.exception, [str(e) for e in at.exception]
+    assert "_read_failed" not in at.session_state
+    assert at.tabs
+
+
 def test_a_read_failure_clears_once_the_sheet_is_readable_again():
     """실패 표시가 세션에 눌어붙으면 고친 뒤에도 화면이 안 돌아온다."""
     at = run(stores=_boom_stores())
