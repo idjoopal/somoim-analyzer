@@ -453,34 +453,35 @@ def _mixed():
     return out
 
 
-def test_the_bung_switch_exists_and_defaults_to_shoots_only():
-    """이 모임의 목적은 출사다 — 기본은 벙을 뺀 채로 센다."""
+def test_the_basis_box_spells_out_what_each_number_counts():
+    """`참석`이 무엇을 센 것인지 모르면 어떤 숫자도 읽을 수 없다.
+
+    스위치로 감추는 대신 셋을 다 적고 말을 정해 준다.
+    """
     at = run(stores=make_stores(_mixed()))
     assert not at.exception, [str(e) for e in at.exception]
-    tog = next(t for t in at.toggle if t.key == "count_bung")
-    assert tog.value is False
-    assert "벙" in tog.label
-
-
-def test_flipping_the_switch_changes_what_is_counted():
-    """스위치가 실제로 분모를 바꾼다 — 안내문의 숫자로 확인한다."""
-    at = run(stores=make_stores(_mixed()))
     말 = " ".join(i.value for i in at.info)
     assert "출사 2건" in 말, 말
-
-    next(t for t in at.toggle if t.key == "count_bung").set_value(True).run()
-    assert not at.exception, [str(e) for e in at.exception]
-    말 = " ".join(i.value for i in at.info)
-    assert "벙 2건" in 말 and "4건" in 말, 말
+    assert "문화벙 1건" in 말 and "보정벙 1건" in 말, 말
+    for 단서 in ("출사 참석", "모임 참석", "출사 참석률"):
+        assert 단서 in 말, (단서, 말)
 
 
-def test_flipping_the_switch_does_not_reread_the_sheet():
-    """모수 자르기는 시트 읽기 뒤에 한다 — 캐시를 버릴 이유가 없다."""
+def test_there_is_no_scope_toggle_to_get_wrong():
+    """모수를 스위치로 바꾸면 켠 사람과 끈 사람이 다른 숫자를 보고 같은 얘기인
+    줄 안다. 하나로 고정하고 이름으로 구분한다."""
     at = run(stores=make_stores(_mixed()))
-    before = at.session_state["_analysis"]
-    next(t for t in at.toggle if t.key == "count_bung").set_value(True).run()
-    assert not at.exception, [str(e) for e in at.exception]
-    assert at.session_state["_analysis"] is before
+    assert not any(t.key == "count_bung" for t in at.toggle), \
+        [t.key for t in at.toggle]
+
+
+def test_the_member_card_shows_both_totals_side_by_side():
+    """출사만인지 벙까지인지가 사람마다 크게 달라 나란히 놓아야 읽힌다."""
+    at = run(stores=make_stores(_mixed()))
+    labels = [m.label for m in at.metric]
+    for 칸 in ("모임 참석", "출사 참석", "출사 참석률",
+              "문화벙 참석", "보정벙 참석", "출사 개최"):
+        assert 칸 in labels, (칸, labels)
 
 
 def test_hidden_theme_photos_are_reachable_regardless_of_period():
@@ -1063,7 +1064,7 @@ def test_member_focus_has_a_picker_and_draws_that_person():
     # 활동이 없는 사람을 골라 놓고 화면이 빈 줄 모른다.
     assert [o.split(" · ")[0] for o in pick.options] == ["나무", "바다", "하늘"]
     assert all("참석" in o and "사진" in o for o in pick.options)
-    assert "참석률" in [m.label for m in at.metric]
+    assert "출사 참석률" in [m.label for m in at.metric]
 
 
 def test_member_focus_switches_person():

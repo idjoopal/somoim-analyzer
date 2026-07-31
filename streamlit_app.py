@@ -142,8 +142,10 @@ def denom_posts(posts: list[dict], 벙포함: bool) -> list[dict]:
     분모를 열다섯 군데에서 각각 거르면 반드시 어긋난다. 규칙은 여기 한 곳에만
     둔다.
 
-    `벙포함=True`면 지금까지의 동작과 **완전히 같다** — 그게 이 변경이 안전하다는
-    증거다.
+    `벙포함`은 **화면 스위치가 아니다.** 화면은 모수를 하나로 고정하고 숫자마다
+    이름을 달아 구분한다(`출사 참석` / `모임 참석`) — 스위치로 두면 켠 사람과 끈
+    사람이 서로 다른 숫자를 보면서 같은 얘기인 줄 안다. 이 인자는 "벙까지 세면
+    예전 값이 그대로 나온다"를 테스트가 확인하는 이음매로 남긴다.
     """
     if 벙포함:
         return posts
@@ -1124,11 +1126,21 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
                                / _active_months(m.get("joined_at"), months), 2))
                for m in members or [] if m.get("mn")] if months else []
 
-    # ③ 벙 지표 — 스위치와 무관하게 **늘 전량**을 본다.
+    # ③ 벙 지표 — 모수와 무관하게 **늘 전량**을 본다.
+    #
+    # 문화와 보정은 따로 센다. 같은 벙이라도 문화는 클라이밍·전시처럼 나가서
+    # 노는 자리이고 보정은 절반 이상이 온라인이라, 한 덩어리로 묶으면 성향이
+    # 정반대인 두 사람이 같은 숫자로 보인다.
     벙참석: Counter = Counter()
+    문화참석: Counter = Counter()
+    보정참석: Counter = Counter()
     온라인참석: Counter = Counter()
     벙개최: Counter = Counter()
+    모임참석: Counter = Counter()
     for p in posts:
+        if p.get("cat") == "A" and p.get("actually_held"):
+            for n in set(p.get("attendees") or []):
+                모임참석[n] += 1
         if not is_bung(p):
             continue
         if not p.get("is_canceled") and p.get("author"):
@@ -1136,8 +1148,10 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
         if not p.get("actually_held"):
             continue
         온라인 = is_online_bung(p)
+        칸 = 문화참석 if p.get("category") == "문화" else 보정참석
         for n in set(p.get("attendees") or []):
             벙참석[n] += 1
+            칸[n] += 1
             if 온라인:
                 온라인참석[n] += 1
 
@@ -1163,13 +1177,17 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
         "최근": last,
         # ① 휴면도 **원본**으로 — 벙에 꾸준히 나온 사람을 쉰 사람이라 부르면 안 된다.
         "휴면": {r["멤버"] for r in dormant_members(posts, members)},
-        # ③ 벙 — 스위치와 무관하게 전량
+        # ③ 벙 — 모수와 무관하게 전량
         "벙참석": list(벙참석.items()),
         "온라인참석": list(온라인참석.items()),
         "벙개최": list(벙개최.items()),
         "벙참석수": dict(벙참석),
+        "문화참석수": dict(문화참석),
+        "보정참석수": dict(보정참석),
         "온라인참석수": dict(온라인참석),
         "벙개최수": dict(벙개최),
+        # 출사 + 문화벙 + 보정벙 — 이 모임에 나온 **모든** 자리
+        "모임참석수": dict(모임참석),
         "밀도": density,
         "_축": months,
         # 여기서 한 번만 읽는다. 멤버마다 `date.today()`를 부르면 자정을 넘기는
@@ -1359,7 +1377,7 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
     """
     ctx = ctx or club_context(posts, photos, members, 벙포함=벙포함)
     m = next((x for x in members or [] if x.get("mn") == name), {})
-    # 비율·순위가 보는 **모수**. `벙포함`이 켜지면 지금까지와 똑같다.
+    # 비율·순위가 보는 **모수** — 기본은 출사만이다.
     모수 = denom_posts(posts, 벙포함)
     my_posts = [p for p in 모수 if p.get("author") == name]
     # **가입인사는 활동이 아니다** — 이유는 `activity_authors`에 적어 두었다.
@@ -1433,8 +1451,13 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
                       if is_shoot(p) and p.get("author") == name
                       and not p.get("is_canceled")),
         "벙 참석": (ctx.get("벙참석수") or {}).get(name, 0),
+        "문화벙 참석": (ctx.get("문화참석수") or {}).get(name, 0),
+        "보정벙 참석": (ctx.get("보정참석수") or {}).get(name, 0),
         "온라인 벙 참석": (ctx.get("온라인참석수") or {}).get(name, 0),
         "벙 개최": (ctx.get("벙개최수") or {}).get(name, 0),
+        # 출사 + 문화벙 + 보정벙. `참석`은 **출사만**이라 이름이 헷갈리기 쉬워
+        # 둘을 나란히 두고 화면에서 이름으로 구분한다.
+        "모임 참석": (ctx.get("모임참석수") or {}).get(name, 0),
         # `유령`은 **활동 0건이라는 사실 그대로** 둔다. 갓 가입한 사람을 여기서
         # 빼면 칭호가 `유령 회원`과 `아직 첫 출사 전`을 가를 근거를 잃는다.
         # 화면에 "유령"이라 쓸지는 `신입`을 함께 보고 정한다.
@@ -2434,28 +2457,40 @@ def slice_period(analysis: dict, start_ym: int, end_ym: int) -> tuple[list[dict]
 # 렌더링
 # ═══════════════════════════════════════════════════════════════
 
-def render_basis_box(posts: list[dict], photos: list[dict], period_label: str,
-                     벙포함: bool = False) -> None:
+def render_basis_box(posts: list[dict], photos: list[dict],
+                     period_label: str) -> None:
     cov = period_coverage(posts, photos)
     rng = ""
     if cov:
         rng = f" · 실제 데이터 {cov[0].isoformat()} ~ {cov[1].isoformat()}"
-    # **지금 무엇을 세고 있는지 숫자로 적는다.** 이게 없으면 스위치를 켠 사람과
-    # 끈 사람이 서로 다른 숫자를 보면서 같은 얘기인 줄 안다.
+    # **말을 먼저 정하고 숫자를 보여 준다.** `참석`이 무엇을 센 것인지 모르면
+    # 어떤 숫자도 읽을 수 없다. 감추거나 스위치로 바꾸는 대신 셋을 다 적는다.
     출사 = sum(1 for p in posts if is_shoot(p) and p.get("actually_held"))
-    벙 = sum(1 for p in posts if is_bung(p) and p.get("actually_held"))
-    모수말 = (f"출사 {출사}건 + 벙 {벙}건 = **{출사 + 벙}건**" if 벙포함
-            else f"**출사 {출사}건**만 (벙 {벙}건 제외)")
+    문화 = sum(1 for p in posts
+              if p.get("category") == "문화" and p.get("cat") == "A"
+              and p.get("actually_held"))
+    보정 = sum(1 for p in posts
+              if p.get("category") == "보정" and p.get("cat") == "A"
+              and p.get("actually_held"))
+    온 = sum(1 for p in posts if is_online_bung(p) and p.get("actually_held"))
     st.info(
         f"**분석 기준** — 대상 기간: {period_label}{rng}\n\n"
-        f"- **모수**: 참석률·순위·칭호가 보는 진행 건수는 {모수말}. "
-        "화면 위 **벙 스위치**로 바꿉니다 — 벙 전용 지표는 스위치와 무관하게 "
-        "늘 벙 전량을 봅니다\n"
+        f"- **이 기간에 열린 자리**: 출사 **{출사}건** · 문화벙 {문화}건 · "
+        f"보정벙 {보정}건 (보정·문화 중 온라인 {온}건) = 모두 "
+        f"{출사 + 문화 + 보정}건\n"
+        "- **말 정하기** — `출사`는 촬영이 목적인 자리(인물·인물&풍경·풍경·GN)로 "
+        "**이 모임이 가장 중요하게 보는 것**입니다. `문화벙`은 촬영이 곁다리이거나 "
+        "없는 번개(클라이밍·전시·보드게임), `보정벙`은 촬영 없이 모여 사진을 "
+        "다듬는 자리라 절반 이상이 온라인입니다\n"
+        "- **`출사 참석`은 출사만, `모임 참석`은 벙까지** 셉니다. `출사 참석률`은 "
+        f"열린 출사 {출사}건 중 내가 나온 비율이고, **순위·칭호는 출사 기준**입니다 "
+        "— 벙은 따로 셉니다\n"
         "- **기간 기준**: 출사 공지(공지글)는 *출사일*, 후기·가입인사·사진은 *작성일* 기준\n"
         "- **인기**: 좋아요 수(lc)로 정렬, 댓글 수(rn) 병기\n"
-        "- **테마사진 참가**: 댓글이 달린 사진(rn>0)을 테마사진 참여로 간주 — 댓글 내용은 비공개라 *추정*\n"
-        "- **취소(펑)**: 제목에 `(펑)`/`[펑]` 포함 · **출사**: 인물(1:1인물·1:1인물출사 포함)·인물&풍경·풍경·GN / "
-        "**벙**: 보정·문화(제목에 `온라인`이 들어가면 온라인 벙) / 그 밖(`일반공지`·카테고리 미상)은 어느 쪽도 아니라 모수에서 빠집니다",
+        "- **테마사진 참가**: 댓글이 달린 사진(rn>0)을 테마사진 참여로 간주 — 댓글 내용은 비공개라 *추정*. "
+        "사진 업로드는 모임이 앱 상위에 노출되도록 **장려하는 활동**이지 모임의 목적은 아닙니다\n"
+        "- **취소(펑)**: 제목에 `(펑)`/`[펑]` 포함 · **온라인 벙**: 제목에 `온라인` 포함 · "
+        "`일반공지`와 카테고리 미상은 출사도 벙도 아니라 어느 숫자에도 안 들어갑니다",
         icon="ℹ️",
     )
 
@@ -2472,8 +2507,7 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
                    applied: dict[str, int] | None = None,
                    pending: dict[str, int] | None = None,
                    correction_url: str | None = None,
-                   fix_store=None, body_cut: int | None = None,
-                   벙포함: bool = False) -> None:
+                   fix_store=None, body_cut: int | None = None) -> None:
     period = period_label(start_ym, end_ym)
     months = month_axis(start_ym, end_ym)
     st.subheader(f"{period} 인사이트")
@@ -2485,7 +2519,7 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
     if applied and any(applied.values()):
         st.caption(f"📕 보정 시트 적용 — 공지 {applied.get('공지', 0)}건 · "
                    f"참석자 {applied.get('참석자', 0)}건")
-    render_basis_box(posts, photos, period, 벙포함)
+    render_basis_box(posts, photos, period)
 
     duplicates = master.get("duplicates") if isinstance(master, dict) else set()
 
@@ -2514,8 +2548,7 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
                      since_ym=start_ym)
     with tabs[6]:
         _tab_member_focus(posts, photos, members or [], months,
-                          duplicates=duplicates or set(), body_cut=body_cut,
-                          벙포함=벙포함)
+                          duplicates=duplicates or set(), body_cut=body_cut)
 
 
 def render_confidence(posts: list[dict], pending: dict[str, int] | None,
@@ -3424,8 +3457,7 @@ def _tab_members(members: list[dict], posts: list[dict], photos: list[dict],
 def _tab_member_focus(posts: list[dict], photos: list[dict],
                       members: list[dict], months: list[int],
                       duplicates: set[str] | None = None,
-                      body_cut: int | None = None,
-                      벙포함: bool = False) -> None:
+                      body_cut: int | None = None) -> None:
     """🔎 한 사람만 골라서 세로로 보는 화면.
 
     나머지 여섯 탭은 전부 "한 행이 한 사람"인 가로 집계라, 사람 하나를
@@ -3465,8 +3497,8 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
     # `months`를 반드시 넘긴다. 빠뜨리면 `ctx["밀도"]`가 빈 목록이 되어
     # `짧은 기간에 진심`이 아무에게도 안 붙고, `ctx["_축"]`이 None이라
     # `신입` 판정이 늘 False가 되어 `아직 첫 출사 전`도 화면에서 사라진다.
-    ctx = club_context(posts, photos, members, months, 벙포함=벙포함)
-    prof = member_profile(name, posts, photos, members, ctx, 벙포함=벙포함)
+    ctx = club_context(posts, photos, members, months)
+    prof = member_profile(name, posts, photos, members, ctx)
     comp = member_companions(name, posts, ctx["쌍"])
     my_posts = [p for p in posts if p.get("author") == name]
     my_photos = [p for p in photos if p.get("author") == name]
@@ -3496,7 +3528,7 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
 
     # 정원이 있어 한 사람만 따로 낼 수 없다 — 같은 칭호를 몇 명이 받는지
     # 알아야 자르기 때문이다. 전원을 내고 자기 것을 꺼낸다(0.1초대).
-    all_titles = club_titles(posts, photos, members, months, ctx, 벙포함=벙포함)
+    all_titles = club_titles(posts, photos, members, months, ctx)
     titles = all_titles.get(name) or []
     if titles:
         with st.container(border=True):
@@ -3506,25 +3538,36 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
         st.caption("칭호는 **선택한 분석 기간 안의 활동**으로만 매깁니다 — 기간을 "
                    "좁히면 달라집니다. 재미로 붙이는 것이니 너무 진지하게 보지 마세요.")
 
+    # **셋을 나란히 놓고 이름으로 구분한다.** `참석`이 무엇을 센 것인지 감추면
+    # 어떤 숫자도 읽을 수 없다 — 출사만인지 벙까지인지가 사람마다 크게 다르다.
     c = st.columns(5)
-    c[0].metric("참석", prof["참석"],
-                help="모수 설정을 따릅니다 — 벙 스위치가 꺼져 있으면 출사만 셉니다.")
-    c[1].metric("개최한 출사", prof["개최"])
+    c[0].metric("모임 참석", prof["모임 참석"],
+                help="출사 + 문화벙 + 보정벙 — 이 모임에 나온 모든 자리입니다.")
+    c[1].metric("출사 참석", prof["참석"],
+                help="촬영이 목적인 자리(인물·인물&풍경·풍경·GN)만 셉니다. "
+                     "순위와 칭호는 이 숫자를 봅니다.")
+    c[2].metric("출사 참석률", f"{prof['참석률']}%",
+                help=f"이 기간에 열린 출사 {prof['매칭 출사']}건 중 나온 비율. "
+                     "후기가 매칭된 출사만 분모에 넣습니다 — 후기가 없으면 "
+                     "누가 갔는지 알 수 없기 때문입니다.")
+    c[3].metric("문화벙 참석", prof["문화벙 참석"],
+                help="클라이밍·전시·보드게임처럼 촬영이 곁다리이거나 없는 번개.")
+    c[4].metric("보정벙 참석", prof["보정벙 참석"],
+                help=f"촬영 없이 모여 사진을 다듬는 자리. "
+                     f"그중 온라인 {prof['온라인 벙 참석']}회.")
+    c = st.columns(5)
+    c[0].metric("출사 개최", prof["출사 개최"],
+                help="펑이 아닌 출사만. 이 모임은 운영진이 아니어도 출사를 열 수 "
+                     "있고 그것을 지향합니다 — `운영진도 아닌데` 칭호가 보는 숫자입니다.")
+    c[1].metric("벙 개최", prof["벙 개최"])
     c[2].metric("후기", prof["후기"])
-    c[3].metric("사진", prof["사진"])
+    c[3].metric("사진", prof["사진"],
+                help="사진 업로드는 모임이 앱 상위에 노출되도록 장려하는 "
+                     "활동이지 모임의 목적은 아닙니다.")
     c[4].metric("테마사진", prof["테마사진"])
-    # 벙은 스위치와 무관하게 늘 전량이다. 출사 참석 옆에 나란히 둬야
-    # "이 사람은 출사보다 벙"이 한눈에 보인다.
-    if prof["벙 참석"] or prof["벙 개최"]:
-        c = st.columns(5)
-        c[0].metric("벙 참석", prof["벙 참석"],
-                    help="보정·문화. 이 숫자는 벙 스위치와 무관하게 늘 전량입니다.")
-        c[1].metric("└ 온라인", prof["온라인 벙 참석"])
-        c[2].metric("벙 개최", prof["벙 개최"])
-        c[3].metric("출사 개최", prof["출사 개최"],
-                    help="펑이 아닌 출사만. `운영진도 아닌데` 칭호가 보는 숫자입니다.")
     c = st.columns(5)
-    c[0].metric("참석률", f"{prof['참석률']}%")
+    c[0].metric("개최(전체)", prof["개최"],
+                help="펑 포함. 출사와 벙을 합친 수입니다.")
     c[1].metric("첫 등장", prof["첫 등장"])
     c[2].metric("최근 참석", prof["최근 참석"])
     c[3].metric("가입일", prof["가입일"])
@@ -3775,22 +3818,6 @@ def _period_picker(full: tuple[int, int]) -> tuple[int, int]:
         format_func=lambda k: labels[k], key="view_range",
     )
     return axis[i], axis[j]
-
-
-def _scope_picker() -> bool:
-    """벙(보정·문화)을 모수에 넣을지. **기본은 출사만.**
-
-    기간 선택과 나란히 둔다 — 둘 다 "이 화면이 지금 무엇을 보고 있나"를 정하는
-    스위치라 떨어져 있으면 한쪽을 못 보고 숫자를 읽게 된다.
-
-    `_analysis` 캐시는 안 건드린다. 기간 자르기도 모수 자르기도 `load_analysis`
-    **뒤에서** 매 rerun마다 하므로, 토글이 일으킨 rerun이 알아서 다시 센다.
-    """
-    return st.toggle(
-        "벙(보정·문화)도 모수에 넣기", value=False, key="count_bung",
-        help="끄면 참석률·순위·칭호를 **출사**(인물·인물&풍경·풍경·GN)만 셉니다. "
-             "이 모임의 목적이 출사라서 기본은 꺼 둡니다. "
-             "벙 전용 지표는 이 스위치와 무관하게 늘 벙 전량을 봅니다.")
 
 
 def render_sidebar(stores, analysis: dict | None) -> None:
@@ -4106,7 +4133,6 @@ def main() -> None:
 
     view = _period_picker(full)
     st.session_state["_view_range"] = view
-    벙포함 = _scope_picker()
     posts, photos = slice_period(analysis, *view)
     from core.store import relabel_names
     real = analysis.get("real_names")
@@ -4125,8 +4151,7 @@ def main() -> None:
                    pending=analysis.get("pending"),
                    correction_url=sheet_url(stores[1].file_id) if stores else None,
                    fix_store=stores[1] if stores else None,
-                   body_cut=analysis.get("body_cut"),
-                   벙포함=벙포함)
+                   body_cut=analysis.get("body_cut"))
 
 
 
