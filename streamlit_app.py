@@ -1003,6 +1003,10 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
         "휴면": {r["멤버"] for r in dormant_members(posts, members)},
         "밀도": density,
         "_축": months,
+        # 여기서 한 번만 읽는다. 멤버마다 `date.today()`를 부르면 자정을 넘기는
+        # 순간 같은 화면 안에서 사람마다 기준이 갈린다. 테스트는 이 값을
+        # 갈아끼워 경계를 고정한다(`dormant_members(as_of=…)`와 같은 결).
+        "오늘": date.today(),
         "후기저자": {p["id"]: p.get("author")
                   for p in posts if p.get("cat") == "E"},
         # 아래 셋은 칭호가 멤버마다 다시 돌면 O(게시글×참석자)가 되는 것들이다.
@@ -1196,10 +1200,18 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
 
     # **"이 출사에 후기가 있나"가 아니라 "그 후기를 이 사람이 썼나"** 를 센다 —
     # 후기를 반드시 개최자가 쓰는 것은 아니다(매칭은 작성자 일치에 가산점만 준다).
-    # 분모에서 펑을 빼는 이유: 취소된 출사는 애초에 후기를 쓸 일이 없어, 넣으면
-    # 펑을 낸 사람의 후기율이 이유 없이 떨어진다.
+    #
+    # 분모에서 두 가지를 뺀다.
+    #   - **펑**: 취소된 출사는 애초에 후기를 쓸 일이 없다.
+    #   - **아직 안 다녀온 출사**: 다음 주 출사에 후기가 없는 것은 당연한데,
+    #     분모에 넣으면 **공지를 미리 올리는 사람일수록 후기율이 떨어진다.**
+    #
+    # 출사일을 모르는 공지는 남긴다 — 미래라고 볼 근거가 없다.
+    today = (ctx.get("오늘") or date.today()).isoformat()
+    reviewable = [p for p in ran
+                  if not p.get("outing_date") or p["outing_date"] <= today]
     self_reviewed = sum(
-        1 for p in ran
+        1 for p in reviewable
         if ctx["후기저자"].get(p.get("matched_review_id")) == name)
 
     themed = [p for p in my_photos if p.get("has_comment")]
@@ -1223,8 +1235,11 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
         "개최": len(hosted), "개최 취소": len(canceled), "개최 진행": len(ran),
         "취소율": _pct(len(canceled), len(hosted)),
         "후기": len(reviews),
+        # 분모를 함께 싣는다 — 화면 문구와 칭호가 **같은 수**를 쓰게 하려는
+        # 것이다. `개최 진행`으로 나누면 아직 안 다녀온 출사가 섞인다.
+        "자기 출사 후기 분모": len(reviewable),
         "자기 출사 후기": self_reviewed,
-        "자기 출사 후기율": _pct(self_reviewed, len(ran)),
+        "자기 출사 후기율": _pct(self_reviewed, len(reviewable)),
         "게시글 좋아요": sum(p.get("likes", 0) for p in my_posts),
         "사진": len(my_photos),
         "사진 좋아요": likes,
@@ -1272,7 +1287,11 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
 
 TITLE_LIMIT = 3                 # 한 사람에게 붙는 최대 개수
 TITLE_QUOTA_DEFAULT = 9         # 한 칭호를 받을 수 있는 최대 인원
-TITLE_QUOTA = {"관계": 5, "카테고리": 5}    # 갈래별 정원
+TITLE_QUOTA = {"관계": 5, "카테고리": 5, "유일": 1}    # 갈래별 정원
+
+# `아맞다후기`를 받을 수 있는 후기율의 위 끝. 후기는 늘 쓰는 것이 맞으니
+# 여기까지가 "낮다"고 부를 수 있는 선이고, 그보다 잘 쓰면 아무도 안 받는다.
+AWOL_REVIEW_MAX = 80
 
 # 구-감노 시절의 끝. 이 앞에 가입해 지금까지 남아 있는 사람을 가려낸다.
 OLD_CLUB_UNTIL = date(2025, 6, 1)
@@ -1487,15 +1506,28 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
          사실=f"{n_photo}장을 올려 장당 좋아요 {prof['장당 좋아요']}를 받았습니다")
 
     # ── 후기 (자기 출사 후기율의 양 끝) ──────────────────────
+    # 분모는 `개최 진행`이 아니라 **후기를 쓸 수 있었던 출사**다(펑과 아직 안
+    # 다녀온 출사를 뺀 것). 근거에도 그 수를 적어야 조건과 문구가 안 갈라진다.
+    셀만한개최 = prof["자기 출사 후기 분모"]
     # 개최 2건이면 "둘 다 내가 썼다"가 너무 흔하다(실제로 15명이 받았다).
-    if hosted_ran >= 5 and prof["자기 출사 후기율"] >= 100:
+    if 셀만한개최 >= 5 and prof["자기 출사 후기율"] >= 100:
         put("후기", 80, "✍️", "책임감 100만점",
-            f"본인이 연 출사 {hosted_ran}건에 **전부** 직접 후기를 썼습니다 (100%)",
-            hosted_ran)
-    if hosted_ran >= 3 and prof["자기 출사 후기"] == 0:
+            f"본인이 연 출사 {셀만한개최}건에 **전부** 후기를 썼습니다 (100%)",
+            셀만한개최)
+    # 후기를 한 건도 안 쓰는 사람은 실제로 없었다(수령자 0명). 그래서 **가장
+    # 낮은 한 명**을 부르되, 80%를 넘게 쓰는 사람에게 `아맞다후기`는 틀린
+    # 말이라 거기서 끊는다 — 다들 잘 쓰는 해에는 아무도 안 받는다.
+    #
+    # "한 명"은 갈래 `유일`(정원 1)이 만든다. 강도가 후기율의 반대라 제일 낮은
+    # 사람이 제일 강해, 정원이 나머지를 잘라 낸다.
+    if 셀만한개최 >= 3 and prof["자기 출사 후기율"] <= AWOL_REVIEW_MAX:
+        n_wrote = prof["자기 출사 후기"]
         put("후기", 64, "🙈", "아맞다후기",
-            f"출사를 {hosted_ran}건 열었는데 본인이 쓴 후기는 한 건도 없습니다 — "
-            "후기는 다른 분들이 써 주셨네요", hosted_ran)
+            (f"출사를 {셀만한개최}건 열었는데 본인이 쓴 후기는 한 건도 없습니다 — "
+             "후기는 다른 분들이 써 주셨네요") if not n_wrote else
+            (f"연 출사 {셀만한개최}건 중 본인이 후기를 쓴 것은 {n_wrote}건입니다"
+             f"({_pctstr(prof['자기 출사 후기율'])}) — 모임에서 가장 낮습니다"),
+            -prof["자기 출사 후기율"], "유일")
 
     # ── 속도 (날짜 간격) ────────────────────────────────────
     gap = _review_lag(name, posts, ctx)
@@ -1540,7 +1572,7 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     # 쪽으로 잰다.
     floors = ((att, 5), (hosted_ran, 2), (prof["후기"], 2), (n_photo, 5))
     if all(v >= f for v, f in floors):
-        put("종합", 76, "🎭", "골고루 하는 사람",
+        put("종합", 76, "🎭", "틈틈이 골고루",
             f"참석 {att} · 개최 {hosted_ran} · 후기 {prof['후기']} · 사진 {n_photo} — "
             "1등은 없어도 네 가지를 **모두** 하십니다. 흔치 않은 조합입니다",
             min(v / f for v, f in floors))
@@ -1559,10 +1591,10 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
 
     # ── 습관 (취소율의 양 끝) ───────────────────────────────
     if prof["개최"] >= 5 and prof["개최 취소"] == 0:
-        put("습관", 73, "🛡", "펑 한 번 없는 사람",
+        put("습관", 73, "🛡", "펑이 뭐죠?",
             f"출사를 {prof['개최']}건 열면서 펑이 한 번도 없었습니다", prof["개최"])
     if prof["개최"] >= 3 and prof["취소율"] >= 40:
-        put("습관", 60, "💥", "펑의 달인",
+        put("습관", 60, "💥", "그럴만한 이유가...",
             f"연 출사 {prof['개최']}건 중 {prof['개최 취소']}건이 펑 "
             f"({_pctstr(prof['취소율'])}) — 사정이 많으셨나 봅니다", prof["취소율"])
 
@@ -3183,8 +3215,9 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
     # 후기는 쓰고 있나"를 확인하는 것이 한 동작인데, 사이에 표가 끼면 두 번
     # 스크롤해 눈으로 맞춰야 한다.
     st.markdown(f"#### 작성한 후기 ({prof['후기']}건)")
-    if prof["개최 진행"]:
-        st.caption(f"본인이 연 출사 {prof['개최 진행']}건(펑 제외) 중 "
+    if prof["자기 출사 후기 분모"]:
+        st.caption(f"본인이 연 출사 {prof['자기 출사 후기 분모']}건"
+                   "(펑과 아직 안 다녀온 출사 제외) 중 "
                    f"**{prof['자기 출사 후기']}건은 본인이 후기를 썼습니다 "
                    f"({prof['자기 출사 후기율']}%).** 나머지는 다른 사람이 썼거나 "
                    "아직 후기가 없습니다 — 후기를 꼭 개최자가 쓰는 것은 아닙니다.")
@@ -3318,9 +3351,9 @@ FIXED_TITLE_NAMES = [
     "사진 좋아요 1위", "느좋 사진러", "다 아는 사람들 이구먼", "저 신입 아닌데요",
     "책임감 100만점", "아맞다후기", "후기는 따끈할때", "내일 출사가실분?",
     "정출킬러", "소수정예",
-    "소모임에요? 글쎄..", "제가 사진이 좀 많아요", "펑 한 번 없는 사람", "펑의 달인",
+    "소모임에요? 글쎄..", "제가 사진이 좀 많아요", "펑이 뭐죠?", "그럴만한 이유가...",
     "잡식성", "프로 평일러",
-    "골고루 하는 사람", "짧은 기간에 진심",
+    "틈틈이 골고루", "짧은 기간에 진심",
     "아이고 어르신", "첫 출사 못 참지", "새싹", "돌아오세요",
     "아직 첫 출사 전", "유령 회원",
     *CATEGORY_TITLES.values(),

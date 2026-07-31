@@ -839,6 +839,53 @@ def test_self_review_rate_leaves_canceled_outings_out_of_the_denominator():
     assert prof["자기 출사 후기율"] == 100.0
 
 
+def _ctx_on(day, posts, photos, members):
+    """오늘을 고정한 ctx — 미래 판정의 경계를 테스트가 붙잡는다."""
+    from streamlit_app import club_context
+    ctx = club_context(posts, photos, members, [202603])
+    ctx["오늘"] = day
+    return ctx
+
+
+def test_outings_not_yet_held_are_out_of_the_review_denominator():
+    """아직 안 다녀온 출사에 후기가 없는 것은 당연하다.
+
+    분모에 넣으면 **공지를 미리 올리는 사람일수록 후기율이 떨어진다** —
+    부지런한 쪽이 벌을 받는다.
+    """
+    from streamlit_app import member_profile
+    posts = _hosted_with_review("a", "주최", "주최", "01")
+    posts.append(notice("future", "2026-03-28", author="주최", held=False))
+    members = [member("w1", "주최")]
+    ctx = _ctx_on(date(2026, 3, 10), posts, [], members)
+    prof = member_profile("주최", posts, [], members, ctx)
+    assert prof["개최 진행"] == 2, "몇 건 열었나는 미래 출사도 연 것이다"
+    assert prof["자기 출사 후기 분모"] == 1
+    assert prof["자기 출사 후기율"] == 100.0
+
+
+def test_an_outing_already_held_stays_in_the_denominator():
+    """다녀온 뒤로는 후기를 쓸 수 있었으니 분모에 남는다."""
+    from streamlit_app import member_profile
+    posts = _hosted_with_review("a", "주최", "주최", "01")
+    posts.append(notice("done", "2026-03-05", author="주최", held=False))
+    members = [member("w1", "주최")]
+    prof = member_profile("주최", posts, [], members,
+                          _ctx_on(date(2026, 3, 10), posts, [], members))
+    assert prof["자기 출사 후기 분모"] == 2 and prof["자기 출사 후기율"] == 50.0
+
+
+def test_an_outing_with_no_date_stays_in_the_denominator():
+    """날짜를 모르는 것과 미래인 것은 다르다 — 모르면 남긴다."""
+    from streamlit_app import member_profile
+    posts = _hosted_with_review("a", "주최", "주최", "01")
+    posts.append(notice("undated", None, author="주최", held=False))
+    members = [member("w1", "주최")]
+    prof = member_profile("주최", posts, [], members,
+                          _ctx_on(date(2026, 3, 10), posts, [], members))
+    assert prof["자기 출사 후기 분모"] == 2
+
+
 # ═══════════════════════════════════════════════════════════════
 # 상대 기준 — 고정값이면 아무도 못 받거나 전원이 받는다
 # ═══════════════════════════════════════════════════════════════
@@ -1312,7 +1359,7 @@ def test_watcher_and_uploader_are_opposite_ends():
 
 def test_never_canceled_host():
     posts = [_hosted(f"n{i}", "무사고", "%02d" % (i + 1), ["무사고"]) for i in range(5)]
-    assert "펑 한 번 없는 사람" in _cands("무사고", posts, [], [member("w1", "무사고")])
+    assert "펑이 뭐죠?" in _cands("무사고", posts, [], [member("w1", "무사고")])
 
 
 def test_someone_else_writes_the_reviews():
@@ -1323,6 +1370,73 @@ def test_someone_else_writes_the_reviews():
         posts.append(review(f"rn{i}", author="딴사람", matched=f"n{i}"))
     members = [member("w1", "개최만"), member("w2", "딴사람")]
     assert "아맞다후기" in _cands("개최만", posts, [], members)
+
+
+def _host_with_rate(host, opened, wrote, day0):
+    """`opened`건을 열고 그중 `wrote`건만 본인이 후기를 쓴 사람.
+
+    후기 지표만 보려고 **조용하게** 만든다 — 참석자를 안 넣고(참석·동행 칭호
+    없음) 공지와 출사일을 멀리 띄운다(`내일 출사가실분?` 없음).
+    """
+    out = []
+    for i in range(opened):
+        pid = f"{host}{i}"
+        out.append(notice(pid, "2026-03-%02d" % (day0 + i), [], author=host,
+                          posted_at=datetime(2026, 3, 1),
+                          matched_review_id=f"r{pid}"))
+        out.append(review(f"r{pid}", author=host if i < wrote else "딴사람",
+                          matched=pid))
+    return out
+
+
+def test_the_awol_reviewer_is_the_single_lowest_writer():
+    """후기 0건인 사람이 실제로 없어서, **가장 낮은 한 명**을 부른다."""
+    posts = (_host_with_rate("바닥", 4, 1, 11)       # 25%
+             + _host_with_rate("중간", 4, 2, 16))     # 50%
+    members = [member("w1", "바닥"), member("w2", "중간"), member("w3", "딴사람")]
+    got = _club(posts, [], members)
+    assert "아맞다후기" in _names(got["바닥"])
+    assert "아맞다후기" not in _names(got["중간"]), "정원 1 — 한 명만 받는다"
+
+
+def test_the_awol_reviewer_stops_at_eighty_percent():
+    """후기는 늘 쓰는 것이 맞으니 81%인 사람에게 이 이름은 틀린 말이다."""
+    ok = _host_with_rate("잘씀", 5, 4, 11)           # 80% — 받는다
+    members = [member("w1", "잘씀"), member("w2", "딴사람")]
+    assert "아맞다후기" in _cands("잘씀", ok, [], members)
+
+    posts = _host_with_rate("더잘씀", 10, 9, 11)      # 90% — 안 받는다
+    members = [member("w1", "더잘씀"), member("w2", "딴사람")]
+    assert "아맞다후기" not in _cands("더잘씀", posts, [], members)
+
+
+def test_nobody_gets_the_awol_title_when_everyone_writes():
+    """다들 잘 쓰는 해에는 수령자가 없다 — 억지로 한 명을 만들지 않는다."""
+    posts = (_host_with_rate("가", 10, 9, 1) + _host_with_rate("나", 10, 10, 12))
+    members = [member("w1", "가"), member("w2", "나"), member("w3", "딴사람")]
+    got = _club(posts, [], members)
+    assert not any("아맞다후기" in _names(ts) for ts in got.values())
+
+
+def test_the_awol_reason_separates_none_from_some():
+    """"한 건도 없다"와 "3건 중 1건"은 다른 얘기다 — 근거도 달라야 한다."""
+    def 근거(host, opened, wrote, day0):
+        posts = _host_with_rate(host, opened, wrote, day0)
+        members = [member("w1", host), member("w2", "딴사람")]
+        t = next(t for t in _cands_full(host, posts, [], members)
+                 if t["칭호"] == "아맞다후기")
+        return t["근거"]
+    assert "한 건도 없습니다" in 근거("아무것도", 3, 0, 11)
+    assert "가장 낮습니다" in 근거("조금만", 5, 1, 11)
+
+
+def test_the_responsible_host_reason_drops_the_word_directly():
+    """후기는 원래 본인이 쓰는 것이라 '직접'은 당연한 말이다."""
+    posts = _host_with_rate("성실", 5, 5, 11)
+    t = next(t for t in _cands_full("성실", posts, [],
+                                    [member("w1", "성실")])
+             if t["칭호"] == "책임감 100만점")
+    assert "직접" not in t["근거"] and "전부" in t["근거"]
 
 
 def test_the_responsible_host_needs_five_outings_now():
@@ -1376,14 +1490,16 @@ def test_renamed_titles_use_the_new_strings():
                  "기록하는 사람", "혼자가 편한 사람", "터줏대감", "마당발",
                  "매번 초면", "열심 참석러", "좋아요 수집가", "가리지 않는 사람",
                  "감노 때부터 계셨네", "이분 출사는 항상 만석",
-                 "한 달도 안 빠졌네", "한결같은 사람"):
+                 "한 달도 안 빠졌네", "한결같은 사람",
+                 "골고루 하는 사람", "펑 한 번 없는 사람", "펑의 달인"):
         assert gone not in FIXED_TITLE_NAMES, gone
     for now in ("테마사진 프로 참석러", "출사장도 장이다", "심심한데 출사쳐야지",
                 "이게 본업이에요", "여기 제 인스타인데..", "책임감 100만점",
                 "저 신입 아닌데요", "아이고 어르신", "정출킬러", "잡식성",
                 "프로 평일러", "아맞다후기", "후기는 따끈할때", "내일 출사가실분?",
                 "소모임에요? 글쎄..", "제가 사진이 좀 많아요", "첫 출사 못 참지",
-                "다 아는 사람들 이구먼", "사진 좋아요 1위", "느좋 사진러"):
+                "다 아는 사람들 이구먼", "사진 좋아요 1위", "느좋 사진러",
+                "틈틈이 골고루", "펑이 뭐죠?", "그럴만한 이유가..."):
         assert now in FIXED_TITLE_NAMES, now
     assert set(CATEGORY_TITLES.values()) <= set(FIXED_TITLE_NAMES)
 
@@ -1414,7 +1530,7 @@ def test_doing_all_four_things_earns_a_title():
     posts += [review(f"r{i}", author="만능", matched=f"n{i}") for i in range(2)]
     photos = [photo(f"p{i}", "만능") for i in range(5)]
     members = [member("w1", "만능"), member("w2", "남들")]
-    assert "골고루 하는 사람" in _cands("만능", posts, photos, members)
+    assert "틈틈이 골고루" in _cands("만능", posts, photos, members)
 
 
 def test_missing_one_of_the_four_earns_nothing():
@@ -1423,7 +1539,7 @@ def test_missing_one_of_the_four_earns_nothing():
     posts += [notice(f"h{i}", "2026-04-0%d" % (i + 1), ["셋만"], author="셋만")
               for i in range(2)]
     photos = [photo(f"p{i}", "셋만") for i in range(5)]
-    assert "골고루 하는 사람" not in _cands("셋만", posts, photos,
+    assert "틈틈이 골고루" not in _cands("셋만", posts, photos,
                                       [member("w1", "셋만")])
 
 
