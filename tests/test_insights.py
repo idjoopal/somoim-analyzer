@@ -1011,7 +1011,7 @@ def test_a_combo_partner_never_also_gets_the_follower_title():
              for i in range(4)]
     members = [member("w1", "나무"), member("w2", "바다")]
     got = _names(_club(posts, [], members)["나무"])
-    assert "바다와 2인 1조" in got
+    assert "바다님과 2인 1조" in got
     assert not any("오늘도 뵙네요" in t for t in got)
 
 
@@ -1703,8 +1703,8 @@ def test_a_rare_pair_that_always_shows_up_together_is_mutual():
     posts = _spread([(["왼짝", "오른짝"], 4), (["왼짝"], 6),
                      (["오른짝"], 6), (["행인"], 84)])
     got = _bond(posts, _cast("왼짝", "오른짝", "행인"), _BOND_MONTHS)
-    assert got.get("왼짝") == "오른짝과 짜고 나오시나요?", got
-    assert got.get("오른짝") == "왼짝과 짜고 나오시나요?", got
+    assert got.get("왼짝") == "오른짝님과 짜고 나오시나요?", got
+    assert got.get("오른짝") == "왼짝님과 짜고 나오시나요?", got
 
 
 def test_one_sided_affinity_becomes_the_crush_title():
@@ -1785,11 +1785,30 @@ def test_a_sub_one_expectation_drops_the_multiplier():
     assert "5.7배" in 크다 and "1.4회" in 크다, 크다
 
 
-def test_the_particle_matches_the_final_consonant():
-    """`엄태진와`가 아니라 `엄태진과`. 표시 이름에는 괄호·영문이 섞인다."""
-    from streamlit_app import _josa
-    assert _josa("엄태진") == "과"          # 받침 ㄴ
-    assert _josa("바다") == "와"            # 받침 없음
-    assert _josa("Bale(이상현)") == "과"    # 마지막 한글 음절 `현`
-    assert _josa("🍭(김민규)") == "와"      # 마지막 한글 음절 `규`
-    assert _josa("Bale") == "와"            # 한글이 없으면 기본값
+def test_a_name_in_a_title_is_always_followed_by_nim():
+    """사람 이름이 박히는 칭호는 **넷 다 `님`**을 붙인다.
+
+    높임말이라 읽기 좋기도 하지만, 조사가 붙는 자리를 `님`이 대신 받아 주는
+    것이 더 크다 — `님`은 받침이 있어 뒤따르는 조사가 이름과 무관하게 늘
+    `과`로 고정된다. 이름을 그대로 쓰면 `엄태진과`/`바다와`를 갈라 줘야 하고,
+    `Bale(이상현)`처럼 괄호·영문으로 끝나는 표시 이름에서 마지막 한글 음절을
+    찾아내는 판정이 따로 필요해진다.
+    """
+    # 받침 있는 이름(`오른짝`)과 없는 이름(`바다`)을 한 번에 지난다.
+    posts = _spread([(["왼짝", "오른짝"], 4), (["왼짝"], 6),
+                     (["오른짝"], 6), (["행인"], 84)])
+    got = _club(posts, [], _cast("왼짝", "오른짝", "행인"), _BOND_MONTHS)
+    assert "오른짝님과 짜고 나오시나요?" in _names(got["왼짝"]), got["왼짝"]
+
+    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), ["나무", "바다"])
+             for i in range(4)]
+    got = _club(posts, [], _cast("나무", "바다"), [202603])
+    assert "바다님과 2인 1조" in _names(got["나무"]), got["나무"]
+
+    # 어느 칭호든 이름 바로 뒤가 `님`이 아닌 채로 조사가 붙으면 안 된다.
+    for who, ts in got.items():
+        for t in ts:
+            for 조사 in ("와 ", "과 "):
+                if 조사 in t["칭호"]:
+                    앞 = t["칭호"][:t["칭호"].index(조사)]
+                    assert 앞.endswith("님"), t["칭호"]
