@@ -377,6 +377,66 @@ def test_store_open_failure_shows_message_instead_of_crashing():
     assert any("JSON" in e.value for e in at.error)
 
 
+class BoomClient(FakeClient):
+    """읽기만 터지는 시트 — 연동은 됐는데 시트를 못 읽는 상황."""
+
+    def read(self, file_id, tab):
+        raise RuntimeError("HttpError 403: caller does not have permission")
+
+
+def _boom_stores():
+    return (RawStore(BoomClient(), "RAW"), CorrectionStore(BoomClient(), "FIX"))
+
+
+def test_a_failed_sheet_read_tells_the_user_what_to_check():
+    """읽기 실패는 **원인별 진단이 아니라 확인 순서**를 준다.
+
+    구글 API 예외는 같은 원인에도 메시지가 제각각이라 문자열로 갈라 짚으면
+    틀린 쪽을 가리키기 쉽다.
+    """
+    at = run(stores=_boom_stores())
+    assert not at.exception, [str(e) for e in at.exception]
+    말 = " ".join(e.value for e in at.error)
+    assert "읽지 못했습니다" in 말, 말
+    for 단서 in ("새로고침", "공유", "탭"):
+        assert 단서 in 말, (단서, 말)
+
+
+def test_a_failed_read_does_not_tell_the_user_to_go_collect():
+    """시트에 데이터가 멀쩡히 있는 사람에게 "수집하세요"는 엉뚱한 지시다.
+
+    실패와 "아직 안 받음"은 둘 다 `load_analysis`가 None을 돌려주므로,
+    구분하지 않으면 진짜 안내 밑에 어긋나는 말이 하나 더 붙는다.
+    """
+    at = run(stores=_boom_stores())
+    assert not at.exception, [str(e) for e in at.exception]
+    assert not any("수집" in i.value for i in at.info), [i.value for i in at.info]
+
+
+def test_the_guide_points_at_streamlit_own_controls():
+    """복구 수단을 새로 만들지 않고 **Streamlit이 이미 주는 것**을 가리킨다.
+
+    연결은 `@st.cache_resource`라 Rerun·새로고침으로는 안 풀린다 — 서버에
+    캐시돼 세션을 넘어 살아남는다. 그래서 `Clear cache`와 `Reboot app`까지
+    적어야 조치가 끝난다.
+    """
+    at = run(stores=_boom_stores())
+    말 = " ".join(e.value for e in at.error)
+    for 단서 in ("Rerun", "Clear cache", "Reboot app"):
+        assert 단서 in 말, (단서, 말)
+
+
+def test_a_read_failure_clears_once_the_sheet_is_readable_again():
+    """실패 표시가 세션에 눌어붙으면 고친 뒤에도 화면이 안 돌아온다."""
+    at = run(stores=_boom_stores())
+    assert "_read_failed" in at.session_state
+    at.session_state["_stores"] = make_stores(MULTI_YEAR, PHOTOS)
+    at.run()
+    assert not at.exception, [str(e) for e in at.exception]
+    assert "_read_failed" not in at.session_state
+    assert at.tabs                                   # 결과 화면이 돌아온다
+
+
 def test_hidden_theme_photos_are_reachable_regardless_of_period():
     """숨긴 사진 목록은 "내가 뭘 숨겼나"이지 기간별 뷰가 아니다.
 
