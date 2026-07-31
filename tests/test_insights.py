@@ -1011,8 +1011,8 @@ def test_a_combo_partner_never_also_gets_the_follower_title():
              for i in range(4)]
     members = [member("w1", "나무"), member("w2", "바다")]
     got = _names(_club(posts, [], members)["나무"])
-    assert "바다와 환상의 콤비" in got
-    assert not any("출사가세요?" in t for t in got)
+    assert "바다와 2인 1조" in got
+    assert not any("오늘도 뵙네요" in t for t in got)
 
 
 def test_the_follower_title_names_the_person_followed():
@@ -1026,7 +1026,7 @@ def test_the_follower_title_names_the_person_followed():
     posts += [notice(f"t{i}", "2026-05-%02d" % (i + 1), ["남들"])
               for i in range(3)]
     members = [member("w1", "따라"), member("w2", "인기"), member("w3", "남들")]
-    assert "인기님 출사가세요?" in _names(_club(posts, [], members)["따라"])
+    assert "인기님 오늘도 뵙네요" in _names(_club(posts, [], members)["따라"])
 
 
 def test_nobody_follows_the_person_who_goes_to_everything():
@@ -1040,7 +1040,7 @@ def test_nobody_follows_the_person_who_goes_to_everything():
     members = [member("w0", "항상")] + [member(f"w{i+1}", p)
                                        for i, p in enumerate(people)]
     for p in people:
-        assert not any("출사가세요?" in t for t in _names(_club(posts, [], members)[p]))
+        assert not any("오늘도 뵙네요" in t for t in _names(_club(posts, [], members)[p]))
 
 
 def test_a_category_regular_is_measured_against_that_categorys_outings():
@@ -1225,7 +1225,7 @@ def test_the_tiebreak_is_stable_across_runs():
 
 
 def test_relationship_titles_have_a_tighter_quota():
-    """`○○님 출사가세요?`는 다섯 명까지 — 한 사람에게 17명이 붙은 적이 있다."""
+    """`○○님 오늘도 뵙네요`는 다섯 명까지 — 한 사람에게 17명이 붙은 적이 있다."""
     from streamlit_app import TITLE_QUOTA
 
     # 팬 여덟이 인기가 가는 날만 골라 네 번씩 나온다. 팬끼리는 최대 세 번만
@@ -1241,7 +1241,7 @@ def test_relationship_titles_have_a_tighter_quota():
                + [member(f"w{j}", f) for j, f in enumerate(fans)])
     got = _club(posts, [], members, [202603, 202604])
     followers = sum(1 for ts in got.values()
-                    for t in ts if t["칭호"] == "인기님 출사가세요?")
+                    for t in ts if t["칭호"] == "인기님 오늘도 뵙네요")
     assert 0 < followers <= TITLE_QUOTA["관계"], followers
 
 
@@ -1622,3 +1622,174 @@ def test_every_reason_says_more_than_a_bare_number():
             # 조사·서술어가 있어야 문장이다 — `참석 13 · 사진 18` 같은
             # 나열만으로는 기준을 알 수 없다.
             assert any(k in 근거 for k in ("니다", "입니다", "요", "습니")), t
+
+
+# ═══════════════════════════════════════════════════════════════
+# 💞 인연 — 우연 대비(lift)
+# ═══════════════════════════════════════════════════════════════
+
+def _bond(posts, members, months=None):
+    """전 멤버의 인연 칭호만 `{이름: 칭호}`로 추린다."""
+    got = _club(posts, [], members, months)
+    return {n: t["칭호"] for n, ts in got.items() for t in ts
+            if "짜고 나오시나요" in t["칭호"] or "알림 켜두셨죠" in t["칭호"]}
+
+
+# 인연은 **전체 출사 수가 분모**라 열 건짜리 표본으로는 재지지 않는다.
+# 아래 픽스처는 100건을 네 달에 흩어 만든다.
+_BOND_MONTHS = [202603, 202604, 202605, 202606]
+
+
+def _spread(seq):
+    """`[(참석자, 건수), …]` → 날짜가 안 겹치는 공지 100건."""
+    out = []
+    for att, n in seq:
+        for _ in range(n):
+            i = len(out)
+            out.append(notice(f"n{i:03d}",
+                              "2026-%02d-%02d" % (3 + i // 28, i % 28 + 1),
+                              list(att)))
+    return out
+
+
+def _cast(*names):
+    return [member(f"w{i}", n) for i, n in enumerate(names)]
+
+
+def test_a_thin_sample_is_discounted_more_than_a_thick_one():
+    """3회 100%와 30회 100%는 관측 비율이 같지만 믿을 만한 정도가 다르다.
+
+    하한을 안 쓰면 두세 번 만난 쌍이 순위를 다 차지한다.
+    """
+    from streamlit_app import _wilson_low
+    assert _wilson_low(3, 3) < _wilson_low(30, 30)
+    assert _wilson_low(30, 30) < 1.0          # 100%여도 1에는 못 닿는다
+    assert _wilson_low(0, 0) == 0.0           # 참석 0인 사람에서 안 터진다
+
+
+def test_lift_divides_out_the_chance_of_meeting_at_all():
+    """`lift`는 "우연히 겹칠 때보다 몇 배"다 — 상대의 출석률로 나눈다."""
+    from streamlit_app import _affinity
+    # 전체 10건 중 나 4건, 상대 5건 → 우연이라면 2회 겹친다.
+    a = _affinity(4, 4, 5, 10)
+    assert a["기대"] == 2.0
+    assert a["lift"] == 2.0                   # 4회 겹쳤으니 우연의 두 배
+    assert _affinity(0, 0, 5, 10)["lift"] == 0.0    # 0으로 안 나눈다
+
+
+def test_the_person_who_goes_to_everything_is_never_the_affinity_top():
+    """실데이터 회귀 — 서동훈↔엄태진은 69회 함께지만 우연의 1.18배다.
+
+    함께 간 **횟수**로만 고르면 이런 쌍이 늘 1등이 된다. 그게 이 칭호를
+    따로 만든 이유이므로, 못 받는 것을 못 박아 둔다.
+    """
+    # 둘 다 20건 중 18건에 나온다 → 겹치는 게 당연하다.
+    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), ["항상", "노상", f"뜨내기{i}"])
+             for i in range(18)]
+    posts += [notice(f"x{i}", "2026-04-%02d" % (i + 1), [f"뜨내기{i}"])
+              for i in range(2)]
+    members = ([member("w0", "항상"), member("w1", "노상")]
+               + [member(f"t{i}", f"뜨내기{i}") for i in range(18)])
+    got = _bond(posts, members, [202603, 202604])
+    assert "항상" not in got and "노상" not in got, got
+
+
+def test_a_rare_pair_that_always_shows_up_together_is_mutual():
+    """네 번뿐이어도 **우연이라면 한 번** 겹칠 사이면 우연이 아니다.
+
+    둘 다 100건 중 10건에만 나오므로 기대 겹침은 1.0회다. 서로에게 40%씩이라
+    `2인 1조`(양쪽 50%)에는 못 미치는 — 횟수로는 안 보이는 쌍이다.
+    """
+    posts = _spread([(["왼짝", "오른짝"], 4), (["왼짝"], 6),
+                     (["오른짝"], 6), (["행인"], 84)])
+    got = _bond(posts, _cast("왼짝", "오른짝", "행인"), _BOND_MONTHS)
+    assert got.get("왼짝") == "오른짝과 짜고 나오시나요?", got
+    assert got.get("오른짝") == "왼짝과 짜고 나오시나요?", got
+
+
+def test_one_sided_affinity_becomes_the_crush_title():
+    """내 1순위인데 **상대의 1순위는 내가 아니면** 짝사랑이다."""
+    # 스타는 20건에 나온다. 단짝은 그중 12건에 늘 붙어 다녀 스타의 1순위이고,
+    # 팬은 자기 10건 중 8건을 스타 옆에서 보내지만 스타에게는 두 번째다.
+    posts = _spread([(["스타", "단짝"], 12), (["스타", "팬"], 8),
+                     (["팬"], 2), (["행인"], 78)])
+    got = _bond(posts, _cast("스타", "단짝", "팬", "행인"), _BOND_MONTHS)
+    assert got.get("팬") == "스타님 알림 켜두셨죠?", got
+    assert "알림" not in got.get("스타", ""), got
+
+
+def test_a_crush_needs_half_of_my_own_outings():
+    """내 1순위여도 내 출사의 일부면 "따라다닌다"고 할 수 없다."""
+    # 팬은 25건에 나오는데 스타와는 3건뿐 — 우연 대비로는 높아도 8%다.
+    posts = _spread([(["스타", "팬"], 3), (["스타", "단짝"], 12),
+                     (["팬"], 22), (["행인"], 63)])
+    assert "팬" not in _bond(posts, _cast("스타", "단짝", "팬", "행인"),
+                            _BOND_MONTHS)
+
+
+def test_the_combo_partner_gets_no_second_heart_for_the_same_person():
+    """같은 이름으로 💞가 두 번 붙으면 한 칸을 낭비한다 — 실데이터 3명.
+
+    **짝사랑으로 흘러내려도 안 된다.** 서로가 서로를 1순위로 꼽는 쌍인데
+    "정작 이분의 1순위는 따로 있고요"라고 하면 거짓말이 된다.
+    """
+    posts = [notice(f"n{i}", "2026-03-%02d" % (i + 1), ["나무", "바다"])
+             for i in range(4)]
+    posts += [notice(f"o{i}", "2026-04-%02d" % (i + 1), ["남들"])
+              for i in range(8)]
+    members = [member("w1", "나무"), member("w2", "바다"), member("w3", "남들")]
+    got = _club(posts, [], members, [202603, 202604])
+    for who in ("나무", "바다"):
+        names = _names(got[who])
+        assert any("2인 1조" in t for t in names), names
+        assert not any("짜고 나오시나요" in t for t in names), names
+        assert not any("알림 켜두셨죠" in t for t in names), names
+
+
+def test_the_two_metrics_can_name_two_different_people():
+    """`동행`과 `인연`은 지표가 달라 서로 자리를 안 뺏는다.
+
+    실데이터에서 둘 다 받는 14명 중 11명은 상대가 다르다 — 이게 이 칭호를
+    더한 이유다. 따라의 **최다 동행은 인기**(14회)지만, 인기는 100건 중
+    40건에 나오니 겹치는 게 당연하다. 우연 대비 1순위는 여섯 번만 나오는
+    **숨은짝**이다.
+    """
+    posts = _spread([(["인기", "따라"], 14), (["숨은짝", "따라"], 5),
+                     (["따라"], 1), (["인기"], 26), (["숨은짝"], 1),
+                     (["행인"], 53)])
+    names = _names(_club(posts, [], _cast("인기", "따라", "숨은짝", "행인"),
+                         _BOND_MONTHS)["따라"])
+    assert "인기님 오늘도 뵙네요" in names, names
+    assert any("숨은짝" in t and "짜고" in t for t in names), names
+
+
+def test_the_reason_explains_the_multiplier_in_plain_words():
+    """`lift 5.7`은 아무 뜻이 없다 — **기대 겹침 횟수**로 바꿔 적는다."""
+    posts = _spread([(["왼짝", "오른짝"], 4), (["왼짝"], 6),
+                     (["오른짝"], 6), (["행인"], 84)])
+    t = next(t for t in _club(posts, [], _cast("왼짝", "오른짝", "행인"),
+                              _BOND_MONTHS)["왼짝"] if "짜고" in t["칭호"])
+    assert "lift" not in t["근거"].lower(), t["근거"]
+    assert "겹" in t["근거"], t["근거"]
+
+
+def test_a_sub_one_expectation_drops_the_multiplier():
+    """"한 번도 안 겹쳤을 법한데 18.8배"는 앞뒤가 어긋나 보인다.
+
+    기대가 1회 미만이면 배수를 빼고 **실제 횟수**로 말한다.
+    """
+    from streamlit_app import _chance_phrase
+    작다 = _chance_phrase({"기대": 0.2, "lift": 18.8, "함께": 3})
+    assert "배" not in 작다 and "3회" in 작다, 작다
+    크다 = _chance_phrase({"기대": 1.4, "lift": 5.7, "함께": 8})
+    assert "5.7배" in 크다 and "1.4회" in 크다, 크다
+
+
+def test_the_particle_matches_the_final_consonant():
+    """`엄태진와`가 아니라 `엄태진과`. 표시 이름에는 괄호·영문이 섞인다."""
+    from streamlit_app import _josa
+    assert _josa("엄태진") == "과"          # 받침 ㄴ
+    assert _josa("바다") == "와"            # 받침 없음
+    assert _josa("Bale(이상현)") == "과"    # 마지막 한글 음절 `현`
+    assert _josa("🍭(김민규)") == "와"      # 마지막 한글 음절 `규`
+    assert _josa("Bale") == "와"            # 한글이 없으면 기본값
