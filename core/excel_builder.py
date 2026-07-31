@@ -524,7 +524,7 @@ def _build_sheet_outings(wb, posts_A):
         ws.append([
             od, pd_, dday_str, p["author"],
             p["category"] or "-",
-            "출사" if p["is_outing"] else "활동",
+            "출사" if p["is_outing"] else "벙",
             "취소" if p["is_canceled"] else "진행",
             p["title"], p["likes"], p["comments"],
         ])
@@ -558,7 +558,7 @@ def _build_sheet_reviews(wb, posts_E):
         ws.append([
             p["posted_at"].strftime("%Y-%m-%d"), p["posted_at"].strftime("%Y-%m"),
             p["author"], p["category"] or "-",
-            "출사" if p["is_outing"] else "활동",
+            "출사" if p["is_outing"] else "벙",
             p["title"], p["likes"], p["comments"],
         ])
         bg = C["REVIEW"] if r % 2 == 0 else C["WHITE"]
@@ -791,7 +791,7 @@ def _build_sheet_categories(wb, posts_A, months):
             continue
         rows.append((
             c,
-            "출사" if c in OUTING_CATS else "활동",
+            "출사" if c in OUTING_CATS else "벙",
             len(sub),
             sum(1 for p in sub if not p["is_canceled"]),
             sum(1 for p in sub if p["is_canceled"]),
@@ -997,7 +997,7 @@ def _build_sheet_insights(wb, posts, posts_A, posts_E, posts_active, posts_cance
         if not cnt:
             continue
         pct = cnt / total_cat * 100 if total_cat else 0
-        kind = "출사" if cat in OUTING_CATS else "활동"
+        kind = "출사" if cat in OUTING_CATS else "벙"
         r = row(f"[{cat}]", f"{cnt}건 ({pct:.1f}%)", kind, r)
 
     r += 1

@@ -922,14 +922,15 @@ def test_bottom_share_finds_the_quiet_end():
 # 🏆 칭호
 # ═══════════════════════════════════════════════════════════════
 
-def _club(posts, photos, members, months=None):
+def _club(posts, photos, members, months=None, 벙포함=False):
     """(이름 → 칭호 목록). 화면이 부르는 것과 같은 함수를 쓴다.
 
     **정원이 있어 한 사람만 따로 낼 수 없다** — 같은 칭호를 몇 명이 받는지
     알아야 자르기 때문에 전원을 함께 낸다.
     """
     from streamlit_app import club_titles
-    return club_titles(posts, photos, members, months or [202603])
+    return club_titles(posts, photos, members, months or [202603],
+                       벙포함=벙포함)
 
 
 def _names(titles):
@@ -1812,3 +1813,205 @@ def test_a_name_in_a_title_is_always_followed_by_nim():
                 if 조사 in t["칭호"]:
                     앞 = t["칭호"][:t["칭호"].index(조사)]
                     assert 앞.endswith("님"), t["칭호"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🎯 출사와 벙 — 이 모임이 무엇을 하러 모이나
+# ═══════════════════════════════════════════════════════════════
+
+def _bung(pid, day, attendees, *, cat="보정", title=None, **kw):
+    """벙 공지. 제목에 `온라인`을 넣으면 온라인 벙이 된다."""
+    return notice(pid, day, attendees, category=cat,
+                  title=title or f"[{cat}] {pid}", **kw)
+
+
+def test_online_is_read_from_the_title_not_stored():
+    """저장하면 `POST_KEYS`가 늘어 raw 시트 스키마가 바뀐다 — 제목에서 읽는다."""
+    from core.collector import is_online_title
+    assert is_online_title("07.28.(화) [보정] 온라인 보정벙")
+    assert is_online_title("10.14(화) [보정]온라인보정벙")      # 붙여쓰기
+    assert is_online_title("[온라인] 보정")                     # 괄호
+    assert is_online_title("온 라인 보정")                      # 띄어쓰기
+    assert not is_online_title("10.15 (수) [보정] 이수 보정벙")  # 장소명
+    assert not is_online_title("")
+    assert not is_online_title(None)
+
+
+def test_the_scope_filter_touches_notices_only():
+    """후기·가입인사까지 빼면 후기율·연차 칭호가 벙 스위치에 흔들린다.
+
+    후기를 쓴 사실은 그 글이 출사 후기냐 벙 후기냐와 무관하다.
+    """
+    from streamlit_app import denom_posts
+    posts = [notice("n1", "2026-03-01", ["나무"]),
+             _bung("b1", "2026-03-02", ["나무"]),
+             review("r1", ["나무"]),
+             {"id": "j1", "cat": "J", "author": "나무",
+              "posted_at": datetime(2026, 3, 3), "title": "가입인사"}]
+    좁힘 = denom_posts(posts, False)
+    assert [p["id"] for p in 좁힘] == ["n1", "r1", "j1"]     # 벙만 빠진다
+    assert denom_posts(posts, True) == posts                # 켜면 지금과 같다
+
+
+def test_a_notice_that_is_neither_shoot_nor_bung_leaves_the_scope():
+    """`일반공지`·카테고리 미상은 출사도 벙도 아니다 — 모수에서 뺀다.
+
+    무엇인지 모르는 공지가 참석률 분모에 있으면 그 비율이 뜻을 잃는다.
+    """
+    from streamlit_app import denom_posts, is_bung, is_shoot
+    일반 = notice("g1", "2026-03-01", ["나무"], category="일반공지")
+    미상 = notice("u1", "2026-03-02", ["나무"], category=None)
+    assert not is_shoot(일반) and not is_bung(일반)
+    assert not is_shoot(미상) and not is_bung(미상)
+    assert denom_posts([일반, 미상], False) == []
+
+
+def test_dropping_bung_changes_the_attendance_denominator():
+    """실데이터에서 참석률 순위가 여섯 계단까지 움직인 바로 그 효과."""
+    from streamlit_app import member_profile
+    posts = [notice("n1", "2026-03-01", ["출사러", "벙러"]),
+             notice("n2", "2026-03-02", ["출사러"]),
+             _bung("b1", "2026-03-03", ["벙러"]),
+             _bung("b2", "2026-03-04", ["벙러"], cat="문화")]
+    members = [member("w1", "출사러"), member("w2", "벙러")]
+
+    끔 = member_profile("출사러", posts, [], members)
+    assert (끔["매칭 출사"], 끔["참석률"]) == (2, 100.0)
+    켬 = member_profile("출사러", posts, [], members, 벙포함=True)
+    assert (켬["매칭 출사"], 켬["참석률"]) == (4, 50.0)
+
+    # 벙러는 반대로 움직인다 — 스위치를 끄면 분모도 분자도 준다.
+    assert member_profile("벙러", posts, [], members)["참석"] == 1
+    assert member_profile("벙러", posts, [], members,
+                          벙포함=True)["참석"] == 3
+
+
+def test_bung_only_attendees_are_not_ghosts():
+    """벙에만 나온 사람이 스위치 하나로 유령이 되면 안 된다.
+
+    실데이터에 정확히 그런 분이 있다 — 출사 0회, 벙 1회.
+    """
+    from streamlit_app import club_context, member_profile
+    posts = [notice("n1", "2026-03-01", ["출사러"]),
+             _bung("b1", "2026-03-02", ["벙러", "출사러"])]
+    members = [member("w1", "출사러"), member("w2", "벙러")]
+    ctx = club_context(posts, [], members, [202603])
+    prof = member_profile("벙러", posts, [], members, ctx)
+    assert prof["벙 참석"] == 1
+    assert prof["참석"] == 0          # 출사 모수로는 0회가 맞다
+    assert not prof["유령"]           # 그렇다고 유령은 아니다
+    assert "벙러" not in ctx["휴면"]   # 휴면도 아니다
+
+
+def test_bung_metrics_ignore_the_switch():
+    """벙 지표는 벙 스위치와 무관하게 늘 전량을 본다."""
+    from streamlit_app import club_context
+    posts = [notice("n1", "2026-03-01", ["나무"]),
+             _bung("b1", "2026-03-02", ["나무"],
+                   title="[보정] 온라인 보정벙"),
+             _bung("b2", "2026-03-03", ["나무"], cat="문화")]
+    members = [member("w1", "나무")]
+    for 벙포함 in (False, True):
+        ctx = club_context(posts, [], members, [202603], 벙포함=벙포함)
+        assert ctx["벙참석수"]["나무"] == 2
+        assert ctx["온라인참석수"]["나무"] == 1
+
+
+def test_the_category_denominator_is_never_filtered():
+    """벙을 빼면 `모여서 보정하실 분?`·`문화?시민`이 **영영 0명**이 된다.
+
+    카테고리 칭호는 비율이라 자기 분모를 스스로 들고 있어 출사 모수와 안 섞인다.
+    """
+    from streamlit_app import club_context
+    posts = [notice(f"n{i}", "2026-03-0%d" % (i + 1), ["나무"])
+             for i in range(4)]
+    posts += [_bung(f"b{i}", "2026-03-1%d" % i, ["나무"]) for i in range(4)]
+    ctx = club_context(posts, [], [member("w1", "나무")], [202603])
+    assert ctx["카테고리총계"]["보정"] == 4      # 스위치가 꺼져 있어도 센다
+    assert ctx["전체참석수"]["나무"] == 8        # 문턱이 읽는 안 걸러진 참석 수
+
+
+def test_a_bung_regular_gets_a_title_of_their_own():
+    """참석의 40% 이상이 벙이면 그 사실이 그 사람다운 얘기다."""
+    # 벙 4 / 출사 6 = 40% — 경계에서 붙는다.
+    posts = [notice(f"n{i}", "2026-03-0%d" % (i + 1), ["벙러", "남들"])
+             for i in range(6)]
+    posts += [_bung(f"b{i}", "2026-03-1%d" % i, ["벙러"]) for i in range(4)]
+    members = [member("w1", "벙러"), member("w2", "남들")]
+    got = _names(_club(posts, [], members, [202603])["벙러"])
+    assert "카메라는 두고 왔어요" in got, got
+
+
+def test_a_bung_regular_below_the_share_gets_nothing():
+    """벙 3회여도 내 참석의 3분의 1이면 그냥 가끔 가는 것이다."""
+    posts = [notice(f"n{i}", "2026-03-0%d" % (i + 1), ["벙러"])
+             for i in range(6)]
+    posts += [_bung(f"b{i}", "2026-03-1%d" % i, ["벙러"]) for i in range(3)]
+    got = _names(_club(posts, [], [member("w1", "벙러")], [202603])["벙러"])
+    assert "카메라는 두고 왔어요" not in got, got
+
+
+def test_online_beats_plain_bung_for_the_same_person():
+    """둘 다 해당하면 더 특수한 쪽만 뜬다 — 같은 지표라 하나만 붙는다."""
+    posts = [notice(f"n{i}", "2026-03-0%d" % (i + 1), ["집순이"])
+             for i in range(6)]
+    posts += [_bung(f"b{i}", "2026-03-1%d" % i, ["집순이"],
+                    title=f"[보정] 온라인 보정벙 {i}") for i in range(4)]
+    got = _names(_club(posts, [], [member("w1", "집순이")], [202603])["집순이"])
+    assert "집에서 뵙겠습니다" in got, got
+    assert "카메라는 두고 왔어요" not in got, got
+
+
+def test_a_non_admin_who_hosts_is_recognised():
+    """운영진이 아닌데 출사를 여는 것 — 이 모임이 바라는 바다."""
+    posts = [notice(f"n{i}", "2026-03-0%d" % (i + 1), ["나무", "바다"],
+                    author="나무") for i in range(2)]
+    posts += [notice(f"m{i}", "2026-03-1%d" % i, ["나무", "바다"],
+                     author="바다") for i in range(2)]
+    members = [member("w1", "나무"), member("w2", "바다", is_admin=True)]
+    got = _club(posts, [], members, [202603])
+    assert "운영진도 아닌데" in _names(got["나무"]), got["나무"]
+    assert "운영진도 아닌데" not in _names(got["바다"]), got["바다"]
+
+
+def test_hosting_a_bung_is_not_hosting_an_outing():
+    """`운영진도 아닌데`는 **출사** 개최만 센다.
+
+    `개최 진행`을 그대로 쓰면 스위치를 켰을 때 보정·문화 벙이 섞여, 출사를
+    여는 사람을 알아보자는 칭호가 벙만 연 사람에게 붙는다(실측에서 그랬다).
+    """
+    posts = [_bung(f"b{i}", "2026-03-0%d" % (i + 1), ["벙주", "남들"],
+                   author="벙주") for i in range(3)]
+    posts += [notice("n1", "2026-03-20", ["남들"], author="남들")]
+    members = [member("w1", "벙주"), member("w2", "남들")]
+    for 벙포함 in (False, True):
+        got = _club(posts, [], members, [202603], 벙포함=벙포함)
+        assert "운영진도 아닌데" not in _names(got["벙주"]), (벙포함, got["벙주"])
+
+
+def test_hosting_outranks_attending():
+    """이 모임은 개최 부담을 나눠 지는 것을 참석보다 귀하게 본다."""
+    from streamlit_app import _title_candidates, club_context, member_profile
+    # `tier`는 개최·참석 **양쪽** 모수가 4명 이상이어야 1등을 인정한다.
+    넷 = ["주최", "손님", "셋째", "넷째"]
+    posts = [notice(f"n{i}", "2026-03-0%d" % (i + 1), 넷, author="주최")
+             for i in range(4)]
+    posts += [notice(f"x{i}", "2026-03-1%d" % i, 넷, author=who)
+              for i, who in enumerate(넷[1:])]
+    members = [member(f"w{i}", n) for i, n in enumerate(넷)]
+    ctx = club_context(posts, [], members, [202603])
+    prof = member_profile("주최", posts, [], members, ctx)
+    cands = _title_candidates("주최", prof, [], posts, [], [202603], ctx)
+    개최 = next(t for t in cands if t["지표"] == "개최")
+    참석 = next(t for t in cands if t["지표"] == "참석")
+    assert 개최["우선"] > 참석["우선"], (개최, 참석)
+
+
+def test_the_switch_on_reproduces_todays_numbers():
+    """스위치를 켠 상태가 **지금 동작과 같다** — 이 변경이 안전하다는 증거다."""
+    from streamlit_app import club_context, denom_posts
+    posts = [notice("n1", "2026-03-01", ["나무"]),
+             _bung("b1", "2026-03-02", ["나무"])]
+    assert denom_posts(posts, True) == posts
+    ctx = club_context(posts, [], [member("w1", "나무")], [202603], 벙포함=True)
+    assert dict(ctx["참석"])["나무"] == 2       # 벙까지 세던 예전 값

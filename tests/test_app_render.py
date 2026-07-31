@@ -437,6 +437,52 @@ def test_a_read_failure_clears_once_the_sheet_is_readable_again():
     assert at.tabs                                   # 결과 화면이 돌아온다
 
 
+# ═══════════════════════════════════════════════════════════════
+# 🎯 벙 스위치
+# ═══════════════════════════════════════════════════════════════
+
+def _mixed():
+    """진행된 출사 2건 · 벙 2건. 스위치에 따라 모수가 2 ↔ 4로 갈린다.
+
+    `actually_held`는 후기가 매칭돼야 서므로 공지마다 후기를 하나씩 붙인다.
+    """
+    out = []
+    for i, cat in enumerate(["풍경", "인물", "보정", "문화"]):
+        out.append(notice(f"p{i}", "2026-03-0%d" % (i + 1), category=cat))
+        out.append(review(f"pr{i}", datetime(2026, 3, i + 2, 9, 0)))
+    return out
+
+
+def test_the_bung_switch_exists_and_defaults_to_shoots_only():
+    """이 모임의 목적은 출사다 — 기본은 벙을 뺀 채로 센다."""
+    at = run(stores=make_stores(_mixed()))
+    assert not at.exception, [str(e) for e in at.exception]
+    tog = next(t for t in at.toggle if t.key == "count_bung")
+    assert tog.value is False
+    assert "벙" in tog.label
+
+
+def test_flipping_the_switch_changes_what_is_counted():
+    """스위치가 실제로 분모를 바꾼다 — 안내문의 숫자로 확인한다."""
+    at = run(stores=make_stores(_mixed()))
+    말 = " ".join(i.value for i in at.info)
+    assert "출사 2건" in 말, 말
+
+    next(t for t in at.toggle if t.key == "count_bung").set_value(True).run()
+    assert not at.exception, [str(e) for e in at.exception]
+    말 = " ".join(i.value for i in at.info)
+    assert "벙 2건" in 말 and "4건" in 말, 말
+
+
+def test_flipping_the_switch_does_not_reread_the_sheet():
+    """모수 자르기는 시트 읽기 뒤에 한다 — 캐시를 버릴 이유가 없다."""
+    at = run(stores=make_stores(_mixed()))
+    before = at.session_state["_analysis"]
+    next(t for t in at.toggle if t.key == "count_bung").set_value(True).run()
+    assert not at.exception, [str(e) for e in at.exception]
+    assert at.session_state["_analysis"] is before
+
+
 def test_hidden_theme_photos_are_reachable_regardless_of_period():
     """숨긴 사진 목록은 "내가 뭘 숨겼나"이지 기간별 뷰가 아니다.
 
