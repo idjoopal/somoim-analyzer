@@ -6,6 +6,8 @@
 
 from datetime import date, datetime, timedelta
 
+import pytest
+
 from core.store import (
     TAB_ATTENDEE_FIX,
     TAB_MEMBER_NAMES,
@@ -14,7 +16,7 @@ from core.store import (
 )
 from streamlit_app import (
     BADGE_TITLES,
-    FIXED_TITLE_NAMES,
+    TITLE_RULES,
     TITLE_LIMIT,
     avg_attendance_trend,
     co_attendance,
@@ -1357,8 +1359,9 @@ def test_only_period_proof_titles_are_badges():
     """
     assert "첫 출사 못 참지" not in BADGE_TITLES
     assert "새싹" not in BADGE_TITLES
-    assert BADGE_TITLES <= set(FIXED_TITLE_NAMES), \
-        BADGE_TITLES - set(FIXED_TITLE_NAMES)
+    from streamlit_app import known_title_names
+    assert BADGE_TITLES <= known_title_names(), \
+        BADGE_TITLES - known_title_names()
 
 
 def test_badge_titles_come_first():
@@ -1666,14 +1669,15 @@ def test_old_timer_does_not_change_when_the_period_narrows():
 
 
 def test_renamed_titles_use_the_new_strings():
-    from streamlit_app import CATEGORY_TITLES, FIXED_TITLE_NAMES
+    from streamlit_app import CATEGORY_TITLES, known_title_names
+    이름들 = known_title_names()
     for gone in ("테마 단골", "판을 여는 사람", "자주 여는 사람", "개근왕", "다작왕",
                  "기록하는 사람", "혼자가 편한 사람", "터줏대감", "마당발",
                  "매번 초면", "열심 참석러", "좋아요 수집가", "가리지 않는 사람",
                  "감노 때부터 계셨네", "이분 출사는 항상 만석",
                  "한 달도 안 빠졌네", "한결같은 사람",
                  "골고루 하는 사람", "펑 한 번 없는 사람", "펑의 달인"):
-        assert gone not in FIXED_TITLE_NAMES, gone
+        assert gone not in 이름들, gone
     for now in ("테마사진 프로 참석러", "출사장도 장이다", "심심한데 출사쳐야지",
                 "이게 본업이에요", "여기 제 인스타인데..", "책임감 100만점",
                 "저 신입 아닌데요", "아이고 어르신", "정출킬러", "잡식성",
@@ -1681,16 +1685,16 @@ def test_renamed_titles_use_the_new_strings():
                 "소모임에요? 글쎄..", "제가 사진이 좀 많아요", "첫 출사 못 참지",
                 "다 아는 사람들 이구먼", "사진 좋아요 1위", "느좋 사진러",
                 "틈틈이 골고루", "펑이 뭐죠?", "그럴만한 이유가..."):
-        assert now in FIXED_TITLE_NAMES, now
-    assert set(CATEGORY_TITLES.values()) <= set(FIXED_TITLE_NAMES)
+        assert now in 이름들, now
+    assert set(CATEGORY_TITLES.values()) <= 이름들
 
 
 def test_the_steady_titles_are_gone():
     """`한 달도 안 빠졌네`·`한결같은 사람`은 뺐다 — 되살리려면 이걸 뒤집는다."""
     import streamlit_app
-    from streamlit_app import FIXED_TITLE_NAMES
-    assert "한 달도 안 빠졌네" not in FIXED_TITLE_NAMES
-    assert "한결같은 사람" not in FIXED_TITLE_NAMES
+    from streamlit_app import known_title_names
+    assert "한 달도 안 빠졌네" not in known_title_names()
+    assert "한결같은 사람" not in known_title_names()
     assert not hasattr(streamlit_app, "_attendance_streak"), "부르는 곳 없는 코드"
 
 
@@ -2431,3 +2435,188 @@ def test_ranks_are_grouped_the_same_way_the_metrics_are():
     from streamlit_app import RANK_GROUPS, RANKED_METRICS
     assert tuple(k for g in RANK_GROUPS.values() for k in g) == RANKED_METRICS
     assert set(RANK_GROUPS) == {"나온 자리", "연 자리", "남긴 것"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 특성화 — 규칙 테이블로 옮기는 동안 결과가 한 칸도 안 밀렸는지
+#
+# 칭호 정의를 `put` 호출부 30곳에서 `TITLE_RULES` 한 테이블로 옮기는 작업은
+# 조용히 어긋나기 쉽다. 우선순위 하나가 밀리면 다른 사람이 다른 칭호를 받는데
+# 아무도 모른다. 옮기기 **전에** 현재 동작을 통째로 찍어 둔다.
+# ═══════════════════════════════════════════════════════════════
+
+def _snapshot(posts, members):
+    return {n: [(t["칭호"], t["지표"], t["우선"], t["갈래"], round(t["강도"], 3))
+                for t in ts]
+            for n, ts in sorted(_club(posts, [], members).items()) if ts}
+
+
+def test_the_titles_are_exactly_what_they_were_before_the_registry():
+    """네 픽스처가 tier·정원·배지·관계·카테고리 경로를 모두 지난다."""
+    판 = {"old30": _old_crowd(30), "old12": _old_crowd(12),
+         "uneven": _uneven_crowd(80), "busy": _busy_oldtimer()}
+    snap = {k: _snapshot(*v) for k, v in 판.items()}
+    # 사람 수와 1인당 칭호 수의 분포까지 고정한다 — 이름만 맞고 개수가 밀리는
+    # 것을 잡기 위해서다.
+    assert {k: len(v) for k, v in snap.items()} == {
+        "old30": 30, "old12": 12, "uneven": 80, "busy": 7}
+    엄태진급 = snap["busy"]["고참"]
+    assert [t[0] for t in 엄태진급][0] == "아이고 어르신", 엄태진급
+    assert len(엄태진급) == 4, 엄태진급
+    # 정원이 걸린 판에서 각 칭호의 수령 인원
+    from collections import Counter
+    c = Counter(t[0] for ts in snap["old30"].values() for t in ts)
+    assert c["아이고 어르신"] == 30, c        # 배지형은 정원 밖
+    assert c["이게 본업이에요"] == 9, c        # 일반 정원
+    assert max(v for k, v in c.items() if k != "아이고 어르신") <= 9, c
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🏆 칭호 진단 — "왜 이 인원인가"를 화면이 말할 수 있는가
+# ═══════════════════════════════════════════════════════════════
+
+def _run(posts, members, photos=None, months=None):
+    from streamlit_app import club_titles
+    return club_titles(posts, photos or [], members, months or [202603],
+                       진단=True)
+
+
+def test_every_title_has_a_condition_written_down():
+    """조건이 빈 칭호가 있으면 진단표에서 그 줄만 손댈 데가 없다."""
+    from streamlit_app import TITLE_RULES
+    빈것 = [rid for rid, r in TITLE_RULES.items() if not r["조건"].strip()]
+    assert not 빈것, 빈것
+
+
+def test_the_condition_text_follows_the_constant():
+    """문구에 숫자를 손으로 적으면 상수를 고쳐도 화면이 옛말을 한다."""
+    from streamlit_app import BUNG_MIN_SHARE, TITLE_RULES
+    조건 = TITLE_RULES["벙/오프"]["조건"]
+    assert "BUNG_MIN_SHARE" in 조건, 조건
+    assert str(BUNG_MIN_SHARE) in 조건, 조건
+
+
+def test_a_missing_constant_breaks_loudly():
+    """`_C`가 `globals()`를 읽으므로 상수 이름을 바꾸면 앱이 아예 안 뜬다 —
+    문구만 옛 이름으로 남는 일이 구조적으로 불가능하다."""
+    from streamlit_app import _C
+    with pytest.raises(KeyError):
+        _C("NOPE_THIS_IS_NOT_A_CONSTANT")
+
+
+def test_the_rules_agree_with_what_put_actually_makes():
+    """규칙표와 `put` 호출부가 갈리면 진단표가 거짓말을 한다."""
+    from streamlit_app import title_rule
+    posts, members = _old_crowd(12)
+    어긋남 = []
+    for ts in _cands_all(posts, [], members).values():
+        pass
+    for m in members:
+        for t in _title_candidates_of(m["mn"], posts, members):
+            r = title_rule(t["칭호"])
+            if r is None:
+                어긋남.append((t["칭호"], "규칙 없음"))
+                continue
+            for k in ("지표", "우선", "갈래"):
+                if r[k] != t[k]:
+                    어긋남.append((t["칭호"], k, r[k], t[k]))
+    assert not 어긋남, 어긋남
+
+
+def _title_candidates_of(name, posts, members, photos=None, months=None):
+    from streamlit_app import (_title_candidates, club_context,
+                               member_companions, member_profile)
+    photos, months = photos or [], months or [202603]
+    ctx = club_context(posts, photos, members, months)
+    return _title_candidates(
+        name, member_profile(name, posts, photos, members, ctx),
+        member_companions(name, posts, ctx["쌍"]), posts, photos, months, ctx)
+
+
+def test_the_three_ways_of_losing_are_told_apart():
+    """`정원`을 늘려도 안 풀리는 것을 정원 탓으로 읽으면 처방이 정반대가 된다."""
+    from streamlit_app import title_diagnostics
+    posts, members = _old_crowd(30)
+    rows = {r["칭호"]: r for r in title_diagnostics(_run(posts, members))}
+    # 서른 명이 같은 조건을 지나 정원 9에 잘린다
+    본업 = rows["이게 본업이에요"]
+    assert 본업["최종"] == 9 and 본업["정원밀림"] > 0, 본업
+    assert 본업["지표밀림"] == 0, "지표 형제가 없는데 지표밀림이 잡혔다"
+
+
+def test_the_numbers_always_add_up():
+    """`후보 = 최종 + 지표밀림 + 세칸밀림 + 정원밀림` — 안 맞으면 표를 못 믿는다."""
+    from streamlit_app import title_diagnostics
+    for 판 in (_old_crowd(30), _old_crowd(12), _uneven_crowd(80)):
+        for r in title_diagnostics(_run(*판)):
+            assert r["후보"] == (r["최종"] + r["지표밀림"] + r["세칸밀림"]
+                              + r["정원밀림"]), r
+
+
+def test_a_sibling_of_the_same_metric_is_not_a_quota_problem():
+    """같은 지표의 윗 칭호에 가린 것은 **정원을 늘려도 안 풀린다.**
+
+    실데이터에서 `다 아는 사람들 이구먼`(동행 80) 여섯 명이 `{X}님과 2인
+    1조`(동행 95)에 가려 있었다. 이걸 정원밀림으로 세면 정원을 늘리라는 처방이
+    나오는데, 늘려도 안 뜬다.
+    """
+    from streamlit_app import title_diagnostics
+    posts, members = _old_crowd(30)
+    rows = {r["칭호"]: r for r in title_diagnostics(_run(posts, members))}
+    마당발 = rows["다 아는 사람들 이구먼"]
+    assert 마당발["지표밀림"] > 0, 마당발
+    assert "지표" in _verdict_of(마당발) or 마당발["정원밀림"] > 0, 마당발
+    # `새싹`(연차 70)과 `아이고 어르신`(연차 79)은 같은 지표인데, 어르신은
+    # 배지형이라 지표 경쟁에서 빠진다 — 그래서 `새싹`이 지표밀림을 안 받는다.
+    assert rows["새싹"]["지표밀림"] == 0, rows["새싹"]
+
+
+def _verdict_of(row):
+    from streamlit_app import _title_verdict, title_rule
+    return _title_verdict(row, title_rule(row["칭호"]) or {})
+
+
+def test_losing_to_a_sibling_is_never_called_a_quota_loss():
+    """지표밀림을 정원밀림으로 뭉뚱그리면 처방이 정반대가 된다 — 회귀 방지."""
+    from streamlit_app import title_diagnostics
+    posts, members = _old_crowd(30)
+    rows = {r["칭호"]: r for r in title_diagnostics(_run(posts, members))}
+    # 이 판에서 `저 신입 아닌데요`(동행 62)는 위 셋에 가려 지표밀림이 크다.
+    외톨이 = rows["저 신입 아닌데요"]
+    assert 외톨이["지표밀림"] >= 10, 외톨이
+    assert 외톨이["정원밀림"] == 0, "정원에 안 걸리는데 정원 탓으로 세면 안 된다"
+
+
+def test_a_badge_title_never_shows_as_lost():
+    """배지형은 후보면 늘 최종이다 — 밀림이 하나라도 있으면 규칙이 깨진 것이다."""
+    from streamlit_app import BADGE_TITLES, title_diagnostics
+    posts, members = _old_crowd(30)
+    for r in title_diagnostics(_run(posts, members)):
+        if r["칭호"] in BADGE_TITLES:
+            assert r["후보"] == r["최종"] == 30, r
+            assert (r["지표밀림"], r["세칸밀림"], r["정원밀림"]) == (0, 0, 0), r
+
+
+def test_a_title_nobody_can_get_still_has_a_row():
+    """아무도 못 받는 칭호가 화면에서 사라지면 이 표의 목적과 어긋난다."""
+    from streamlit_app import known_title_names, title_diagnostics
+    posts, members = _old_crowd(4)
+    이름들 = {r["칭호"] for r in title_diagnostics(_run(posts, members))}
+    assert known_title_names() <= 이름들, known_title_names() - 이름들
+    빈줄 = [r for r in title_diagnostics(_run(posts, members)) if not r["후보"]]
+    assert 빈줄, "이 판에서는 후보 0인 칭호가 있어야 한다"
+    assert all(r["조건"] for r in 빈줄), "조건이 비면 손댈 데를 모른다"
+
+
+def test_the_verdict_tells_intent_from_accident():
+    """`짧은 기간에 진심`이 후보의 대부분을 잃는 것은 **의도**다 — 코드 주석에
+    그렇게 적혀 있다. 같은 모양의 사고와 구분되어야 표가 쓸모 있다."""
+    from streamlit_app import TITLE_RULES, _title_verdict
+    r = {"칭호": "짧은 기간에 진심", "후보": 28, "최종": 5, "지표밀림": 0,
+         "세칸밀림": 23, "정원밀림": 0, "정원": "9", "우선": 68, "지표": "밀도"}
+    말 = _title_verdict(r, TITLE_RULES["밀도/촘촘"])
+    assert "우선(68)에 눌림" in 말, 말
+    assert "의도됨" in 말, 말
+    민낯 = dict(r, 칭호="부지런한 업로더")
+    assert "의도됨" not in _title_verdict(민낯, TITLE_RULES["사진/상위"]), \
+        "메모가 없는 칭호에 '의도됨'이 붙으면 사고를 의도로 읽게 된다"

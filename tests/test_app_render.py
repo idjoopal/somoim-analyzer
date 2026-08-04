@@ -1239,12 +1239,12 @@ def test_titles_come_with_the_reason_they_were_given():
 def test_closed_distribution_panel_computes_nothing():
     """쉰 명분 칭호를 매 rerun마다 돌릴 이유가 없다."""
     at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
-    assert not any("칭호별 수령 인원" in str(m.value) for m in at.markdown)
+    assert not any("칭호별 진단" in str(m.value) for m in at.markdown)
 
     at.session_state["mf_dist_open"] = True
     at.run()
     assert not at.exception, [str(e) for e in at.exception]
-    assert any("칭호별 수령 인원" in str(m.value) for m in at.markdown)
+    assert any("칭호별 진단" in str(m.value) for m in at.markdown)
 
 
 def test_distribution_keeps_titles_nobody_earned():
@@ -1252,18 +1252,18 @@ def test_distribution_keeps_titles_nobody_earned():
 
     안 걸린 것을 빼 버리면 화면만 보고는 그 칭호가 있는지도 모른다.
     """
-    from streamlit_app import FIXED_TITLE_NAMES
+    from streamlit_app import known_title_names
 
     at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
     at.session_state["mf_dist_open"] = True
     at.run()
 
-    tables = [d.value for d in at.dataframe if "받은 사람" in list(d.value.columns)]
-    assert tables, "칭호별 수령 인원 표가 없다"
+    tables = [d.value for d in at.dataframe if "진단" in list(d.value.columns)]
+    assert tables, "칭호별 진단 표가 없다"
     df = tables[0]
-    assert set(FIXED_TITLE_NAMES) <= set(df["칭호"]), \
-        set(FIXED_TITLE_NAMES) - set(df["칭호"])
-    assert (df["인원"] == 0).any(), "이 픽스처에서는 못 받는 칭호가 있어야 한다"
+    assert known_title_names() <= set(df["칭호"]), \
+        known_title_names() - set(df["칭호"])
+    assert (df["최종"] == 0).any(), "이 픽스처에서는 못 받는 칭호가 있어야 한다"
 
 
 def test_distribution_counts_everyone_including_the_empty_handed():
@@ -1286,7 +1286,7 @@ def test_distribution_lists_the_renamed_titles_not_the_old_ones():
     at.run()
     assert not at.exception, [str(e) for e in at.exception]
 
-    df = [d.value for d in at.dataframe if "받은 사람" in list(d.value.columns)][0]
+    df = [d.value for d in at.dataframe if "진단" in list(d.value.columns)][0]
     shown = set(df["칭호"])
     assert {"테마사진 프로 참석러", "아이고 어르신", "정출킬러",
             "여기 제 인스타인데..", "소모임에요? 글쎄.."} <= shown
