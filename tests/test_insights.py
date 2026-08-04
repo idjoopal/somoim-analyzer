@@ -2195,3 +2195,143 @@ def test_the_switch_on_reproduces_todays_numbers():
     assert denom_posts(posts, True) == posts
     ctx = club_context(posts, [], [member("w1", "나무")], [202603], 벙포함=True)
     assert dict(ctx["참석"])["나무"] == 2       # 벙까지 세던 예전 값
+
+
+# ═══════════════════════════════════════════════════════════════
+# 갈래 — "출사"라고 적힌 숫자가 정말 출사인가
+#
+# 직전까지 세 탭의 집계는 `cat == "A"` 하나로만 걸렀다. 실데이터에서 `진행
+# 출사` 262건 중 49건이 벙이었고, 참석 1·2위가 뒤바뀔 만큼 컸다.
+# ═══════════════════════════════════════════════════════════════
+
+def _shoot_and_bung():
+    """출사 1 · 문화벙 1 · 보정벙 1 — 셋을 가르는 최소 판.
+
+    `likes`·`comments`를 채우는 것은 `category_counts`·`outings_table`이 그
+    키를 직접 읽기 때문이다.
+    """
+    return [notice("s1", "2026-03-01", ["나무", "바다"], category="풍경",
+                   likes=0, comments=0),
+            _bung("c1", "2026-03-02", ["나무"], cat="문화", likes=0, comments=0),
+            _bung("r1", "2026-03-03", ["나무"], cat="보정", likes=0, comments=0)]
+
+
+def test_post_kind_names_each_bucket():
+    from streamlit_app import KIND_CULTURE, KIND_RETOUCH, KIND_SHOOT, post_kind
+    s, c, r = _shoot_and_bung()
+    assert (post_kind(s), post_kind(c), post_kind(r)) == (
+        KIND_SHOOT, KIND_CULTURE, KIND_RETOUCH)
+
+
+def test_a_general_notice_belongs_to_no_bucket():
+    """`일반공지`를 벙으로 세면 벙 숫자가 공지에 오염된다."""
+    from streamlit_app import post_kind
+    assert post_kind(notice("g1", "2026-03-01", [], category="일반공지")) is None
+    assert post_kind({"cat": "E", "category": "풍경"}) is None
+
+
+def test_post_kind_agrees_with_the_old_predicates():
+    """`is_shoot`/`is_bung`와 영원히 같은 답을 낸다 — 판정이 둘로 갈리면 안 된다."""
+    from core.collector import ALL_CATS
+    from streamlit_app import KIND_SHOOT, is_bung, is_shoot, post_kind
+    for c in ALL_CATS:
+        p = {"cat": "A", "category": c}
+        assert (post_kind(p) == KIND_SHOOT) == is_shoot(p), c
+        assert (post_kind(p) in ("문화벙", "보정벙")) == is_bung(p), c
+
+
+def test_the_headline_number_counts_only_shoots():
+    """실데이터 262 = 출사 213 + 벙 49의 축소판."""
+    from streamlit_app import compute_kpis
+    k = compute_kpis(_shoot_and_bung(), [])
+    assert k["진행 출사"] == 1, k
+    assert (k["진행 문화벙"], k["진행 보정벙"], k["진행 벙"]) == (1, 1, 2), k
+
+
+def test_the_monthly_series_always_carry_every_kind():
+    """없는 갈래의 키를 빼면 그 달 선이 통째로 사라져 '그런 자리가 없다'가 아니라
+    '그런 개념이 없다'로 읽힌다."""
+    from streamlit_app import monthly_table
+    mt = monthly_table([notice("s1", "2026-03-01", [], category="풍경")], [])
+    assert mt["진행 문화벙"] == {} and mt["진행 보정벙"] == {}
+    assert mt["진행 출사"] == {202603: 1}
+
+
+def test_attendance_splits_by_kind_and_adds_up():
+    """`모임 참석 = 출사 + 문화벙 + 보정벙` — 한 줄에 나란히 놓이므로 합이 맞아야 한다."""
+    from streamlit_app import attendance_by_kind
+    posts = _shoot_and_bung() + [
+        notice("g1", "2026-03-04", ["나무"], category="일반공지")]
+    row = next(r for r in attendance_by_kind(posts) if r["멤버"] == "나무")
+    assert (row["출사 참석"], row["문화벙"], row["보정벙"]) == (1, 1, 1), row
+    assert row["모임 참석"] == 3, "일반공지가 섞이면 합이 깨진다"
+
+
+def test_counting_everything_flips_who_comes_most():
+    """이 변경의 존재 이유 — 실데이터에서 서동훈(모임 1위)이 출사에선 2위다."""
+    from streamlit_app import attendance_by_kind
+    posts = [notice("s1", "2026-03-01", ["출사러"], category="풍경"),
+             notice("s2", "2026-03-02", ["출사러"], category="인물"),
+             _bung("b1", "2026-03-03", ["벙러"], cat="보정"),
+             _bung("b2", "2026-03-04", ["벙러"], cat="보정"),
+             _bung("b3", "2026-03-05", ["벙러"], cat="문화")]
+    rows = attendance_by_kind(posts)
+    assert rows[0]["멤버"] == "벙러", "모임 참석 기준 1위"
+    assert max(rows, key=lambda r: r["출사 참석"])["멤버"] == "출사러"
+
+
+def test_hosting_splits_by_kind_and_adds_up():
+    """김지우 회귀 — 출사 1건·보정벙 9건이 한 숫자로 뭉치면 '안 여는 사람'이 된다."""
+    from streamlit_app import hosting_by_kind
+    posts = [notice("s1", "2026-03-01", [], category="풍경", author="지우"),
+             notice("x1", "2026-03-02", [], category="풍경", author="지우",
+                    is_canceled=True)]
+    posts += [_bung(f"r{i}", "2026-03-0%d" % (i + 3), [], cat="보정",
+                    author="지우") for i in range(3)]
+    row = next(r for r in hosting_by_kind(posts) if r["작성자"] == "지우")
+    assert (row["출사 진행"], row["보정벙 개최"]) == (1, 3), row
+    assert row["모임 개최"] == 4, "펑을 세면 다른 칸의 합과 안 맞는다"
+    assert row["출사 취소율"] == 50.0, "분모는 출사 공지뿐이다"
+
+
+def test_the_average_crowd_is_measured_per_kind():
+    """실데이터에서 출사 5.36 · 문화벙 7.06 · 보정벙 4.23 — 섞으면 셋 다 아니게 된다."""
+    from streamlit_app import KIND_CULTURE, KIND_SHOOT, avg_attendance_trend
+    posts = _shoot_and_bung()
+    출사 = avg_attendance_trend(posts, [202603], (KIND_SHOOT,))
+    문화 = avg_attendance_trend(posts, [202603], (KIND_CULTURE,))
+    assert 출사[202603] == 2.0 and 문화[202603] == 1.0
+
+
+def test_the_matching_rate_is_reported_per_kind():
+    from streamlit_app import KIND_SHOOT, KINDS, real_attendance_rate
+    rate = real_attendance_rate(_shoot_and_bung())
+    assert set(KINDS) <= set(rate)
+    assert rate[KIND_SHOOT]["공지"] == 1, rate
+
+
+def test_a_general_notice_is_not_a_bung_in_the_category_table():
+    """분석 기준 상자는 '일반공지는 출사도 벙도 아니다'라고 적어 두고 이 표만
+    다른 말을 하고 있었다."""
+    from streamlit_app import category_counts
+    rows = {r["카테고리"]: r["유형"] for r in category_counts(
+        [notice("g1", "2026-03-01", [], category="일반공지", likes=0),
+         notice("s1", "2026-03-02", [], category="풍경", likes=0)])}
+    assert rows["일반공지"] == "—", rows
+    assert rows["풍경"] == "출사", rows
+
+
+def test_the_attendee_table_says_which_kind_each_row_is():
+    """카테고리 이름만으로는 `보정`이 벙이라는 것을 아는 사람만 안다."""
+    from streamlit_app import attendees_table, outings_table
+    posts = _shoot_and_bung()
+    유형 = {r["카테고리"]: r["유형"] for r in attendees_table(posts)}
+    assert 유형 == {r["카테고리"]: r["유형"] for r in outings_table(posts)}, \
+        "두 표가 다른 말을 쓰면 같은 자리가 화면마다 달라 보인다"
+
+
+def test_the_monthly_matrix_counts_shoots_only():
+    """두 화면이 이 값을 `출사 참석`이라 부른다 — 벙까지 세면 이름이 거짓이 된다."""
+    from streamlit_app import attendance_monthly_matrix
+    mm, _ = attendance_monthly_matrix(_shoot_and_bung())
+    assert mm["나무"][202603] == 1

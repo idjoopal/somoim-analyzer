@@ -133,6 +133,45 @@ def kind_label(p: dict) -> str:
     return "기타"
 
 
+# 세는 칸을 고르는 이름 — 화면·집계가 **한 벌로** 쓴다.
+KIND_SHOOT, KIND_CULTURE, KIND_RETOUCH = "출사", "문화벙", "보정벙"
+KINDS = (KIND_SHOOT, KIND_CULTURE, KIND_RETOUCH)
+
+
+def post_kind(p: dict) -> str | None:
+    """게시글 하나가 어느 칸에 들어가나. 아니면 `None`.
+
+    **`kind_label`과 헷갈리지 말 것.** 저쪽은 표에 찍는 문자열(`벙(온라인)`)이고
+    이쪽은 **집계를 가르는 열쇠**다. 온라인 여부는 여기서 안 가른다 — 보정벙의
+    성질이지 다른 갈래가 아니다(`is_online_bung`으로 따로 병기한다).
+
+    갈래를 열다섯 군데에서 각각 판정하면 반드시 어긋난다. `denom_posts`가
+    모수를 한 곳에 모은 것과 같은 이유로 규칙은 여기에만 둔다.
+
+    `일반공지`와 카테고리 미상은 `None`이다 — 출사도 벙도 아닌 것을 어느 칸에
+    넣어도 그 칸의 뜻이 흐려진다.
+    """
+    if is_shoot(p):
+        return KIND_SHOOT
+    if is_bung(p):
+        return KIND_CULTURE if p.get("category") == "문화" else KIND_RETOUCH
+    return None
+
+
+def by_kind(posts: list[dict], pred=None) -> dict[str, list[dict]]:
+    """갈래별로 나눈 글 `{출사: […], 문화벙: […], 보정벙: […]}`.
+
+    빈 칸도 키를 남긴다 — 부르는 쪽이 `.get`으로 더듬지 않게, 그리고 차트에서
+    **그 달에 벙이 0건이었다는 사실**이 선에서 사라지지 않게.
+    """
+    out: dict[str, list[dict]] = {k: [] for k in KINDS}
+    for p in posts:
+        k = post_kind(p)
+        if k and (pred is None or pred(p)):
+            out[k].append(p)
+    return out
+
+
 def denom_posts(posts: list[dict], 벙포함: bool) -> list[dict]:
     """비율·순위·칭호의 **모수**가 되는 글.
 
@@ -153,11 +192,26 @@ def denom_posts(posts: list[dict], 벙포함: bool) -> list[dict]:
 
 
 def compute_kpis(posts: list[dict], photos: list[dict]) -> dict[str, int]:
-    posts_A = [p for p in posts if p["cat"] == "A"]
+    """화면 맨 위 KPI. **갈래마다 따로 센다.**
+
+    예전에는 `cat == "A"` 하나로만 걸러 `진행 출사`에 보정·문화 벙이 섞여
+    있었다 — 실데이터에서 262건 중 49건이 벙이었다. "출사"라고 적힌 숫자가
+    출사가 아니면 그 아래 어떤 비율도 읽을 수 없다.
+    """
+    갈래 = by_kind(posts)
+    진행 = {k: sum(1 for p in v if not p["is_canceled"]) for k, v in 갈래.items()}
+    취소 = {k: sum(1 for p in v if p["is_canceled"]) for k, v in 갈래.items()}
     return {
         "전체 게시글": len(posts),
-        "진행 출사":  sum(1 for p in posts_A if not p["is_canceled"]),
-        "취소 출사":  sum(1 for p in posts_A if p["is_canceled"]),
+        "진행 출사":  진행[KIND_SHOOT],
+        "취소 출사":  취소[KIND_SHOOT],
+        "진행 문화벙": 진행[KIND_CULTURE],
+        "취소 문화벙": 취소[KIND_CULTURE],
+        "진행 보정벙": 진행[KIND_RETOUCH],
+        "취소 보정벙": 취소[KIND_RETOUCH],
+        # 벙 둘을 합친 값. 화면이 "출사 N · 벙 M"으로 한 줄에 적을 때 쓴다.
+        "진행 벙":    진행[KIND_CULTURE] + 진행[KIND_RETOUCH],
+        "취소 벙":    취소[KIND_CULTURE] + 취소[KIND_RETOUCH],
         "후기글":     sum(1 for p in posts if p["cat"] == "E"),
         "사진 업로드": len(photos),
         "테마 예상":  sum(1 for p in photos if p["has_comment"]),
@@ -165,10 +219,13 @@ def compute_kpis(posts: list[dict], photos: list[dict]) -> dict[str, int]:
 
 
 def monthly_table(posts: list[dict], photos: list[dict]) -> dict[str, dict[int, int]]:
-    """월별 활동 집계 — `{구분: {ym: 건수}}`. 축은 호출부가 결정한다."""
-    posts_A  = [p for p in posts if p["cat"] == "A"]
-    active   = [p for p in posts_A if not p["is_canceled"]]
-    canceled = [p for p in posts_A if p["is_canceled"]]
+    """월별 활동 집계 — `{구분: {ym: 건수}}`. 축은 호출부가 결정한다.
+
+    출사와 벙을 **갈라서** 낸다. 한 선으로 그리면 벙이 몰린 달이 출사가 많았던
+    달로 보인다.
+    """
+    진행 = by_kind(posts, lambda p: not p["is_canceled"])
+    취소 = by_kind(posts, lambda p: p["is_canceled"])
     reviews  = [p for p in posts if p["cat"] == "E"]
     themed   = [p for p in photos if p["has_comment"]]
 
@@ -187,8 +244,12 @@ def monthly_table(posts: list[dict], photos: list[dict]) -> dict[str, dict[int, 
         return dict(out)
 
     return {
-        "진행 출사":   by_outing(active),
-        "취소 출사":   by_outing(canceled),
+        "진행 출사":   by_outing(진행[KIND_SHOOT]),
+        "취소 출사":   by_outing(취소[KIND_SHOOT]),
+        "진행 문화벙":  by_outing(진행[KIND_CULTURE]),
+        "취소 문화벙":  by_outing(취소[KIND_CULTURE]),
+        "진행 보정벙":  by_outing(진행[KIND_RETOUCH]),
+        "취소 보정벙":  by_outing(취소[KIND_RETOUCH]),
         "후기글":      by_posted(reviews),
         "사진":        by_posted(photos),
         "테마사진 참가": by_posted(themed),
@@ -224,7 +285,10 @@ def category_counts(posts: list[dict]) -> list[dict]:
         if sub:
             rows.append({
                 "카테고리": c,
-                "유형": "출사" if c in OUTING_CATS else "벙",
+                # `OUTING_CATS`가 아니면 벙이라고 하면 **일반공지가 벙이 된다.**
+                # 분석 기준 상자는 "일반공지는 출사도 벙도 아니다"라고 적어 두고
+                # 이 표만 다른 말을 하고 있었다. 판정은 `post_kind` 한 곳에서.
+                "유형": post_kind({"cat": "A", "category": c}) or "—",
                 "개수": len(sub),
                 "좋아요": sum(p["likes"] for p in sub),
             })
@@ -276,8 +340,49 @@ def category_monthly(posts: list[dict], months: list[int], *,
     return rows, skipped
 
 
+def hosting_by_kind(posts: list[dict]) -> list[dict]:
+    """작성자별 **개최**를 갈래로 갈라 센다 — 모임 개최 내림차순. 활성 멤버만.
+
+    `outing_user_ranking`은 넘긴 글을 그냥 센다(모수를 부르는 쪽이 정한다).
+    이쪽은 한 번에 갈래를 다 내어, 출사를 여는 사람과 벙을 여는 사람이 같은
+    표에서 갈라 보이게 한다 — 실데이터의 김지우는 출사 1건·보정벙 9건이라
+    한 숫자로는 "거의 안 여는 사람"이 된다.
+
+    `모임 개최`는 **펑을 뺀 진행 건수**라 `출사 진행 + 문화벙 + 보정벙`과 정확히
+    맞는다. 펑까지 세면 한 줄 안에서 합이 안 맞아 보는 사람이 먼저 의심한다 —
+    참석 쪽 `모임 참석`에 같은 규칙을 쓴다. 펑은 아래 두 칸이 따로 말한다.
+
+    `출사 취소율`의 분모는 **출사 공지 전부**다. 벙은 펑이 드물어 섞으면
+    취소율이 실제보다 낮아 보인다.
+    """
+    agg: dict[str, Counter] = defaultdict(Counter)
+    for p in posts:
+        k = post_kind(p)
+        if not k or not p.get("is_active", True) or not p.get("author"):
+            continue
+        agg[p["author"]][f"{k}{'취소' if p['is_canceled'] else '진행'}"] += 1
+    rows = []
+    for who, c in agg.items():
+        출사 = c["출사진행"] + c["출사취소"]
+        rows.append({
+            "작성자": who,
+            "모임 개최": c["출사진행"] + c["문화벙진행"] + c["보정벙진행"],
+            "출사 진행": c["출사진행"],
+            "출사 취소": c["출사취소"],
+            "출사 취소율": round(c["출사취소"] / 출사 * 100, 1) if 출사 else 0.0,
+            "문화벙 개최": c["문화벙진행"],
+            "보정벙 개최": c["보정벙진행"],
+        })
+    return sorted(rows, key=lambda r: (-r["모임 개최"], -r["출사 진행"], r["작성자"]))
+
+
 def outing_user_ranking(posts: list[dict]) -> list[dict]:
-    """공지(cat=A) 작성자 랭킹. 활성 멤버만 집계."""
+    """공지(cat=A) 작성자 랭킹. 활성 멤버만 집계.
+
+    **넘긴 글만 센다** — 갈래를 여기서 안 가른다(`attendance_counts`와 같은
+    계약). `club_context`는 `denom_posts`로 출사만 걸러 넘긴다. 갈래를 나눠
+    보려면 `hosting_by_kind`를 쓴다.
+    """
     agg: dict[str, dict] = {}
     for p in posts:
         if p["cat"] != "A":
@@ -454,13 +559,43 @@ def period_coverage(posts: list[dict], photos: list[dict]):
 # ── 후기 본문 기반 참석 (PR2: tab 데이터 헬퍼) ──────────────────
 
 def attendance_counts(posts: list[dict]) -> list[dict]:
-    """매칭된 출사(actually_held)의 참석자(실명) 합계."""
+    """매칭된 자리(actually_held)의 참석자(실명) 합계.
+
+    **넘긴 글만 센다** — 갈래를 여기서 안 가른다. `club_context`는 이미
+    `denom_posts`로 출사만 걸러 넘기므로 그쪽 값은 출사 참석이 된다. 갈래를
+    나눠 보려면 `attendance_by_kind`를 쓴다.
+    """
     cnt: Counter = Counter()
     for n in posts:
         if n.get("cat") == "A" and n.get("actually_held"):
             for name in n.get("attendees", []):
                 cnt[name] += 1
     return [{"멤버": name, "참석횟수": c} for name, c in cnt.most_common()]
+
+
+def attendance_by_kind(posts: list[dict]) -> list[dict]:
+    """멤버별 참석을 갈래로 갈라 센다 — 모임 참석 내림차순.
+
+    실데이터에서 이 구분이 순위를 뒤집는다. 서동훈은 모임 123회로 1위지만
+    출사만 세면 90회로 2위고, 벙 33회가 1위다. 한 숫자로 뭉치면 "제일 많이
+    나오는 사람"이 누구인지가 무엇을 세느냐에 따라 달라진다는 사실이 감춰진다.
+
+    `set(attendees)`로 세는 것은 한 글에 같은 이름이 두 번 적혀도 한 번으로
+    치기 위해서다(`club_context`의 벙 카운터와 같은 규칙).
+    """
+    per: dict[str, Counter] = defaultdict(Counter)
+    for p in posts:
+        k = post_kind(p)
+        if not k or not p.get("actually_held"):
+            continue
+        for name in set(p.get("attendees") or []):
+            per[name][k] += 1
+    rows = [{"멤버": n,
+             "모임 참석": sum(c.values()),
+             "출사 참석": c[KIND_SHOOT],
+             "문화벙": c[KIND_CULTURE],
+             "보정벙": c[KIND_RETOUCH]} for n, c in per.items()]
+    return sorted(rows, key=lambda r: (-r["모임 참석"], -r["출사 참석"], r["멤버"]))
 
 
 def member_category_pref(posts: list[dict]) -> dict[str, Counter]:
@@ -486,29 +621,44 @@ def top_category_label(pref: Counter, n: int = PREF_TOP_N) -> str:
     return ", ".join(f"{c}({v})" for c, v in pref.most_common(n)) or "—"
 
 
-def attendance_monthly_matrix(posts: list[dict]):
-    """(member_month dict[name->dict[ym->count]], members_sorted_by_total). 월 키는 YYYYMM."""
+def attendance_monthly_matrix(posts: list[dict],
+                              kinds: tuple[str, ...] = (KIND_SHOOT,)):
+    """(member_month dict[name->dict[ym->count]], members_sorted_by_total). 월 키는 YYYYMM.
+
+    기본이 **출사만**인 것은 이 값이 두 화면에서 `출사 참석`이라는 이름으로
+    쓰이기 때문이다(참석 탭 매트릭스·멤버 상세 월별 추이). 벙까지 세면서
+    출사라고 부르면 같은 사람의 참석 수가 화면마다 달라진다.
+    """
     mm: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     for n in posts:
-        if n.get("cat") != "A" or not n.get("actually_held"):
+        if post_kind(n) not in kinds or not n.get("actually_held"):
             continue
         m = post_ym(n)
         if m is None:
             continue
-        for name in n.get("attendees", []):
+        for name in set(n.get("attendees") or []):
             mm[name][m] += 1
     members = sorted(mm, key=lambda x: -sum(mm[x].values()))
     return mm, members
 
 
 def real_attendance_rate(posts: list[dict]) -> dict:
-    notices = [p for p in posts if p.get("cat") == "A"]
-    held = [p for p in notices if p.get("actually_held")]
-    return {
-        "공지": len(notices),
-        "매칭": len(held),
-        "진행률": round(len(held) / len(notices) * 100, 1) if notices else 0.0,
-    }
+    """후기가 매칭돼 **누가 갔는지 아는** 공지의 비율. 갈래마다 따로 낸다.
+
+    예전에는 `cat == "A"` 전량을 세면서 화면에는 `출사 공지`라고 적었다.
+    출사와 벙은 후기가 붙는 빈도가 달라, 섞으면 어느 쪽 진행률도 아니게 된다.
+    """
+    갈래 = by_kind(posts)
+    out = {}
+    for k, v in 갈래.items():
+        held = [p for p in v if p.get("actually_held")]
+        out[k] = {"공지": len(v), "매칭": len(held),
+                  "진행률": round(len(held) / len(v) * 100, 1) if v else 0.0}
+    벙공지 = out[KIND_CULTURE]["공지"] + out[KIND_RETOUCH]["공지"]
+    벙매칭 = out[KIND_CULTURE]["매칭"] + out[KIND_RETOUCH]["매칭"]
+    out["벙"] = {"공지": 벙공지, "매칭": 벙매칭,
+                "진행률": round(벙매칭 / 벙공지 * 100, 1) if 벙공지 else 0.0}
+    return out
 
 
 def member_first_seen(posts: list[dict]) -> tuple[dict[str, str], dict[str, str]]:
@@ -528,9 +678,13 @@ def member_first_seen(posts: list[dict]) -> tuple[dict[str, str], dict[str, str]
 
 
 def attendees_table(posts: list[dict]) -> list[dict]:
-    """출사별 참석자 표. 취소(펑) 출사는 제외하고, 매칭된 후기 제목과 함께 보여
-    매칭이 제대로 됐는지 사용자가 검증할 수 있게 한다. 후기가 없는 출사는 상태
+    """자리별 참석자 표. 취소(펑)는 제외하고, 매칭된 후기 제목과 함께 보여
+    매칭이 제대로 됐는지 사용자가 검증할 수 있게 한다. 후기가 없는 자리는 상태
     컬럼으로 강조해 누락을 인지시킨다.
+
+    **`유형` 컬럼을 함께 낸다** — 이 표에는 출사와 벙이 섞여 있는데 카테고리
+    이름만으로는 `보정`이 벙이라는 것을 아는 사람만 안다. 출사 목록표가
+    `kind_label`로 같은 일을 이미 하고 있다.
     """
     review_by_id = {p["id"]: p for p in posts if p.get("cat") == "E"}
     rows = []
@@ -544,6 +698,7 @@ def attendees_table(posts: list[dict]) -> list[dict]:
         rows.append({
             "출사일": p.get("outing_date") or "-",
             "카테고리": p.get("category") or "-",
+            "유형": kind_label(p),
             "상태": "✓ 매칭" if review else "⚠️ 후기 없음",
             "공지자": p["author"],
             "참석자수": len(att),
@@ -566,18 +721,25 @@ def orphan_reviews(posts: list[dict]) -> list[dict]:
 
 
 def activity_ranking(posts: list[dict], photos: list[dict]) -> list[dict]:
-    """작성자별 게시글·사진 종합. 글이나 사진이 1건이라도 있으면 포함."""
+    """작성자별 게시글·사진 종합. 글이나 사진이 1건이라도 있으면 포함.
+
+    `공지` 한 칸이던 것을 **갈래로 갈랐다** — 벙만 여는 사람과 출사를 여는
+    사람이 같은 숫자로 보이면 안 된다(김지우는 출사 1건·보정벙 9건이다).
+    취소는 출사 탭의 순위표가 취소율까지 함께 전담한다.
+    """
     photo_cnt = {r["작성자"]: r["사진수"] for r in photo_user_ranking(photos)}
     by_author = {r["작성자"]: r for r in top_posters(posts, n=max(len(posts), 1))}
+    host = {r["작성자"]: r for r in hosting_by_kind(posts)}
     rows = []
-    for author in set(by_author) | set(photo_cnt):
-        pr = by_author.get(author)
+    for author in set(by_author) | set(photo_cnt) | set(host):
+        pr, h = by_author.get(author), host.get(author)
         rows.append({
             "작성자": author,
             "게시글": pr["게시글"] if pr else 0,
             "사진": photo_cnt.get(author, 0),
-            "공지": pr["공지"] if pr else 0,
-            "취소": pr["취소"] if pr else 0,
+            "출사 개최": h["출사 진행"] if h else 0,
+            "문화벙 개최": h["문화벙 개최"] if h else 0,
+            "보정벙 개최": h["보정벙 개최"] if h else 0,
             "후기": pr["후기"] if pr else 0,
             "좋아요": pr["좋아요"] if pr else 0,
         })
@@ -626,16 +788,21 @@ def confidence_report(posts: list[dict],
     ]
 
 
-def avg_attendance_trend(posts: list[dict],
-                         months: list[int]) -> dict[int, float | None]:
-    """월별 **출사당 평균 참석 인원**. 출사가 없는 달은 None(0이 아니다).
+def avg_attendance_trend(posts: list[dict], months: list[int],
+                         kinds: tuple[str, ...] = (KIND_SHOOT,),
+                         ) -> dict[int, float | None]:
+    """월별 **자리당 평균 참석 인원**. 그 달에 해당 자리가 없으면 None(0이 아니다).
 
-    참석자 0명인 출사도 분모에 넣는다 — 빼면 "인원이 적힌 출사"만 평균 내게
+    참석자 0명인 자리도 분모에 넣는다 — 빼면 "인원이 적힌 자리"만 평균 내게
     되어 모임 규모가 실제보다 부풀려진다.
+
+    `kinds`가 기본으로 **출사만**인 것은 예전 값이 벙에 오염돼 있었기
+    때문이다. 실데이터에서 출사 5.28명·벙 6.02명이라, 섞으면 5.42명으로
+    출사가 실제보다 커 보였다. 벙이 더 북적인다는 사실도 함께 묻혔다.
     """
     per_month: dict[int, list[int]] = {m: [] for m in months}
     for p in posts:
-        if p.get("cat") != "A" or not p.get("actually_held"):
+        if post_kind(p) not in kinds or not p.get("actually_held"):
             continue
         m = post_ym(p)
         if m in per_month:
@@ -1138,7 +1305,10 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
     벙개최: Counter = Counter()
     모임참석: Counter = Counter()
     for p in posts:
-        if p.get("cat") == "A" and p.get("actually_held"):
+        # **`post_kind`로 거른다.** `cat == "A"`로만 세면 `일반공지`와 카테고리
+        # 미상까지 들어와 `모임 참석 = 출사 + 문화벙 + 보정벙` 항등식이 깨진다.
+        # 참석 탭이 네 숫자를 한 줄에 놓으므로 합이 안 맞으면 바로 보인다.
+        if post_kind(p) and p.get("actually_held"):
             for n in set(p.get("attendees") or []):
                 모임참석[n] += 1
         if not is_bung(p):
@@ -2295,14 +2465,21 @@ def monthly_trend_chart(monthly: dict[str, dict[int, int]], months: list[int],
 
 def stacked_bar(rows: list[dict], x_col: str, y_col: str, color_col: str,
                 title: str, *, x_sort: list[str] | None = None,
-                scheme: str = "tableau10") -> alt.Chart:
-    """월별 누적 막대 — x축은 월, 색은 카테고리처럼 쌓아 올릴 구분값."""
+                scheme: str = "tableau10",
+                label_angle: int | None = None) -> alt.Chart:
+    """누적 막대 — x축은 월(또는 종류), 색은 쌓아 올릴 구분값.
+
+    `label_angle`은 x 라벨을 눕히고 싶을 때 쓴다. 막대가 서넛뿐이면 세로로 선
+    글자가 읽기 나쁘다(월 축은 열댓 개라 세운 채로 두는 편이 낫다).
+    """
     df = pd.DataFrame(rows)
     return (
         alt.Chart(df)
         .mark_bar()
         .encode(
-            x=alt.X(f"{x_col}:O", title=x_col, sort=x_sort),
+            x=alt.X(f"{x_col}:O", title=x_col, sort=x_sort,
+                    axis=alt.Axis(labelAngle=label_angle)
+                    if label_angle is not None else alt.Undefined),
             y=alt.Y(f"{y_col}:Q", title=y_col, stack="zero"),
             color=alt.Color(f"{color_col}:N", scale=alt.Scale(scheme=scheme),
                             legend=alt.Legend(title=None)),
@@ -2541,6 +2718,17 @@ def render_basis_box(posts: list[dict], photos: list[dict],
         icon="ℹ️",
     )
 
+# 화면 맨 윗줄 KPI. `compute_kpis`가 내는 것 중 **띄울 것만** 골라 적는다 —
+# dict를 그대로 그리면 집계에 키를 더할 때마다 칸이 늘어난다. 갈래별 건수는
+# 바로 아래 분석 기준 상자가 이미 출사/문화벙/보정벙으로 갈라 적고 있다.
+KPI_TOP = ("전체 게시글", "진행 출사", "취소 출사", "후기글", "사진 업로드", "테마 예상")
+
+# 개요 월별 추이에 그릴 선. 취소는 아래 종류별 막대가 전담한다 — 여기에까지
+# 넣으면 선이 아홉 개가 되어 아무것도 안 읽힌다.
+OVERVIEW_TREND = ("진행 출사", "진행 문화벙", "진행 보정벙",
+                  "후기글", "사진", "테마사진 참가")
+
+
 def _ranking_df(rows: list[dict], count_col: str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -2559,9 +2747,11 @@ def render_results(start_ym: int, end_ym: int, posts: list[dict],
     months = month_axis(start_ym, end_ym)
     st.subheader(f"{period} 인사이트")
 
+    # **띄울 칸을 여기서 고른다.** `compute_kpis`는 갈래별 값을 다 내는데,
+    # dict를 그대로 zip하면 키를 하나 더할 때마다 맨 윗줄 칸이 조용히 늘어난다.
     kpis = compute_kpis(posts, photos)
-    for col, (label, val) in zip(st.columns(len(kpis)), kpis.items()):
-        col.metric(label, val)
+    for col, label in zip(st.columns(len(KPI_TOP)), KPI_TOP):
+        col.metric(label, kpis[label])
 
     if applied and any(applied.values()):
         st.caption(f"📕 보정 시트 적용 — 공지 {applied.get('공지', 0)}건 · "
@@ -2630,13 +2820,25 @@ def _tab_overview(posts: list[dict], photos: list[dict], months: list[int],
     st.divider()
 
     k = compute_kpis(posts, photos)
-    if k["진행 출사"] + k["취소 출사"] > 0:
-        # 카테고리 분포 도넛은 🏷️ 카테고리 탭과 완전히 겹쳐 여기서 뺐다.
+    # **도넛에서 누적 막대로 바꿨다.** 도넛은 조각이 둘뿐이라 갈래를 얹을 자리가
+    # 없어, 진행/취소만 보이고 그 안에 벙이 섞여 있다는 사실이 가려졌다.
+    # 카테고리 분포 도넛은 🏷️ 카테고리 탭과 완전히 겹쳐 예전에 뺐다.
+    rows = [{"종류": 종류, "상태": 상태, "건수": k[f"{상태} {종류}"]}
+            for 종류 in KINDS for 상태 in ("진행", "취소")]
+    if sum(r["건수"] for r in rows):
         st.altair_chart(
-            donut({"진행": k["진행 출사"], "취소": k["취소 출사"]}, "출사 공지 진행/취소"),
+            stacked_bar(rows, "종류", "건수", "상태", "공지 종류별 진행/취소",
+                        x_sort=list(KINDS), label_angle=0),
             width="stretch",
         )
-    st.altair_chart(monthly_trend_chart(monthly_table(posts, photos), months), width="stretch")
+        기타 = sum(1 for p in posts if p.get("cat") == "A" and not post_kind(p))
+        if 기타:
+            st.caption(f"`일반공지`·카테고리 미상 **{기타}건**은 출사도 벙도 아니라 "
+                       "어느 막대에도 안 들어갑니다.")
+    mt = monthly_table(posts, photos)
+    st.altair_chart(
+        monthly_trend_chart({k2: mt[k2] for k2 in OVERVIEW_TREND}, months),
+        width="stretch")
     st.caption("월별 추이 — 출사는 출사일 기준, 후기·사진·테마사진 참가는 작성일 기준. "
                "출사·사진·테마 각각의 월별 상세는 해당 탭에 있습니다.")
 
@@ -2675,43 +2877,57 @@ def _tab_overview(posts: list[dict], photos: list[dict], months: list[int],
 
 
 def _tab_outings(posts: list[dict], months: list[int]) -> None:
-    st.markdown("#### 월별 출사 공지 (진행/취소)")
+    st.markdown("#### 월별 공지 (종류·상태별)")
     mt = monthly_table(posts, photos=[])
     mdf = pd.DataFrame(
         {"진행 출사": axis_values(mt["진행 출사"], months),
-         "취소 출사": axis_values(mt["취소 출사"], months)},
+         "취소 출사": axis_values(mt["취소 출사"], months),
+         "진행 문화벙": axis_values(mt["진행 문화벙"], months),
+         "진행 보정벙": axis_values(mt["진행 보정벙"], months)},
         index=axis_labels(months),
     )
-    st.bar_chart(mdf)
+    # **쌓지 않는다.** 쌓으면 막대 높이가 "출사 수"가 아니라 "모든 자리 수"가
+    # 되어, 지금까지 이 화면을 읽던 방법이 소리 없이 바뀐다.
+    st.bar_chart(mdf, stack=False)
     st.caption("출사일 기준 월별 집계.")
 
-    st.markdown("#### 출사 공지 작성 순위")
-    st.caption("작성자별 cat=A 공지 수 (진행+취소). 출사일이 대상 기간에 든 공지만 집계.")
-    ranking = outing_user_ranking(posts)
+    st.markdown("#### 공지 작성 순위 (출사 기준)")
+    st.caption("**정렬과 막대는 `출사 진행`** 입니다 — 이 모임의 주목적이라서요. "
+               "문화벙·보정벙은 같은 줄에 병기만 합니다. `출사 취소율`의 분모도 "
+               "출사 공지뿐입니다(벙은 펑이 드물어 섞으면 낮아 보입니다). "
+               "출사일이 대상 기간에 든 공지만 집계합니다.")
+    ranking = hosting_by_kind(posts)
     if ranking:
+        ranking = sorted(ranking, key=lambda r: (-r["출사 진행"], -r["모임 개최"],
+                                                 r["작성자"]))
         st.dataframe(
-            _ranking_df(ranking, "합계"),
+            _ranking_df(ranking, "출사 진행"),
             hide_index=True, width="stretch",
             column_config={
-                "합계": st.column_config.ProgressColumn(
-                    "합계", min_value=0, max_value=max(r["합계"] for r in ranking), format="%d"),
-                "취소율": st.column_config.NumberColumn("취소율", format="%.1f%%"),
+                "출사 진행": st.column_config.ProgressColumn(
+                    "출사 진행", min_value=0,
+                    max_value=max(r["출사 진행"] for r in ranking) or 1,
+                    format="%d"),
+                "출사 취소율": st.column_config.NumberColumn(
+                    "출사 취소율", format="%.1f%%"),
             },
         )
     else:
-        st.info("출사 공지가 없습니다.")
+        st.info("공지가 없습니다.")
 
-    st.markdown("#### 출사당 평균 참석 인원")
-    st.caption("모임 규모가 커지는지 줄어드는지. 참석자를 못 뽑은 출사도 분모에 들어가므로, "
-               "📊 개요의 보정 대기가 많으면 실제보다 낮게 나옵니다.")
-    avg = avg_attendance_trend(posts, months)
-    if any(v is not None for v in avg.values()):
-        st.line_chart(pd.DataFrame({"평균 참석 인원": [avg[m] for m in months]},
-                                   index=axis_labels(months)))
+    st.markdown("#### 종류별 평균 참석 인원")
+    st.caption("모임 규모가 커지는지 줄어드는지. 참석자를 못 뽑은 자리도 분모에 "
+               "들어가므로, 📊 개요의 보정 대기가 많으면 실제보다 낮게 나옵니다. "
+               "**그 달에 그 종류가 없으면 선이 끊깁니다**(0이 아닙니다).")
+    avgs = {k: avg_attendance_trend(posts, months, (k,)) for k in KINDS}
+    if any(v is not None for a in avgs.values() for v in a.values()):
+        st.line_chart(pd.DataFrame(
+            {k: [a[m] for m in months] for k, a in avgs.items()},
+            index=axis_labels(months)))
     else:
-        st.caption("매칭된 출사가 없습니다.")
+        st.caption("매칭된 자리가 없습니다.")
 
-    st.markdown("#### 출사 공지 전체 목록")
+    st.markdown("#### 공지 전체 목록")
     rows = outings_table(posts)
     if rows:
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
@@ -2839,41 +3055,58 @@ def _tab_attendance(posts: list[dict], months: list[int],
     )
 
     # 멤버 마스터 수는 🧑‍🤝‍🧑 멤버 탭에 있어 여기서 뺐다.
+    #
+    # **갈래를 갈라 적는다.** 예전에는 `cat == "A"` 전량을 세면서 라벨만
+    # `출사 공지`라고 적어, 보정·문화 벙이 그 숫자에 들어 있었다.
     rate = real_attendance_rate(posts)
     c1, c2, c3 = st.columns(3)
-    c1.metric("출사 공지", rate["공지"])
-    c2.metric("후기 매칭", rate["매칭"])
-    c3.metric("실제 진행률", f"{rate['진행률']}%")
+    c1.metric("출사 공지", rate[KIND_SHOOT]["공지"])
+    c2.metric("출사 후기 매칭", rate[KIND_SHOOT]["매칭"])
+    c3.metric("출사 매칭률", f"{rate[KIND_SHOOT]['진행률']}%")
+    st.caption("**매칭률은 진행률이 아닙니다** — 열린 자리 중 *후기가 붙어 누가 "
+               "갔는지 아는* 비율입니다. 후기가 없으면 참석자를 알 방법이 없습니다.")
+    st.dataframe(pd.DataFrame(
+        [{"종류": k, "공지": rate[k]["공지"], "후기 매칭": rate[k]["매칭"],
+          "매칭률": f"{rate[k]['진행률']}%"} for k in KINDS]),
+        hide_index=True, width="stretch")
 
     st.markdown("#### 멤버별 참석 횟수")
-    st.caption(f"`선호 카테고리`는 그 사람이 많이 간 순으로 최대 {PREF_TOP_N}개. "
-               f"카테고리가 모두 {len(ALL_CATS)}종이라 사실상 전체 분포이고, "
-               "한 사람만 자세히 보려면 🔎 멤버 상세 탭으로 가세요.")
-    counts = attendance_counts(posts)
+    st.caption(
+        "**`모임 참석` = `출사 참석` + `문화벙` + `보정벙`** 입니다 — 🔎 멤버 "
+        "상세와 같은 이름·같은 규칙입니다. 순위와 칭호가 보는 숫자는 `출사 참석` "
+        f"입니다. `선호 출사 카테고리`는 많이 간 순으로 최대 {PREF_TOP_N}개.")
+    counts = attendance_by_kind(posts)
     if counts:
-        pref = member_category_pref(posts)
+        # **출사 카테고리만.** 전량을 넘기면 `보정(22)`·`문화(9)`가 목록에 섞여
+        # `선호 출사 카테고리`라는 이름이 거짓이 된다. 벙은 바로 왼쪽 두 칸이
+        # 이미 말하고 있다. `club_context`는 전량을 그대로 쓴다 — 카테고리
+        # 칭호(`모여서 보정하실 분?`)의 분모가 벙이라서다.
+        pref = member_category_pref(denom_posts(posts, False))
         first, last = member_first_seen(posts)
         for r in counts:
-            r["선호 카테고리"] = top_category_label(pref[r["멤버"]])
+            r["선호 출사 카테고리"] = top_category_label(pref[r["멤버"]])
             r["첫 등장"] = first.get(r["멤버"], "—")
             r["최근"] = last.get(r["멤버"], "—")
         st.dataframe(
-            _ranking_df(counts, "참석횟수"),
+            _ranking_df(counts, "모임 참석"),
             hide_index=True, width="stretch",
             column_config={
-                "참석횟수": st.column_config.ProgressColumn(
-                    "참석횟수", min_value=0,
-                    max_value=max(r["참석횟수"] for r in counts) or 1, format="%d"),
+                "모임 참석": st.column_config.ProgressColumn(
+                    "모임 참석", min_value=0,
+                    max_value=max(r["모임 참석"] for r in counts) or 1,
+                    format="%d"),
                 # 5개면 `인물(12), 인물&풍경(9), 풍경(7), GN(3), 보정(1)`까지
                 # 들어가 기본 폭에서는 말줄임으로 잘린다.
-                "선호 카테고리": st.column_config.TextColumn(
-                    "선호 카테고리", width="large"),
+                "선호 출사 카테고리": st.column_config.TextColumn(
+                    "선호 출사 카테고리", width="large"),
             },
         )
     else:
-        st.info("매칭된 출사가 없습니다.")
+        st.info("매칭된 자리가 없습니다.")
 
-    st.markdown("#### 월별 참석 매트릭스")
+    st.markdown("#### 월별 출사 참석 매트릭스")
+    st.caption("**출사만** 셉니다 — 벙까지 세면 위 표의 `출사 참석`과 어긋납니다. "
+               "벙 참석은 위 표에서 문화벙·보정벙으로 봅니다.")
     mm, members = attendance_monthly_matrix(posts)
     if members:
         labels = axis_labels(months)
@@ -2887,15 +3120,16 @@ def _tab_attendance(posts: list[dict], months: list[int],
     else:
         st.caption("매칭된 출사가 아직 없어 매트릭스를 표시할 수 없습니다.")
 
-    st.markdown("#### 출사별 참석자")
-    st.caption("취소(펑) 출사는 제외. 공지 제목과 매칭된 후기 제목을 함께 표시해 "
+    st.markdown("#### 모임별 참석자")
+    st.caption("취소(펑)는 제외. 공지 제목과 매칭된 후기 제목을 함께 표시해 "
                 "매칭 정확도를 검증할 수 있습니다. **⚠️ 후기 없음** 행은 후기가 "
-                "작성되지 않은 출사입니다.")
+                "작성되지 않은 자리입니다. **`유형`으로 출사와 벙을 가릅니다** — "
+                "카테고리 이름만으로는 `보정`이 벙이라는 것을 아는 사람만 압니다.")
     rows = attendees_table(posts)
     if rows:
         n_missing = sum(1 for r in rows if r["상태"].startswith("⚠️"))
         if n_missing:
-            st.warning(f"후기가 작성되지 않은 출사 {n_missing}건 — 표에서 ⚠️로 표시됩니다.")
+            st.warning(f"후기가 작성되지 않은 자리 {n_missing}건 — 표에서 ⚠️로 표시됩니다.")
         df = pd.DataFrame(rows)
         styled = df.style.apply(
             lambda row: ["background-color: #fff4e5" if row["상태"].startswith("⚠️") else ""
@@ -2905,13 +3139,16 @@ def _tab_attendance(posts: list[dict], months: list[int],
         st.dataframe(styled, hide_index=True, width="stretch", height=400)
 
     st.markdown("#### 함께 간 사람")
-    st.caption(f"같은 출사에 함께 참석한 횟수 상위 {CO_ATTENDANCE_TOP}쌍. "
-               "`A 참석`은 그 사람의 전체 참석 횟수, `A 기준`은 그중 상대와 "
+    st.caption(f"같은 **출사**에 함께 참석한 횟수 상위 {CO_ATTENDANCE_TOP}쌍. "
+               "`A 참석`은 그 사람의 출사 참석 횟수, `A 기준`은 그중 상대와 "
                "함께한 비율입니다 — 같은 8회라도 한쪽에겐 대부분, 다른 쪽에겐 "
                "일부일 수 있습니다. **여기는 전체 상위 쌍이라 참석이 적은 "
                "사람은 올라오지 않습니다** — 특정인의 동행 전체는 🔎 멤버 상세 "
                "탭에서 봅니다.")
-    pairs = co_attendance(posts)
+    # **모수를 출사로 맞춘다.** 여기만 벙을 세고 있어서, 같은 두 사람의 동행
+    # 횟수가 이 표와 🔎 멤버 상세(모수=출사)에서 서로 달랐다. 캡션은 줄곧
+    # "같은 출사에"라고 적혀 있었으니 이제야 참말이 된다.
+    pairs = co_attendance(denom_posts(posts, False))
     if pairs:
         # 횟수는 `회`, 비율은 막대. 두 종류가 같은 숫자 모양이면 무엇을 보고
         # 있는지 알 수 없다 — 예전 표의 실제 문제였다.
@@ -3653,14 +3890,20 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
     mm, _ = attendance_monthly_matrix(posts)
     mine = mm.get(name, {})
     mt = monthly_table(my_posts, my_photos)
+    # **개최를 갈라 그린다.** `진행 출사` 하나만 쓰면 벙만 여는 분의 막대가
+    # 통째로 비어 "아무것도 안 여는 사람"으로 보인다 — 김지우 님은 출사 1건에
+    # 보정벙이 9건이다.
     st.bar_chart(pd.DataFrame({
-        "참석": [mine.get(m, 0) for m in months],
-        "개최": axis_values(mt["진행 출사"], months),
+        "출사 참석": [mine.get(m, 0) for m in months],
+        "출사 개최": axis_values(mt["진행 출사"], months),
+        "문화벙 개최": axis_values(mt["진행 문화벙"], months),
+        "보정벙 개최": axis_values(mt["진행 보정벙"], months),
         "후기": axis_values(mt["후기글"], months),
         "사진": axis_values(mt["사진"], months),
     }, index=axis_labels(months)), height=260)
     st.caption("개최는 출사일, 후기·사진은 작성일 기준 — 다른 탭의 월별 추이와 같습니다. "
-               "취소된 출사는 `개최`에 들어가지 않습니다.")
+               "취소(펑)는 `개최`에 들어가지 않습니다. `출사 참석`은 출사만 셉니다 — "
+               "벙 참석은 위 칸에 따로 있습니다.")
 
     pref = member_category_pref(posts).get(name)
     if pref:
