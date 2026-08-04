@@ -1524,6 +1524,10 @@ TITLE_QUOTA = {"관계": 5, "카테고리": 5, "유일": 1}    # 갈래별 정�
 # 적어 둘 수 있는 **이름**"의 목록이라 정원과 아무 상관이 없다.
 BADGE_TITLES = {"아이고 어르신"}
 
+# 칩 색. 이미 쓰는 네 가지를 피한다 — 운영진 파랑, 유령 회색, 휴면 주황,
+# 동명이인 빨강. 초록은 남아 있으면서 🌳와도 어울린다.
+BADGE_TITLE_COLOR = "green"
+
 # ── 인연 칭호(우연 대비) ────────────────────────────────────────
 # `동행`이 **함께 간 횟수와 비율**로 짝을 고르는 데 반해, `인연`은 **우연히
 # 겹칠 양을 빼고 남는 것**으로 고른다. 실제 데이터에서 두 지표의 1위는
@@ -3576,11 +3580,14 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
 
     badge_ts, period_ts = split_badge_titles(titles)
 
+    # **테두리 카드가 아니라 칩으로 그린다.** 아래 기간 칭호와 같은 카드에
+    # 담으면 생김새가 같아 성격이 다르다는 것이 안 보인다 — 위 운영진 배지와
+    # 같은 칩 모양이라야 "겨뤄서 딴 것이 아니라 늘 붙어 있는 것"으로 읽힌다.
+    # 근거는 칩 밑에 남긴다. "구-감노 시절부터…"가 이 칭호의 전부다.
     if badge_ts:
-        with st.container(border=True):
-            for col, t in zip(st.columns(len(badge_ts)), badge_ts):
-                col.markdown(f"##### {t['아이콘']} {t['칭호']}")
-                col.caption(t["근거"])
+        for col, t in zip(st.columns(len(badge_ts)), badge_ts):
+            col.badge(f"{t['아이콘']} {t['칭호']}", color=BADGE_TITLE_COLOR)
+            col.caption(t["근거"])
         st.caption("위는 **가입일로만 매기는 칭호**입니다 — 분석 기간을 좁혀도, "
                    "요즘 얼마나 나오시든 그대로입니다.")
     if period_ts:
