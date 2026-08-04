@@ -60,8 +60,18 @@ OUTING_CATS     = ["인물", "인물&풍경", "풍경", "GN"]
 NON_OUTING_CATS = ["보정", "문화", "일반공지"]
 ALL_CATS        = OUTING_CATS + NON_OUTING_CATS
 
+# **벙(번개)** — 촬영이 부목적이거나 아예 없는 모임.
+#   `문화`: 클라이밍·전시·보드게임·야구처럼 촬영이 곁다리이거나 없다.
+#   `보정`: 촬영이 없다. 모여서 사진을 다듬는 자리이고 절반 이상이 온라인이다.
+# `NON_OUTING_CATS`를 그대로 쓰면 안 된다 — 거기에는 `일반공지`가 들어 있는데
+# 그건 출사도 벙도 아닌 **모임이 아닌 글**이다.
+BUNG_CATS = ["보정", "문화"]
+
 CAT_RX    = re.compile(r"\[(" + "|".join(re.escape(c) for c in RAW_CATS) + r")\]")
 CANCEL_RX = re.compile(r"[\(\[]\s*펑\s*[\)\]]")
+# 온라인 벙. `\s*`는 "온 라인" 하나 때문이 아니라 **한 줄로 세 경우를 덮기
+# 때문**이다 — `온라인 보정벙`(띄어쓰기), `온라인보정벙`(붙임), `[온라인]`(괄호).
+ONLINE_RX = re.compile(r"온\s*라\s*인")
 
 DATE_PATTERN_WITH_YEAR = r"20(\d{2})[./\-](\d{1,2})[./\-](\d{1,2})"
 # 구분자 없이 붙여 쓴 `260308`. 연 20~29·월 01~12·일 01~31만 받고 앞뒤에 숫자가
@@ -176,6 +186,16 @@ def _post_dt(p: dict) -> datetime:
     """게시글 작성 시각 (공지 핀고정시 ot 사용)"""
     ts = p["ot"] if p.get("w_t") == 2000000000 else p["w_t"]
     return _ts_to_dt(ts)
+
+
+def is_online_title(title: str) -> bool:
+    """온라인 벙인가 — **제목만** 본다.
+
+    레코드에 키로 저장하지 않는다. `POST_KEYS`(`core/store.py`)는 raw 시트의
+    **헤더 순서 그 자체**라, 키를 하나 더하면 시트 스키마가 바뀌고 전량 재수집이
+    따라온다. 제목은 이미 레코드에 있으니 쓰는 자리에서 부르면 된다.
+    """
+    return bool(ONLINE_RX.search(title or ""))
 
 
 def _parse_title_meta(title: str) -> dict:

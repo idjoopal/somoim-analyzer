@@ -437,6 +437,53 @@ def test_a_read_failure_clears_once_the_sheet_is_readable_again():
     assert at.tabs                                   # 결과 화면이 돌아온다
 
 
+# ═══════════════════════════════════════════════════════════════
+# 🎯 벙 스위치
+# ═══════════════════════════════════════════════════════════════
+
+def _mixed():
+    """진행된 출사 2건 · 벙 2건. 스위치에 따라 모수가 2 ↔ 4로 갈린다.
+
+    `actually_held`는 후기가 매칭돼야 서므로 공지마다 후기를 하나씩 붙인다.
+    """
+    out = []
+    for i, cat in enumerate(["풍경", "인물", "보정", "문화"]):
+        out.append(notice(f"p{i}", "2026-03-0%d" % (i + 1), category=cat))
+        out.append(review(f"pr{i}", datetime(2026, 3, i + 2, 9, 0)))
+    return out
+
+
+def test_the_basis_box_spells_out_what_each_number_counts():
+    """`참석`이 무엇을 센 것인지 모르면 어떤 숫자도 읽을 수 없다.
+
+    스위치로 감추는 대신 셋을 다 적고 말을 정해 준다.
+    """
+    at = run(stores=make_stores(_mixed()))
+    assert not at.exception, [str(e) for e in at.exception]
+    말 = " ".join(i.value for i in at.info)
+    assert "출사 2건" in 말, 말
+    assert "문화벙 1건" in 말 and "보정벙 1건" in 말, 말
+    for 단서 in ("출사 참석", "모임 참석", "출사 참석률"):
+        assert 단서 in 말, (단서, 말)
+
+
+def test_there_is_no_scope_toggle_to_get_wrong():
+    """모수를 스위치로 바꾸면 켠 사람과 끈 사람이 다른 숫자를 보고 같은 얘기인
+    줄 안다. 하나로 고정하고 이름으로 구분한다."""
+    at = run(stores=make_stores(_mixed()))
+    assert not any(t.key == "count_bung" for t in at.toggle), \
+        [t.key for t in at.toggle]
+
+
+def test_the_member_card_shows_both_totals_side_by_side():
+    """출사만인지 벙까지인지가 사람마다 크게 달라 나란히 놓아야 읽힌다."""
+    at = run(stores=make_stores(_mixed()))
+    labels = [m.label for m in at.metric]
+    for 칸 in ("모임 참석", "출사 참석", "출사 참석률",
+              "문화벙 참석", "보정벙 참석", "출사 개최"):
+        assert 칸 in labels, (칸, labels)
+
+
 def test_hidden_theme_photos_are_reachable_regardless_of_period():
     """숨긴 사진 목록은 "내가 뭘 숨겼나"이지 기간별 뷰가 아니다.
 
@@ -1017,7 +1064,7 @@ def test_member_focus_has_a_picker_and_draws_that_person():
     # 활동이 없는 사람을 골라 놓고 화면이 빈 줄 모른다.
     assert [o.split(" · ")[0] for o in pick.options] == ["나무", "바다", "하늘"]
     assert all("참석" in o and "사진" in o for o in pick.options)
-    assert "참석률" in [m.label for m in at.metric]
+    assert "출사 참석률" in [m.label for m in at.metric]
 
 
 def test_member_focus_switches_person():

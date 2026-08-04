@@ -17,6 +17,7 @@ import pandas as pd
 import streamlit as st
 
 from core.collector import (
+    BUNG_CATS,
     GROUP_NAME,
     NON_OUTING_CATS,
     OUTING_CATS,
@@ -30,6 +31,7 @@ from core.collector import (
     find_duplicate_member_names,
     in_ym_range,
     is_multi_year,
+    is_online_title,
     match_outings_with_reviews,
     month_axis,
     parse_join_name_aliases,
@@ -93,6 +95,61 @@ def post_ym(p: dict) -> int | None:
     """공지의 시간축은 출사일 — 미상이면 None(축에 넣을 수 없음)."""
     od = p.get("outing_date")
     return ym_of(date.fromisoformat(od)) if od else None
+
+
+# ═══════════════════════════════════════════════════════════════
+# 출사와 벙 — 이 모임이 무엇을 하러 모이나
+# ═══════════════════════════════════════════════════════════════
+#
+# 이 모임의 주목적은 **출사**(인물·인물&풍경·풍경·GN)다. `문화`는 벙(번개)이라
+# 촬영이 곁다리이거나 없고, `보정`은 촬영이 아예 없이 모여서 사진을 다듬는
+# 자리다. 둘은 같은 무게로 셀 수 없다.
+#
+# `is_outing` 필드가 이미 있지만 **판정에는 안 쓴다.** 그건 수집 시점에 파생된
+# 값이고, 사람이 보정 시트에서 고치는 것은 `category`다(`core/store.py`가 거기서
+# `is_outing`을 다시 만든다). 진실이 하나여야 한다.
+
+def is_shoot(p: dict) -> bool:
+    """출사(촬영이 주목적)인가."""
+    return p.get("cat") == "A" and p.get("category") in OUTING_CATS
+
+
+def is_bung(p: dict) -> bool:
+    """벙(보정·문화)인가. `일반공지`는 출사도 벙도 아니다."""
+    return p.get("cat") == "A" and p.get("category") in BUNG_CATS
+
+
+def is_online_bung(p: dict) -> bool:
+    """온라인 벙인가. 제목에서 그때그때 읽는다 — 저장하지 않는다."""
+    return is_bung(p) and is_online_title(p.get("title") or "")
+
+
+def kind_label(p: dict) -> str:
+    """`출사` / `벙` / `벙(온라인)`. 표가 세 곳이라 문자열은 한 곳에서 만든다."""
+    if is_shoot(p):
+        return "출사"
+    if is_bung(p):
+        return "벙(온라인)" if is_online_bung(p) else "벙"
+    return "기타"
+
+
+def denom_posts(posts: list[dict], 벙포함: bool) -> list[dict]:
+    """비율·순위·칭호의 **모수**가 되는 글.
+
+    **공지만 거른다** — 후기·가입인사는 그대로 통과시킨다. 그것까지 빼면 후기율·
+    연차 칭호가 벙 스위치에 따라 흔들리는데, 후기를 쓴 사실은 벙과 무관하다.
+
+    분모를 열다섯 군데에서 각각 거르면 반드시 어긋난다. 규칙은 여기 한 곳에만
+    둔다.
+
+    `벙포함`은 **화면 스위치가 아니다.** 화면은 모수를 하나로 고정하고 숫자마다
+    이름을 달아 구분한다(`출사 참석` / `모임 참석`) — 스위치로 두면 켠 사람과 끈
+    사람이 서로 다른 숫자를 보면서 같은 얘기인 줄 안다. 이 인자는 "벙까지 세면
+    예전 값이 그대로 나온다"를 테스트가 확인하는 이음매로 남긴다.
+    """
+    if 벙포함:
+        return posts
+    return [p for p in posts if p.get("cat") != "A" or is_shoot(p)]
 
 
 def compute_kpis(posts: list[dict], photos: list[dict]) -> dict[str, int]:
@@ -167,7 +224,7 @@ def category_counts(posts: list[dict]) -> list[dict]:
         if sub:
             rows.append({
                 "카테고리": c,
-                "유형": "출사" if c in OUTING_CATS else "활동",
+                "유형": "출사" if c in OUTING_CATS else "벙",
                 "개수": len(sub),
                 "좋아요": sum(p["likes"] for p in sub),
             })
@@ -318,7 +375,7 @@ def outings_table(posts: list[dict]) -> list[dict]:
             "D-day": f"+{dday}" if dday is not None and dday >= 0 else (str(dday) if dday is not None else "-"),
             "작성자": p["author"],
             "카테고리": p["category"] or "-",
-            "유형": "출사" if p["is_outing"] else "활동",
+            "유형": kind_label(p),
             "상태": "취소" if p["is_canceled"] else "진행",
             "제목": p["title"],
             "좋아요": p["likes"],
@@ -1020,16 +1077,33 @@ def bottom_share(name: str, scores: list[tuple[str, float]], share: float, *,
 
 
 def club_context(posts: list[dict], photos: list[dict], members: list[dict],
-                 months: list[int] | None = None) -> dict:
+                 months: list[int] | None = None, 벙포함: bool = False) -> dict:
     """전 멤버 공통 집계 — 순위표·쌍·첫 등장·휴면 명단. **한 번 만들어 돌려 쓴다.**
 
     `member_profile`은 안에서 `attendance_counts`·`photo_user_ranking`·
     `outing_user_ranking`·`dormant_members`·`member_first_seen`을 매번 다시
     돈다. 한 사람만 볼 때는 문제가 없지만 **칭호 분포는 전 멤버를 훑으므로**
     쉰 명이면 그게 쉰 번이 되어 구역을 열 때마다 몇 초씩 멈춘다.
+
+    **여기서 두 세계를 만든다.** 원본 `posts`와 스위치를 함께 받아 안에서
+    가르는 이유: 호출자가 자른 목록과 원본을 둘 다 들고 다니면 어느 쪽을
+    넘겼는지 헷갈려 반드시 어긋난다.
+
+      - `모수` = `denom_posts(...)` — **비율·순위·칭호**의 분모
+      - `posts`(원본) — **존재 판정과 카테고리**. 아래 셋은 절대 안 자른다.
+
+    잘라서는 안 되는 것 셋:
+
+    ① **첫 등장·휴면** — 벙만 다니는 사람이 스위치 하나로 "휴면"이 된다.
+       실제로 김지우는 27회 중 18회가 벙이다. 안 나온 것이 아니라 벙에 나왔다.
+    ② **카테고리** — 벙을 빼면 분모가 0이 되어 `모여서 보정하실 분?`·
+       `문화?시민`이 **영영 0명**이 된다. 카테고리 칭호는 비율이라 자기 분모를
+       스스로 들고 있어서 출사 모수와 안 섞인다.
+    ③ **벙 지표** — 벙 칭호의 재료다. 스위치와 무관하게 늘 전량을 본다.
     """
+    모수 = denom_posts(posts, 벙포함)
     photo_rows = photo_user_ranking(photos)
-    pair, solo = _attendance_pairs(posts)
+    pair, solo = _attendance_pairs(모수)
 
     # 쌍 그래프의 차수 = 그 사람이 함께 가 본 사람 수. 쌍을 이미 다 세어
     # 두었으므로 한 번 더 훑기만 하면 된다.
@@ -1038,12 +1112,13 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
         deg[a] += 1
         deg[b] += 1
 
+    # ① 존재 판정은 **원본**으로 — 벙에 나온 것도 나온 것이다.
     first, last = member_first_seen(posts)
 
     # 활동 기간 대비 참석 — 늦게 합류한 사람은 누적으로는 영원히 위로 못 간다.
     # 월 축을 알아야 재므로 `months`를 준 경우에만 만든다.
     attended: dict[str, int] = Counter()
-    for p in posts:
+    for p in 모수:
         if p.get("cat") == "A" and p.get("actually_held"):
             for n in p.get("attendees") or []:
                 attended[n] += 1
@@ -1051,27 +1126,68 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
                                / _active_months(m.get("joined_at"), months), 2))
                for m in members or [] if m.get("mn")] if months else []
 
+    # ③ 벙 지표 — 모수와 무관하게 **늘 전량**을 본다.
+    #
+    # 문화와 보정은 따로 센다. 같은 벙이라도 문화는 클라이밍·전시처럼 나가서
+    # 노는 자리이고 보정은 절반 이상이 온라인이라, 한 덩어리로 묶으면 성향이
+    # 정반대인 두 사람이 같은 숫자로 보인다.
+    벙참석: Counter = Counter()
+    문화참석: Counter = Counter()
+    보정참석: Counter = Counter()
+    온라인참석: Counter = Counter()
+    벙개최: Counter = Counter()
+    모임참석: Counter = Counter()
+    for p in posts:
+        if p.get("cat") == "A" and p.get("actually_held"):
+            for n in set(p.get("attendees") or []):
+                모임참석[n] += 1
+        if not is_bung(p):
+            continue
+        if not p.get("is_canceled") and p.get("author"):
+            벙개최[p["author"]] += 1
+        if not p.get("actually_held"):
+            continue
+        온라인 = is_online_bung(p)
+        칸 = 문화참석 if p.get("category") == "문화" else 보정참석
+        for n in set(p.get("attendees") or []):
+            벙참석[n] += 1
+            칸[n] += 1
+            if 온라인:
+                온라인참석[n] += 1
+
     return {
-        "참석": [(r["멤버"], r["참석횟수"]) for r in attendance_counts(posts)],
+        "참석": [(r["멤버"], r["참석횟수"]) for r in attendance_counts(모수)],
         # 펑만 낸 사람은 모수에서 뺀다 — "펑 아닌 출사를 연 사람들 중 몇 등"이라야
         # 말이 된다. 정렬은 믿지 않는다(`outing_user_ranking`은 합계 순이다).
         "개최": [(r["작성자"], r["진행"])
-                for r in outing_user_ranking(posts) if r["진행"]],
+                for r in outing_user_ranking(모수) if r["진행"]],
         "사진": [(r["작성자"], r["사진수"]) for r in photo_rows],
         "테마": [(r["작성자"], r["테마예상"]) for r in photo_rows if r["테마예상"]],
         "좋아요": [(r["작성자"], r["장당좋아요"]) for r in photo_rows
                 if r["사진수"] >= LIKE_RANK_MIN_PHOTOS],
         "동행자": [(n, c) for n, c in deg.items()],
         # 참석한 출사의 평균 인원 — `정출킬러`·`소수정예`가 양 끝에서 읽는다.
-        "참석인원": list(_attended_crowd_all(posts).items()),
+        "참석인원": list(_attended_crowd_all(모수).items()),
         "쌍": (pair, solo),
         # 우연 대비 1순위. **전원분을 여기서 한 번에 만든다** — "서로가 서로의
         # 1순위"는 상대 것도 알아야 판정되므로, 사람마다 다시 세면 전 멤버
         # 칭호를 뽑을 때 O(사람 × 쌍)이 된다.
-        "인연1위": _affinity_top(pair, solo, _held_count(posts)),
+        "인연1위": _affinity_top(pair, solo, _held_count(모수)),
         "첫등장": first,
         "최근": last,
+        # ① 휴면도 **원본**으로 — 벙에 꾸준히 나온 사람을 쉰 사람이라 부르면 안 된다.
         "휴면": {r["멤버"] for r in dormant_members(posts, members)},
+        # ③ 벙 — 모수와 무관하게 전량
+        "벙참석": list(벙참석.items()),
+        "온라인참석": list(온라인참석.items()),
+        "벙개최": list(벙개최.items()),
+        "벙참석수": dict(벙참석),
+        "문화참석수": dict(문화참석),
+        "보정참석수": dict(보정참석),
+        "온라인참석수": dict(온라인참석),
+        "벙개최수": dict(벙개최),
+        # 출사 + 문화벙 + 보정벙 — 이 모임에 나온 **모든** 자리
+        "모임참석수": dict(모임참석),
         "밀도": density,
         "_축": months,
         # 여기서 한 번만 읽는다. 멤버마다 `date.today()`를 부르면 자정을 넘기는
@@ -1082,11 +1198,16 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
                   for p in posts if p.get("cat") == "E"},
         # 아래 셋은 칭호가 멤버마다 다시 돌면 O(게시글×참석자)가 되는 것들이다.
         # 전 멤버를 훑는 경로가 생겼으므로 여기서 한 번만 만든다.
+        # ② 카테고리는 **원본**으로. 벙을 빼면 `모여서 보정하실 분?`·`문화?시민`이
+        #    분모 0으로 영영 안 나온다.
         "카테고리": member_category_pref(posts),
         # 카테고리별로 **몇 건이나 열렸나**. 카테고리 칭호의 분모다.
         "카테고리총계": Counter(
             p.get("category") for p in posts
             if p.get("cat") == "A" and p.get("actually_held") and p.get("category")),
+        # 성향(카테고리) 칭호의 문턱이 읽을 **안 걸러진 참석 수**. 분모는 원본인데
+        # 문턱만 걸러진 수로 재면 기준이 서로 어긋난다.
+        "전체참석수": {r["멤버"]: r["참석횟수"] for r in attendance_counts(posts)},
         "공지": {p["id"]: p for p in posts if p.get("cat") == "A"},
     }
 
@@ -1237,7 +1358,8 @@ def _days_to_first(joined, first_iso: str | None) -> int | None:
 
 
 def member_profile(name: str, posts: list[dict], photos: list[dict],
-                   members: list[dict], ctx: dict | None = None) -> dict:
+                   members: list[dict], ctx: dict | None = None,
+                   벙포함: bool = False) -> dict:
     """한 사람의 모든 스칼라. 화면 맨 위 배지·KPI가 여기서 나온다.
 
     **참석률의 분모는 매칭된 출사뿐이다.** 후기가 없는 출사는 누가 갔는지 알
@@ -1253,15 +1375,18 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
     `ctx`는 `club_context`를 넘기는 통로다 — 전 멤버를 훑을 때 공통 집계를
     쉰 번 다시 돌지 않기 위한 것. 안 넘기면 스스로 만든다.
     """
-    ctx = ctx or club_context(posts, photos, members)
+    ctx = ctx or club_context(posts, photos, members, 벙포함=벙포함)
     m = next((x for x in members or [] if x.get("mn") == name), {})
-    my_posts = [p for p in posts if p.get("author") == name]
+    # 비율·순위가 보는 **모수** — 기본은 출사만이다.
+    모수 = denom_posts(posts, 벙포함)
+    my_posts = [p for p in 모수 if p.get("author") == name]
     # **가입인사는 활동이 아니다** — 이유는 `activity_authors`에 적어 두었다.
     # 🧑‍🤝‍🧑 멤버 탭도 같은 규칙을 쓴다(갈라지면 같은 사람이 탭마다 달라진다).
-    my_real = [p for p in my_posts if p.get("cat") != "J"]
+    my_real = [p for p in posts
+               if p.get("author") == name and p.get("cat") != "J"]
     my_photos = [p for p in photos if p.get("author") == name]
 
-    held = [p for p in posts if p.get("cat") == "A" and p.get("actually_held")]
+    held = [p for p in 모수 if p.get("cat") == "A" and p.get("actually_held")]
     attended = [p for p in held if name in (p.get("attendees") or [])]
 
     hosted = [p for p in my_posts if p.get("cat") == "A"]
@@ -1318,10 +1443,30 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
         "테마사진": len(themed),
         "테마 참여월": len({ym_of(p["posted_at"]) for p in themed}),
         "동행자": dict(ctx["동행자"]).get(name, 0),
+        # 벙은 스위치와 무관하게 전량을 센다 — 벙 지표·칭호의 재료다.
+        # 개최도 마찬가지다. `개최 진행`은 모수를 따라 벙을 포함할 수 있지만,
+        # `출사 개최`는 **늘 출사만** 센다 — `운영진도 아닌데`가 스위치에 따라
+        # 벙 개최자에게 붙어 버리면 칭호가 뜻을 잃는다.
+        "출사 개최": sum(1 for p in posts
+                      if is_shoot(p) and p.get("author") == name
+                      and not p.get("is_canceled")),
+        "벙 참석": (ctx.get("벙참석수") or {}).get(name, 0),
+        "문화벙 참석": (ctx.get("문화참석수") or {}).get(name, 0),
+        "보정벙 참석": (ctx.get("보정참석수") or {}).get(name, 0),
+        "온라인 벙 참석": (ctx.get("온라인참석수") or {}).get(name, 0),
+        "벙 개최": (ctx.get("벙개최수") or {}).get(name, 0),
+        # 출사 + 문화벙 + 보정벙. `참석`은 **출사만**이라 이름이 헷갈리기 쉬워
+        # 둘을 나란히 두고 화면에서 이름으로 구분한다.
+        "모임 참석": (ctx.get("모임참석수") or {}).get(name, 0),
         # `유령`은 **활동 0건이라는 사실 그대로** 둔다. 갓 가입한 사람을 여기서
         # 빼면 칭호가 `유령 회원`과 `아직 첫 출사 전`을 가를 근거를 잃는다.
         # 화면에 "유령"이라 쓸지는 `신입`을 함께 보고 정한다.
-        "유령": not my_real and not my_photos and not attended,
+        #
+        # **벙 참석을 반드시 함께 본다.** 안 그러면 벙만 다니는 사람이 스위치
+        # 하나로 유령이 된다 — 실제로 김지우는 27회 중 18회가 벙이다. 안 나온
+        # 것이 아니라 벙에 나온 것이다.
+        "유령": not my_real and not my_photos and not attended
+                and not (ctx.get("벙참석수") or {}).get(name, 0),
         "신입": joined_recently(m.get("joined_at"), ctx.get("_축") or []),
         "휴면": name in ctx["휴면"],
         # 아래 둘은 칭호(`감노 때부터 계셨네`·`가입하자마자 출동`)가 쓴다.
@@ -1370,6 +1515,14 @@ PAIR_MIN_JOINT = 3      # 이보다 적게 만난 쌍은 우연과 구분되지 
 PAIR_MIN_LIFT = 1.4     # lift **하한**의 문턱(생 lift가 아니다)
 BOND_MIN_SHARE = 50     # 짝사랑 쪽에 요구하는 내 출사 비중
 
+# ── 벙 · 자발 칭호 ─────────────────────────────────────────────
+# 모임 전체에서 벙은 참석의 19%, 온라인 벙은 7%다. 아래 비중은 각각 그 두 배
+# 남짓이라 "유난히 그쪽"이라 부를 만한 선이다.
+BUNG_MIN_JOIN = 3       # 이보다 적으면 취향이라기보다 우연이다
+BUNG_MIN_SHARE = 40     # 벙이 내 참석에서 차지하는 비중
+ONLINE_MIN_SHARE = 25   # 온라인 벙이 내 참석에서 차지하는 비중
+SELF_HOST_MIN = 2       # 비운영진이 연 출사가 이만큼이면 우연이 아니다
+
 # `아맞다후기`를 받을 수 있는 후기율의 위 끝. 후기는 늘 쓰는 것이 맞으니
 # 여기까지가 "낮다"고 부를 수 있는 선이고, 그보다 잘 쓰면 아무도 안 받는다.
 AWOL_REVIEW_MAX = 80
@@ -1385,7 +1538,8 @@ CATEGORY_TITLES = {
 
 
 def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
-                months: list[int], ctx: dict | None = None) -> dict[str, list[dict]]:
+                months: list[int], ctx: dict | None = None,
+                벙포함: bool = False) -> dict[str, list[dict]]:
     """전 멤버의 최종 칭호 `{이름: [칭호…]}`.
 
     **한 사람만 따로 낼 수 없다.** 같은 칭호를 몇 명이 받는지 알아야 정원을
@@ -1403,7 +1557,7 @@ def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
     비용은 멤버 94명·사진 1만 장에서 0.1초대다 — `ctx`가 공통 집계를 들고
     있어서 사람마다 다시 도는 것이 거의 없다.
     """
-    ctx = ctx or club_context(posts, photos, members, months)
+    ctx = ctx or club_context(posts, photos, members, months, 벙포함=벙포함)
     pair = ctx["쌍"]
 
     cand: dict[str, list[dict]] = {}
@@ -1411,7 +1565,7 @@ def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
         n = m.get("mn")
         if not n:
             continue
-        prof = member_profile(n, posts, photos, members, ctx)
+        prof = member_profile(n, posts, photos, members, ctx, 벙포함=벙포함)
         cand[n] = _title_candidates(
             n, prof, member_companions(n, posts, pair), posts, photos, months, ctx)
 
@@ -1611,7 +1765,11 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     tier("테마", (90, "🎨", "테마사진의 제왕"), (78, "🖌", "테마사진 프로 참석러"),
          바닥=n_theme >= 2, 강도=n_theme, share=0.15, 순서말="많이 낸",
          사실=f"테마사진 {n_theme}장을 {prof['테마 참여월']}개월에 걸쳐 냈습니다")
-    tier("개최", (90, "📢", "출사장도 장이다"), (77, "🗣", "심심한데 출사쳐야지"),
+    # **개최는 참석보다 위에 둔다.** 이 모임은 운영진이 아니어도 출사를 열 수
+    # 있고 그것을 지향한다 — 개최 부담을 나눠 지는 것이 그냥 나오는 것보다
+    # 귀하다. 그래서 93 > 참석 90, 80 > 참석 76이다. 동행 95는 그대로 위에
+    # 남긴다(관계 칭호가 맨 앞에 오는 지금 결이 자연스럽다).
+    tier("개최", (93, "📢", "출사장도 장이다"), (80, "🗣", "심심한데 출사쳐야지"),
          바닥=hosted_ran >= 2, 강도=hosted_ran, share=0.30, 순서말="많이 연",
          사실=f"펑이 아닌 출사를 {hosted_ran}건 열었습니다")
     tier("참석", (90, "🥾", "이게 본업이에요"), (76, "🔥", "프로 참석러"),
@@ -1735,6 +1893,10 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     # 풍경·보정·문화가, ②만 썼을 때 인물&풍경·인물이 0명이었다. ③이 그 사이
     # 크기(19~28건)의 계열을 메운다.
     all_held = sum(ctx["카테고리총계"].values())
+    # 카테고리 분모는 벙을 포함한 **원본**이다(`club_context` 참고). 문턱만
+    # 걸러진 참석 수로 재면 기준이 서로 어긋나므로 여기서도 원본을 쓴다 —
+    # 안 그러면 벙을 많이 다닌 사람이 6회 문턱에서 억울하게 떨어진다.
+    att_all = (ctx.get("전체참석수") or {}).get(name, att)
     best = None
     for cat, cnt in pref.items():
         held = ctx["카테고리총계"].get(cat, 0)
@@ -1743,10 +1905,10 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
         ratio = _pct(cnt, held) if held >= 4 and cnt >= 3 else 0.0
         lift = ((cnt / total) / (held / all_held)
                 if held >= 4 and cnt >= 3 and total >= 5 and all_held else 0.0)
-        if not ((att >= 6 and own >= 75) or ratio >= 40 or lift >= 3):
+        if not ((att_all >= 6 and own >= 75) or ratio >= 40 or lift >= 3):
             continue
         # 어느 쪽으로 걸렸든 가장 또렷한 숫자를 근거로 보여 준다.
-        score = max(own if att >= 6 and own >= 75 else 0, ratio, lift * 10)
+        score = max(own if att_all >= 6 and own >= 75 else 0, ratio, lift * 10)
         if best is None or score > best[1]:
             best = (cat, score, cnt, held, own, ratio, lift)
     if best:
@@ -1765,13 +1927,58 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
                   f"{_pctstr(_pct(held, all_held))}뿐이라 모임 평균의 {lift:.1f}배입니다")
         put("성향", 73, "🏞", CATEGORY_TITLES.get(cat, f"{cat} 마니아"),
             근거, score, "카테고리")
-    elif att >= 6 and pref and len(pref) >= 4:
+    elif att_all >= 6 and pref and len(pref) >= 4:
         cat, cnt = pref.most_common(1)[0]
         share = _pct(cnt, total)
         if share <= 40:
             put("성향", 71, "🌈", "잡식성",
                 f"{len(pref)}가지 카테고리를 고루 다니십니다 — 가장 많은 {cat}조차 "
             f"{_pctstr(share)}뿐이라 어느 한쪽으로 쏠리지 않습니다", len(pref))
+
+    # ── 벙 — 사진을 안 찍는 자리 ─────────────────────────────
+    #
+    # 벙(보정·문화)은 촬영이 곁다리이거나 없다. 출사가 이 모임의 목적이므로
+    # 벙은 **곁가지 지표**로 둔다 — 한 지표로 묶어 세 칸 중 하나만 쓰게 한다.
+    # 온라인 쪽 우선순위를 높여, 온라인이 잦은 사람은 그쪽이 이긴다.
+    #
+    # 문턱의 근거: 모임 전체에서 벙은 참석의 19%, 온라인 벙은 7%다. 40%·25%는
+    # 각각 그 두 배 남짓이라 "유난히 그쪽"이라 부를 만하다. 30%까지 낮추면
+    # 열 명이 되어 그냥 모임 평균이 되고, 50%면 두 명뿐이라 예외가 된다.
+    #
+    # 우선순위 84·81은 **곁가지치고는 높다.** 낮게(76·72) 두었더니 조건을 지난
+    # 다섯 명 중 화면에 뜬 사람이 한 명뿐이었다 — 세 칸이 동행 88·인연 87·
+    # 규모 83에 먼저 찬다. 참석의 3분의 2가 벙인 사람에게 그 사실은 `정출킬러`
+    # 보다 그 사람다운 얘기다. 다만 관계 칭호(95·88·87) 아래에는 둔다.
+    벙 = prof["벙 참석"]
+    온라인 = prof["온라인 벙 참석"]
+    전체참석 = att_all
+    if 온라인 >= BUNG_MIN_JOIN and _pct(온라인, 전체참석) >= ONLINE_MIN_SHARE:
+        put("벙", 84, "💻", "집에서 뵙겠습니다",
+            f"온라인 벙에 {온라인}회 나오셨습니다 — 내 참석의 "
+            f"{_pctstr(_pct(온라인, 전체참석))}입니다. 카메라 없이도 자주 뵙네요",
+            _pct(온라인, 전체참석))
+    elif 벙 >= BUNG_MIN_JOIN and _pct(벙, 전체참석) >= BUNG_MIN_SHARE:
+        put("벙", 81, "🎲", "카메라는 두고 왔어요",
+            f"보정·문화 벙에 {벙}회 — 내 참석 {전체참석}회의 "
+            f"{_pctstr(_pct(벙, 전체참석))}입니다. 찍으러만 다니시는 게 아니군요",
+            _pct(벙, 전체참석))
+
+    # ── 자발 — 운영진이 아닌데 출사를 여는 사람 ────────────────
+    #
+    # 이 모임은 운영진이 아니어도 출사를 열 수 있고 **그것을 지향한다** —
+    # 운영진의 개최 부담을 나누기 위해서다. 지표를 `개최`와 따로 파는 이유:
+    # 많이 여는 분은 `출사장도 장이다`와 **둘 다** 받아야 말이 된다. 하나는
+    # "많이 열었다", 하나는 "운영진도 아닌데 열었다"로 서로 다른 얘기다.
+    #
+    # `prof["운영진"]`은 진작 있었는데 어느 칭호도 안 쓰고 있었다.
+    # 세는 것은 **출사 개최뿐**이다. `hosted_ran`을 그대로 쓰면 스위치를 켰을 때
+    # 보정·문화 벙까지 섞여, "출사를 여는 사람"을 알아보자는 칭호가 벙을 많이
+    # 연 사람에게도 붙는다(실측에서 김지우가 10건으로 올라왔다).
+    출사개최 = prof["출사 개최"]
+    if not prof["운영진"] and 출사개최 >= SELF_HOST_MIN:
+        put("자발", 86, "🙌", "운영진도 아닌데",
+            f"운영진이 아닌데 펑이 아닌 출사를 {출사개최}건 열었습니다 — "
+            "개최 부담을 나눠 지고 계십니다", 출사개최)
     # 요일은 성향과 **다른 축**이다 — 무엇을 찍느냐(카테고리)와 언제 가느냐는
     # 같이 나와도 서로 겹치는 말이 아니다. 한 지표로 묶으면 둘 중 하나가
     # 늘 묻힌다.
@@ -2250,17 +2457,40 @@ def slice_period(analysis: dict, start_ym: int, end_ym: int) -> tuple[list[dict]
 # 렌더링
 # ═══════════════════════════════════════════════════════════════
 
-def render_basis_box(posts: list[dict], photos: list[dict], period_label: str) -> None:
+def render_basis_box(posts: list[dict], photos: list[dict],
+                     period_label: str) -> None:
     cov = period_coverage(posts, photos)
     rng = ""
     if cov:
         rng = f" · 실제 데이터 {cov[0].isoformat()} ~ {cov[1].isoformat()}"
+    # **말을 먼저 정하고 숫자를 보여 준다.** `참석`이 무엇을 센 것인지 모르면
+    # 어떤 숫자도 읽을 수 없다. 감추거나 스위치로 바꾸는 대신 셋을 다 적는다.
+    출사 = sum(1 for p in posts if is_shoot(p) and p.get("actually_held"))
+    문화 = sum(1 for p in posts
+              if p.get("category") == "문화" and p.get("cat") == "A"
+              and p.get("actually_held"))
+    보정 = sum(1 for p in posts
+              if p.get("category") == "보정" and p.get("cat") == "A"
+              and p.get("actually_held"))
+    온 = sum(1 for p in posts if is_online_bung(p) and p.get("actually_held"))
     st.info(
         f"**분석 기준** — 대상 기간: {period_label}{rng}\n\n"
+        f"- **이 기간에 열린 자리**: 출사 **{출사}건** · 문화벙 {문화}건 · "
+        f"보정벙 {보정}건 (보정·문화 중 온라인 {온}건) = 모두 "
+        f"{출사 + 문화 + 보정}건\n"
+        "- **말 정하기** — `출사`는 촬영이 목적인 자리(인물·인물&풍경·풍경·GN)로 "
+        "**이 모임이 가장 중요하게 보는 것**입니다. `문화벙`은 촬영이 곁다리이거나 "
+        "없는 번개(클라이밍·전시·보드게임), `보정벙`은 촬영 없이 모여 사진을 "
+        "다듬는 자리라 절반 이상이 온라인입니다\n"
+        "- **`출사 참석`은 출사만, `모임 참석`은 벙까지** 셉니다. `출사 참석률`은 "
+        f"열린 출사 {출사}건 중 내가 나온 비율이고, **순위·칭호는 출사 기준**입니다 "
+        "— 벙은 따로 셉니다\n"
         "- **기간 기준**: 출사 공지(공지글)는 *출사일*, 후기·가입인사·사진은 *작성일* 기준\n"
         "- **인기**: 좋아요 수(lc)로 정렬, 댓글 수(rn) 병기\n"
-        "- **테마사진 참가**: 댓글이 달린 사진(rn>0)을 테마사진 참여로 간주 — 댓글 내용은 비공개라 *추정*\n"
-        "- **취소(펑)**: 제목에 `(펑)`/`[펑]` 포함 · **출사 카테고리**: 인물(1:1인물·1:1인물출사 포함)·인물&풍경·풍경·GN / 활동: 보정·문화",
+        "- **테마사진 참가**: 댓글이 달린 사진(rn>0)을 테마사진 참여로 간주 — 댓글 내용은 비공개라 *추정*. "
+        "사진 업로드는 모임이 앱 상위에 노출되도록 **장려하는 활동**이지 모임의 목적은 아닙니다\n"
+        "- **취소(펑)**: 제목에 `(펑)`/`[펑]` 포함 · **온라인 벙**: 제목에 `온라인` 포함 · "
+        "`일반공지`와 카테고리 미상은 출사도 벙도 아니라 어느 숫자에도 안 들어갑니다",
         icon="ℹ️",
     )
 
@@ -3000,7 +3230,12 @@ def _gallery_section(photos: list[dict], months: list[int]) -> None:
 
 
 def _category_section(posts: list[dict], months: list[int]) -> None:
-    st.caption("출사 공지(cat=A) 제목의 [카테고리] 태그 기준. 출사: 인물(1:1인물·1:1인물출사 포함)·인물&풍경·풍경·GN / 활동: 보정·문화.")
+    온 = sum(1 for p in posts if is_online_bung(p))
+    st.caption(
+        "공지(cat=A) 제목의 [카테고리] 태그 기준. "
+        "**출사**(촬영이 목적): 인물(1:1인물·1:1인물출사 포함)·인물&풍경·풍경·GN / "
+        "**벙**(번개 — 촬영이 곁다리이거나 없음): 보정·문화"
+        + (f" · 그중 제목에 `온라인`이 든 벙 {온}건." if 온 else "."))
     rows = category_counts(posts)
     if not rows:
         st.info("분류된 카테고리가 없습니다.")
@@ -3258,7 +3493,11 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
         return
 
     # 공통 집계는 한 번만 만들어 프로필·동행·칭호가 나눠 쓴다.
-    ctx = club_context(posts, photos, members)
+    #
+    # `months`를 반드시 넘긴다. 빠뜨리면 `ctx["밀도"]`가 빈 목록이 되어
+    # `짧은 기간에 진심`이 아무에게도 안 붙고, `ctx["_축"]`이 None이라
+    # `신입` 판정이 늘 False가 되어 `아직 첫 출사 전`도 화면에서 사라진다.
+    ctx = club_context(posts, photos, members, months)
     prof = member_profile(name, posts, photos, members, ctx)
     comp = member_companions(name, posts, ctx["쌍"])
     my_posts = [p for p in posts if p.get("author") == name]
@@ -3299,14 +3538,36 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
         st.caption("칭호는 **선택한 분석 기간 안의 활동**으로만 매깁니다 — 기간을 "
                    "좁히면 달라집니다. 재미로 붙이는 것이니 너무 진지하게 보지 마세요.")
 
+    # **셋을 나란히 놓고 이름으로 구분한다.** `참석`이 무엇을 센 것인지 감추면
+    # 어떤 숫자도 읽을 수 없다 — 출사만인지 벙까지인지가 사람마다 크게 다르다.
     c = st.columns(5)
-    c[0].metric("참석", prof["참석"])
-    c[1].metric("개최한 출사", prof["개최"])
+    c[0].metric("모임 참석", prof["모임 참석"],
+                help="출사 + 문화벙 + 보정벙 — 이 모임에 나온 모든 자리입니다.")
+    c[1].metric("출사 참석", prof["참석"],
+                help="촬영이 목적인 자리(인물·인물&풍경·풍경·GN)만 셉니다. "
+                     "순위와 칭호는 이 숫자를 봅니다.")
+    c[2].metric("출사 참석률", f"{prof['참석률']}%",
+                help=f"이 기간에 열린 출사 {prof['매칭 출사']}건 중 나온 비율. "
+                     "후기가 매칭된 출사만 분모에 넣습니다 — 후기가 없으면 "
+                     "누가 갔는지 알 수 없기 때문입니다.")
+    c[3].metric("문화벙 참석", prof["문화벙 참석"],
+                help="클라이밍·전시·보드게임처럼 촬영이 곁다리이거나 없는 번개.")
+    c[4].metric("보정벙 참석", prof["보정벙 참석"],
+                help=f"촬영 없이 모여 사진을 다듬는 자리. "
+                     f"그중 온라인 {prof['온라인 벙 참석']}회.")
+    c = st.columns(5)
+    c[0].metric("출사 개최", prof["출사 개최"],
+                help="펑이 아닌 출사만. 이 모임은 운영진이 아니어도 출사를 열 수 "
+                     "있고 그것을 지향합니다 — `운영진도 아닌데` 칭호가 보는 숫자입니다.")
+    c[1].metric("벙 개최", prof["벙 개최"])
     c[2].metric("후기", prof["후기"])
-    c[3].metric("사진", prof["사진"])
+    c[3].metric("사진", prof["사진"],
+                help="사진 업로드는 모임이 앱 상위에 노출되도록 장려하는 "
+                     "활동이지 모임의 목적은 아닙니다.")
     c[4].metric("테마사진", prof["테마사진"])
     c = st.columns(5)
-    c[0].metric("참석률", f"{prof['참석률']}%")
+    c[0].metric("개최(전체)", prof["개최"],
+                help="펑 포함. 출사와 벙을 합친 수입니다.")
     c[1].metric("첫 등장", prof["첫 등장"])
     c[2].metric("최근 참석", prof["최근 참석"])
     c[3].metric("가입일", prof["가입일"])
@@ -3504,6 +3765,7 @@ FIXED_TITLE_NAMES = [
     "틈틈이 골고루", "짧은 기간에 진심",
     "아이고 어르신", "첫 출사 못 참지", "새싹", "돌아오세요",
     "아직 첫 출사 전", "유령 회원",
+    "집에서 뵙겠습니다", "카메라는 두고 왔어요", "운영진도 아닌데",
     *CATEGORY_TITLES.values(),
 ]
 
