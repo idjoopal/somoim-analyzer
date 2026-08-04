@@ -1505,6 +1505,25 @@ TITLE_LIMIT = 3                 # 한 사람에게 붙는 최대 개수
 TITLE_QUOTA_DEFAULT = 9         # 한 칭호를 받을 수 있는 최대 인원
 TITLE_QUOTA = {"관계": 5, "카테고리": 5, "유일": 1}    # 갈래별 정원
 
+# ── 배지형 칭호 — 위 정원을 둘 다 안 탄다 ──────────────────────
+# 활동 순위가 아니라 **바뀌지 않는 사실**을 말하는 칭호다. 성격이 운영진
+# 배지와 같아, 이번 기간에 얼마나 활동했는지에 밀려 사라지면 안 된다.
+#
+# 실제로 밀리고 있었다. `아이고 어르신` 자격자 14명 중 아홉만 화면에 떴다 —
+# 넷은 활동이 많아 세 칸이 먼저 찼고, 한 명은 칭호가 하나뿐인데도 정원 9명에
+# 잘렸다. 가입일이 14명 중 가장 늦다는 이유였다. 2021년부터 자리를 지켜 온
+# 것은 남과 겨룰 일이 아닌데 겨루게 해 놓은 것이 잘못이었다.
+#
+# 들어올 자격: **기간을 좁혀도 받는 사람이 그대로**여야 한다. 칭호 82종을
+# 전체·최근 12개월·최근 6개월로 돌려 보면 여럿이 받으면서 이 성질을 지키는
+# 것은 `아이고 어르신`뿐이다. 가입일로만 재기 때문이다(`_title_candidates`
+# 의 연차 항목). 옆자리 `첫 출사 못 참지`는 `ctx["첫등장"]`을 써서 10 → 8 →
+# 5명으로 줄어든다 — 그래서 여기 못 들어온다.
+#
+# 아래쪽 `FIXED_TITLE_NAMES`와 헷갈리지 말 것. 그쪽은 "칭호 분포 표에 미리
+# 적어 둘 수 있는 **이름**"의 목록이라 정원과 아무 상관이 없다.
+BADGE_TITLES = {"아이고 어르신"}
+
 # ── 인연 칭호(우연 대비) ────────────────────────────────────────
 # `동행`이 **함께 간 횟수와 비율**로 짝을 고르는 데 반해, `인연`은 **우연히
 # 겹칠 양을 빼고 남는 것**으로 고른다. 실제 데이터에서 두 지표의 1위는
@@ -1552,6 +1571,9 @@ def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
     3. **화면에 뜬 것**을 세어 정원을 넘긴 칭호는 약한 쪽을 뺀다
     4. 빠진 사람은 다음 후보로 다시 뽑는다 — 넘치지 않을 때까지 반복
 
+    `BADGE_TITLES`는 2·3을 통째로 건너뛰고 자격만 되면 늘 나온다. 목록 **앞**
+    에 놓아 화면이 배지형과 기간형을 갈라 그릴 수 있게 한다.
+
     정원을 후보 단계에서만 세면 **화면에 안 뜰 사람이 자리를 잡아먹는다.**
 
     비용은 멤버 94명·사진 1만 장에서 0.1초대다 — `ctx`가 공통 집계를 들고
@@ -1582,13 +1604,21 @@ def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
 
     def pick(n: str) -> list[dict]:
         best: dict[str, dict] = {}
+        badge: dict[str, dict] = {}
         for t in cand[n]:
+            if t["칭호"] in BADGE_TITLES:
+                # 세 칸도, 지표 경쟁도, 정원도 안 탄다. `best`에 안 넣는 것이
+                # 지표 경쟁에서 빼 주는 부분이다 — `아이고 어르신`이 같은
+                # `연차` 지표의 `돌아오세요`를 밀어내던 것을 멈춘다.
+                badge[t["칭호"]] = t
+                continue
             if n in banned[t["칭호"]]:
                 continue                     # 정원에 밀린 칭호는 건너뛴다
             cur = best.get(t["지표"])
             if cur is None or t["우선"] > cur["우선"]:
                 best[t["지표"]] = t
-        return sorted(best.values(), key=lambda t: -t["우선"])[:TITLE_LIMIT]
+        return (sorted(badge.values(), key=lambda t: -t["우선"])
+                + sorted(best.values(), key=lambda t: -t["우선"])[:TITLE_LIMIT])
 
     while True:
         out = {n: pick(n) for n in cand}
@@ -1598,6 +1628,8 @@ def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
                 holders[t["칭호"]].append((t["강도"], n))
         cut = False
         for 칭호, rows in holders.items():
+            if 칭호 in BADGE_TITLES:
+                continue        # 사실을 말하는 칭호에 정원을 두면 뜻이 없다
             quota = TITLE_QUOTA.get(_quota_kind(cand, 칭호), TITLE_QUOTA_DEFAULT)
             if len(rows) <= quota:
                 continue
@@ -1616,6 +1648,17 @@ def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
         if not cut:
             return out
     return out
+
+
+def split_badge_titles(titles: list[dict]) -> tuple[list[dict], list[dict]]:
+    """칭호를 `(배지형, 기간형)`으로 가른다.
+
+    **줄을 가르는 이유.** 배지형은 가입일로만 매겨 기간을 좁혀도 그대로인데,
+    기간으로 매긴 칭호와 한 줄에 놓으면 밑에 붙는 "기간을 좁히면 달라집니다"
+    안내가 전부에 걸리는 것처럼 읽힌다. 서로 다른 말을 하는 둘이다.
+    """
+    badge = [t for t in titles if t["칭호"] in BADGE_TITLES]
+    return badge, [t for t in titles if t["칭호"] not in BADGE_TITLES]
 
 
 def _tiebreak(칭호: str, name: str) -> str:
@@ -3530,9 +3573,19 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
     # 알아야 자르기 때문이다. 전원을 내고 자기 것을 꺼낸다(0.1초대).
     all_titles = club_titles(posts, photos, members, months, ctx)
     titles = all_titles.get(name) or []
-    if titles:
+
+    badge_ts, period_ts = split_badge_titles(titles)
+
+    if badge_ts:
         with st.container(border=True):
-            for col, t in zip(st.columns(len(titles)), titles):
+            for col, t in zip(st.columns(len(badge_ts)), badge_ts):
+                col.markdown(f"##### {t['아이콘']} {t['칭호']}")
+                col.caption(t["근거"])
+        st.caption("위는 **가입일로만 매기는 칭호**입니다 — 분석 기간을 좁혀도, "
+                   "요즘 얼마나 나오시든 그대로입니다.")
+    if period_ts:
+        with st.container(border=True):
+            for col, t in zip(st.columns(len(period_ts)), period_ts):
                 col.markdown(f"##### {t['아이콘']} {t['칭호']}")
                 col.caption(t["근거"])
         st.caption("칭호는 **선택한 분석 기간 안의 활동**으로만 매깁니다 — 기간을 "
@@ -3711,7 +3764,10 @@ def _title_distribution(names: list[str],
         st.caption(f"칭호마다 **정원**이 있습니다 — 일반 {TITLE_QUOTA_DEFAULT}명, "
                    f"관계형·카테고리형 {TITLE_QUOTA['관계']}명. 넘치면 강한 순으로 "
                    "자르므로 **인원이 정원에 딱 붙어 있으면 조건이 느슨하다는 뜻**"
-                   "입니다. 반대로 **수령 0명인 칭호**는 너무 조인 것입니다.")
+                   "입니다. 반대로 **수령 0명인 칭호**는 너무 조인 것입니다. "
+                   f"단 **{', '.join(sorted(BADGE_TITLES))}**은(는) 정원도 3칸 "
+                   "제한도 없습니다 — 활동이 아니라 가입일로 매기는 사실이라 "
+                   "자격이 되면 전원이 받습니다.")
 
         got: dict[str, list[str]] = defaultdict(list)
         per_person: dict[str, int] = {}
@@ -3740,10 +3796,13 @@ def _title_distribution(names: list[str],
                      hide_index=True, width="stretch", height=460)
 
         st.markdown("##### 한 사람이 받은 개수")
+        # 배지형은 세 칸 밖이라 `TITLE_LIMIT`까지만 세면 **행이 통째로 사라진다.**
+        # 실제로 받은 최대치까지 늘려 잡는다.
         dist = Counter(per_person.values())
+        top = max([TITLE_LIMIT, *per_person.values()], default=TITLE_LIMIT)
         st.dataframe(pd.DataFrame(
             [{"칭호 수": f"{k}개", "인원": dist.get(k, 0)}
-             for k in range(TITLE_LIMIT + 1)]),
+             for k in range(top + 1)]),
             hide_index=True, width="stretch")
 
         none_got = [n for n, v in per_person.items() if not v]
