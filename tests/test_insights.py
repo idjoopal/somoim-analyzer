@@ -2289,9 +2289,31 @@ def test_hosting_splits_by_kind_and_adds_up():
     posts += [_bung(f"r{i}", "2026-03-0%d" % (i + 3), [], cat="보정",
                     author="지우") for i in range(3)]
     row = next(r for r in hosting_by_kind(posts) if r["작성자"] == "지우")
-    assert (row["출사 진행"], row["보정벙 개최"]) == (1, 3), row
+    assert (row["출사 진행"], row["보정벙 진행"]) == (1, 3), row
     assert row["모임 개최"] == 4, "펑을 세면 다른 칸의 합과 안 맞는다"
     assert row["출사 취소율"] == 50.0, "분모는 출사 공지뿐이다"
+
+
+def test_every_kind_reports_its_cancellations():
+    """벙 취소를 안 세면 벙 쪽 데이터가 반쪽이 된다.
+
+    실데이터에서 벙 펑은 드물지 않다 — 문화벙 3건(13.0%)·보정벙 4건(12.1%),
+    여덟 명이 냈다. 이재연 님은 보정벙 진행 1·취소 2로 대부분이 펑인데 그
+    사실이 화면에 아예 없었다.
+    """
+    from streamlit_app import KINDS, hosting_by_kind
+    posts = [_bung("c1", "2026-03-01", [], cat="문화", author="재연"),
+             _bung("r1", "2026-03-02", [], cat="보정", author="재연"),
+             _bung("r2", "2026-03-03", [], cat="보정", author="재연",
+                   is_canceled=True),
+             _bung("r3", "2026-03-04", [], cat="보정", author="재연",
+                   is_canceled=True)]
+    row = next(r for r in hosting_by_kind(posts) if r["작성자"] == "재연")
+    for k in KINDS:
+        assert f"{k} 진행" in row and f"{k} 취소" in row, (k, row)
+    assert (row["보정벙 진행"], row["보정벙 취소"]) == (1, 2), row
+    assert (row["문화벙 진행"], row["문화벙 취소"]) == (1, 0), row
+    assert row["모임 개최"] == 2, "펑은 `모임 개최`에 안 들어간다"
 
 
 def test_the_average_crowd_is_measured_per_kind():
@@ -2335,3 +2357,77 @@ def test_the_monthly_matrix_counts_shoots_only():
     from streamlit_app import attendance_monthly_matrix
     mm, _ = attendance_monthly_matrix(_shoot_and_bung())
     assert mm["나무"][202603] == 1
+
+
+# ═══════════════════════════════════════════════════════════════
+# 멤버 지표 — 개최도 참석과 같은 결로 쪼갠다
+# ═══════════════════════════════════════════════════════════════
+
+def _hosts_everything():
+    """출사 1 · 문화벙 1 · 보정벙 2(+펑 1)를 연 사람 하나."""
+    posts = [notice("s1", "2026-03-01", ["여는이"], category="풍경", author="여는이"),
+             _bung("c1", "2026-03-02", ["여는이"], cat="문화", author="여는이"),
+             _bung("r1", "2026-03-03", ["여는이"], cat="보정", author="여는이"),
+             _bung("r2", "2026-03-04", ["여는이"], cat="보정", author="여는이"),
+             _bung("x1", "2026-03-05", [], cat="보정", author="여는이",
+                   is_canceled=True)]
+    return posts, [member("w1", "여는이")]
+
+
+def _prof(name, posts, members, months=None):
+    from streamlit_app import club_context, member_profile
+    months = months or [202603]
+    ctx = club_context(posts, [], members, months)
+    return member_profile(name, posts, [], members, ctx)
+
+
+def test_hosting_is_split_the_same_way_attendance_is():
+    """참석만 문화/보정으로 갈라 놓고 개최를 `벙 개최` 한 덩어리로 두면,
+    문화벙만 여는 사람과 보정벙만 여는 사람이 같은 숫자로 보인다."""
+    posts, members = _hosts_everything()
+    p = _prof("여는이", posts, members)
+    assert (p["출사 개최"], p["문화벙 개최"], p["보정벙 개최"]) == (1, 1, 2), p
+
+
+def test_the_whole_club_hosting_number_actually_includes_bungs():
+    """화면이 `개최(전체)`라 부르며 '출사와 벙을 합친 수'라고 적어 둔 값이
+    실제로는 출사만이었다 — 김지우 님은 출사 1·보정벙 9인데 1로 표시됐다."""
+    posts, members = _hosts_everything()
+    p = _prof("여는이", posts, members)
+    assert p["모임 개최"] == 4, p
+    assert p["모임 개최"] == p["출사 개최"] + p["문화벙 개최"] + p["보정벙 개최"]
+    assert p["개최"] == 1, "`개최`는 여전히 출사만 센다(펑 포함)"
+
+
+def test_a_cancelled_bung_is_not_hosting():
+    """`모임 개최`는 펑을 뺀 수라야 다른 칸의 합과 맞는다."""
+    posts, members = _hosts_everything()
+    assert _prof("여는이", posts, members)["모임 개최"] == 4  # 펑 1건은 빠진다
+
+
+def test_every_metric_carries_a_rank_and_a_pool():
+    """벙만 다니는 사람에게 출사 순위만 보여 주면 그 사람이 이 모임에서
+    무엇을 하는 사람인지가 화면에서 통째로 빠진다."""
+    from streamlit_app import RANKED_METRICS
+    posts, members = _hosts_everything()
+    p = _prof("여는이", posts, members)
+    for k in RANKED_METRICS:
+        assert f"{k} 순위" in p and f"{k} 모수" in p, k
+    assert p["문화벙개최 순위"] == 1 and p["문화벙개최 모수"] == 1
+
+
+def test_the_rank_pool_only_counts_people_who_did_it():
+    """모수가 '전체 멤버'면 한 번도 안 한 사람이 분모를 부풀려 등수가 뜻을 잃는다."""
+    posts, members = _hosts_everything()
+    members = members + [member("w2", "구경만")]
+    p = _prof("여는이", posts, members)
+    assert p["문화벙개최 모수"] == 1, "구경만 님은 문화벙을 연 적이 없다"
+    구경 = _prof("구경만", posts, members)
+    assert 구경["문화벙개최 순위"] is None, "안 한 사람은 등수가 없다(—)"
+
+
+def test_ranks_are_grouped_the_same_way_the_metrics_are():
+    """순위와 지표가 다른 순서로 놓이면 눈이 두 번 훑어야 한다."""
+    from streamlit_app import RANK_GROUPS, RANKED_METRICS
+    assert tuple(k for g in RANK_GROUPS.values() for k in g) == RANKED_METRICS
+    assert set(RANK_GROUPS) == {"나온 자리", "연 자리", "남긴 것"}

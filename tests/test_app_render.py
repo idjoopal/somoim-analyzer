@@ -1182,10 +1182,30 @@ def test_rank_is_a_metric_not_a_grey_caption():
     at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
     labels = {m.label: m.value for m in at.metric}
     ranked = {k: v for k, v in labels.items() if k.endswith("명 중)")}
-    assert len(ranked) == 3, labels
-    assert any(k.startswith("참석") for k in ranked)
-    assert any(k.startswith("개최") for k in ranked)
+    assert ranked, labels
     assert all(v.endswith("등") or v == "—" for v in ranked.values()), ranked
+
+
+def test_every_metric_gets_its_own_rank():
+    """셋만 그리던 시절엔 벙만 다니는 분에게 `출사 87명 중 몇 등`만 보여 줬다 —
+    그 사람이 이 모임에서 무엇을 하는 사람인지가 화면에서 통째로 빠진다."""
+    from streamlit_app import RANK_LABEL, RANKED_METRICS
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    ranked = [m.label for m in at.metric if m.label.endswith("명 중)")]
+    assert len(ranked) == len(RANKED_METRICS), ranked
+    for key in RANKED_METRICS:
+        이름 = RANK_LABEL.get(key, key)
+        assert any(k.startswith(f"{이름} (") for k in ranked), (이름, ranked)
+
+
+def test_the_rank_labels_say_which_ones_are_shoots_only():
+    """`참석`·`개최`는 출사만 세는 값이라 이름만 보고는 알 수 없다."""
+    from streamlit_app import RANK_LABEL
+    assert RANK_LABEL["참석"] == "출사 참석"
+    assert RANK_LABEL["개최"] == "출사 개최"
+    at = run(stores=make_stores(PAIRS, PHOTOS, members=FOCUS_MEMBERS))
+    ranked = [m.label for m in at.metric if m.label.endswith("명 중)")]
+    assert not any(k.startswith("참석 (") for k in ranked), ranked
 
 
 def test_a_member_with_nothing_going_on_gets_no_title_box():
