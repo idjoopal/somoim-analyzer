@@ -1761,6 +1761,24 @@ BADGE_TITLES = {"아이고 어르신"}
 # 동명이인 빨강. 초록은 남아 있으면서 🌳와도 어울린다.
 BADGE_TITLE_COLOR = "green"
 
+# ── 조율하게 되는 문턱값 ───────────────────────────────────────
+# 분위와 최소 바닥 — 칭호 기준을 만진다는 것은 사실상 이 둘을 만지는 일이다.
+# 흩어진 리터럴로 두면 🏆 칭호 분포에서 "무엇을 고쳐야 하나"가 안 보인다.
+# **조건 문구가 이 이름들을 f-string으로 읽으므로**, 값을 바꾸면 화면 설명도
+# 따라 바뀐다(손으로 맞출 것은 말투뿐이다).
+RANK1_MIN_POOL = 4       # 두 사람뿐인 판의 1등은 1등이 아니다
+TOP_SHARE_TIGHT = 0.15   # 흔치 않아야 하는 것 — 참석·테마
+TOP_SHARE_LOOSE = 0.30   # 넉넉히 불러도 되는 것 — 개최·사진·좋아요
+COMPANION_TOP_SHARE = 0.20   # `다 아는 사람들 이구먼`
+COMPANION_MIN = 4            # 그 정도는 돼야 "아는 얼굴이 많다"
+COMPANION_BOTTOM_SHARE = 0.25  # `저 신입 아닌데요`
+CROWD_SHARE = 0.15       # `정출킬러`↔`소수정예` — 양 끝을 같은 폭으로
+DENSITY_SHARE = 0.30     # `짧은 기간에 진심`
+ATT_MIN_RANK = 3         # 참석 칭호의 바닥
+ATT_MIN_CROWD = 4        # 규모를 말하려면 이만큼은 다녀야 평균이 뜻을 갖는다
+ATT_MIN_HABIT = 5        # 요일·밀도처럼 "버릇"을 말하는 칭호의 바닥
+PHOTO_MIN_RANK = 5       # 사진 칭호의 바닥
+
 # ── 인연 칭호(우연 대비) ────────────────────────────────────────
 # `동행`이 **함께 간 횟수와 비율**로 짝을 고르는 데 반해, `인연`은 **우연히
 # 겹칠 양을 빼고 남는 것**으로 고른다. 실제 데이터에서 두 지표의 1위는
@@ -1768,6 +1786,10 @@ BADGE_TITLE_COLOR = "green"
 # 절반쯤 나와서 우연 기대치가 58.5회, 겨우 1.18배다. 반대로 김준영↔김희규는
 # 6회뿐이지만 우연의 11.5배다. 그래서 두 지표를 **따로** 둔다.
 PAIR_MIN_JOINT = 3      # 이보다 적게 만난 쌍은 우연과 구분되지 않는다
+COMBO_MIN_SHARE = 50    # `2인 1조` — 서로에게 이만큼은 돼야 "서로"다
+FOLLOW_MIN_ATT = 4      # `오늘도 뵙네요` — 이보다 적으면 비율이 튄다
+FOLLOW_MIN_SHARE = 60   # 내 출사 중 그분과 함께한 비중
+FOLLOW_MIN_EDGE = 15    # 그분의 전체 출석률보다 이만큼(%p)은 높아야 한다
 PAIR_MIN_LIFT = 1.4     # lift **하한**의 문턱(생 lift가 아니다)
 BOND_MIN_SHARE = 50     # 짝사랑 쪽에 요구하는 내 출사 비중
 
@@ -1793,10 +1815,222 @@ CATEGORY_TITLES = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════
+# 🏆 칭호 규칙표 — 칭호가 무엇인지는 **여기 한 곳**에만 적는다
+#
+# 예전에는 한 칭호를 이루는 정보가 네 군데에 흩어져 있었다.
+#
+#   지표·우선·아이콘·이름·갈래 → `put(...)` 호출 인자 30곳
+#   조건                    → `if` 식에 박힌 숫자 (**글로는 아무 데도 없었다**)
+#   정원                    → `_quota_kind`가 후보에서 역추적
+#   표에 남길 이름           → `FIXED_TITLE_NAMES` 손 동기화 목록
+#
+# 🏆 칭호 분포를 "무엇을 조율할지 보는 화면"으로 만들려니 이 흩어짐이 그대로
+# 벽이 됐다. **후보가 0명인 칭호**가 가장 조율이 급한데, 조건을 `put` 인자로
+# 두면 그 칭호는 후보 데이터에 아예 없어 조건도 정원도 화면에 못 띄운다.
+#
+# 손 동기화 목록도 이미 틀려 있었다 — `FIXED_TITLE_NAMES`에 관계 칭호 넷이
+# 빠져 있어, 아무도 못 받는 기간에는 그 칭호들이 표에서 통째로 사라졌다.
+#
+# **조건 문구의 숫자는 상수를 f-string으로 읽는다**(`_C`). 값을 바꾸면 화면
+# 설명이 따라오고, 상수 이름을 바꾸거나 지우면 앱이 아예 안 뜬다 — 문구만
+# 옛 이름으로 남는 일이 구조적으로 불가능하다.
+# ═══════════════════════════════════════════════════════════════
+
+def _C(이름: str, pct: bool = False) -> str:
+    """조건 문구에 **상수 이름과 현재값을 함께** 박는다 — `ATT_MIN_RANK(3)`."""
+    v = globals()[이름]
+    return f"{이름}({v:.0%})" if pct else f"{이름}({v})"
+
+
+TITLE_RULES: dict[str, dict] = {}
+
+
+def _rule(rid, *, 지표, 우선, 아이콘, 이름, 조건, 갈래="일반",
+          동적=False, 이름들=(), share=0.0, 메모=""):
+    """규칙 하나. `동적`은 이름에 사람·카테고리가 박히는 것(미리 못 적는다)."""
+    TITLE_RULES[rid] = {
+        "id": rid, "지표": 지표, "우선": 우선, "아이콘": 아이콘, "이름": 이름,
+        "조건": 조건, "갈래": 갈래, "동적": 동적, "이름들": tuple(이름들),
+        "share": share, "메모": 메모,
+    }
+
+
+def _tier_rules(지표, *, 위, 아래, 바닥말, 순서말, share, share이름):
+    """1등/상위 짝을 함께 찍는다 — `tier`가 만드는 열 칭호가 여기서 나온다."""
+    _rule(f"{지표}/1등", 지표=지표, 우선=위[0], 아이콘=위[1], 이름=위[2],
+          조건=f"{바닥말} · {순서말} 순 1등 (모수 {_C('RANK1_MIN_POOL')}명 이상)")
+    _rule(f"{지표}/상위", 지표=지표, 우선=아래[0], 아이콘=아래[1], 이름=아래[2],
+          share=share,
+          조건=f"{바닥말} · {순서말} 순 상위 {_C(share이름, pct=True)}")
+
+
+def known_title_names() -> set[str]:
+    """미리 알 수 있는 칭호 이름 전부 — 규칙표에서 **파생**한다.
+
+    예전에는 `FIXED_TITLE_NAMES`라는 손 동기화 목록이었는데 **이미 틀려
+    있었다** — 관계 칭호 넷(`{상대}님과 2인 1조` 등)이 빠져 있어, 아무도 못
+    받는 기간에는 그 칭호들이 분포표에서 통째로 사라졌다. 이름에 사람이
+    박히는 칭호는 미리 못 적으니 여기서도 빠진다(틀은 `TITLE_RULES`에 있다).
+    """
+    out: set[str] = set()
+    for r in TITLE_RULES.values():
+        out |= set(r["이름들"])
+        if not r["동적"]:
+            out.add(r["이름"])
+    return out
+
+
+def title_rule(칭호: str) -> dict | None:
+    """칭호 **이름**으로 규칙을 찾는다. 동적 이름은 틀로 되짚는다."""
+    for r in TITLE_RULES.values():
+        if 칭호 == r["이름"] or 칭호 in r["이름들"]:
+            return r
+        if r["동적"] and 칭호.endswith(r["이름"].split("}")[-1]):
+            return r
+    return None
+
+
+# ── 규칙 정의 ───────────────────────────────────────────────────
+# 조건 문구는 `docs/사용설명서.md` 9장 부록의 말투를 그대로 옮긴 것이다.
+# 새로 지으면 같은 조건을 두 가지 말로 설명하게 되어 화면과 문서가 갈린다.
+
+# 동행 — 함께 간 횟수와 비율
+_rule("동행/2인1조", 지표="동행", 우선=95, 아이콘="💞", 이름="{상대}님과 2인 1조",
+      갈래="관계", 동적=True,
+      조건=f"함께 {_C('PAIR_MIN_JOINT')}회 이상 · **서로에게** "
+           f"{_C('COMBO_MIN_SHARE')}%가 넘는 사이")
+_rule("동행/추종", 지표="동행", 우선=88, 아이콘="🐾", 이름="{상대}님 오늘도 뵙네요",
+      갈래="관계", 동적=True,
+      조건=f"출사 참석 {_C('FOLLOW_MIN_ATT')}회 이상 · 내 출사의 "
+           f"{_C('FOLLOW_MIN_SHARE')}% 이상을 그분과 · 그분의 전체 출석률보다 "
+           f"{_C('FOLLOW_MIN_EDGE')}%p 이상 높을 것")
+_rule("동행/마당발", 지표="동행", 우선=80, 아이콘="🕸", 이름="다 아는 사람들 이구먼",
+      share=COMPANION_TOP_SHARE,
+      조건=f"함께 출사해 본 사람 {_C('COMPANION_MIN')}명 이상 · 그 수가 상위 "
+           f"{_C('COMPANION_TOP_SHARE', pct=True)}")
+_rule("동행/외톨이", 지표="동행", 우선=62, 아이콘="🕊", 이름="저 신입 아닌데요",
+      share=COMPANION_BOTTOM_SHARE,
+      조건=f"출사 참석 {_C('ATT_MIN_RANK')}회 이상인데 동행자 수는 하위 "
+           f"{_C('COMPANION_BOTTOM_SHARE', pct=True)}")
+
+# 인연 — 우연히 겹칠 몫을 뺀 나머지
+_rule("인연/상호", 지표="인연", 우선=87, 아이콘="💞",
+      이름="{상대}님과 짜고 나오시나요?", 갈래="관계", 동적=True,
+      조건=f"함께 {_C('PAIR_MIN_JOINT')}회 이상 · 우연의 "
+           f"{_C('PAIR_MIN_LIFT')}배 이상 · **서로가 서로의 1순위**")
+_rule("인연/짝사랑", 지표="인연", 우선=84, 아이콘="🐾",
+      이름="{상대}님 알림 켜두셨죠?", 갈래="관계", 동적=True,
+      조건=f"위와 같되 **그분의 1순위는 내가 아님** · 내 출사의 "
+           f"{_C('BOND_MIN_SHARE')}% 이상")
+
+# 테마·개최·참석·사진·좋아요 — 1등이면 위, 아니면 상위 분위
+_tier_rules("테마", 위=(90, "🎨", "테마사진의 제왕"),
+            아래=(78, "🖌", "테마사진 프로 참석러"),
+            바닥말="테마사진 2장 이상", 순서말="많이 낸",
+            share=TOP_SHARE_TIGHT, share이름="TOP_SHARE_TIGHT")
+_tier_rules("개최", 위=(93, "📢", "출사장도 장이다"),
+            아래=(80, "🗣", "심심한데 출사쳐야지"),
+            바닥말="펑 아닌 출사 2건 이상", 순서말="많이 연",
+            share=TOP_SHARE_LOOSE, share이름="TOP_SHARE_LOOSE")
+_tier_rules("참석", 위=(90, "🥾", "이게 본업이에요"), 아래=(76, "🔥", "프로 참석러"),
+            바닥말=f"출사 참석 {_C('ATT_MIN_RANK')}회 이상", 순서말="많이 나온",
+            share=TOP_SHARE_TIGHT, share이름="TOP_SHARE_TIGHT")
+_tier_rules("사진", 위=(85, "📸", "여기 제 인스타인데.."),
+            아래=(75, "🖼", "부지런한 업로더"),
+            바닥말=f"사진 {_C('PHOTO_MIN_RANK')}장 이상", 순서말="많이 올린",
+            share=TOP_SHARE_LOOSE, share이름="TOP_SHARE_LOOSE")
+_tier_rules("좋아요", 위=(85, "❤️", "사진 좋아요 1위"), 아래=(74, "💗", "느좋 사진러"),
+            바닥말=f"사진 {_C('LIKE_RANK_MIN_PHOTOS')}장 이상",
+            순서말="장당 좋아요가 높은",
+            share=TOP_SHARE_LOOSE, share이름="TOP_SHARE_LOOSE")
+
+# 후기 · 속도
+_rule("후기/성실", 지표="후기", 우선=80, 아이콘="✍️", 이름="책임감 100만점",
+      조건="본인이 연 출사 5건 이상에 **전부** 후기를 씀 (100%)")
+_rule("후기/미작성", 지표="후기", 우선=64, 아이콘="🙈", 이름="아맞다후기", 갈래="유일",
+      조건=f"개최 3건 이상 · 후기율 {_C('AWOL_REVIEW_MAX')}% 이하 · "
+           "그중 **가장 낮은 한 명**")
+_rule("속도/빠른후기", 지표="속도", 우선=82, 아이콘="🚀", 이름="후기는 따끈할때",
+      조건="후기 3건 이상 · 출사일로부터 **평균 1일 안에** 올림")
+_rule("속도/번개공지", 지표="속도", 우선=81, 아이콘="⚡", 이름="내일 출사가실분?",
+      조건="개최 3건 이상 · 그중 절반 이상이 **공지 후 이틀 안에 출발**")
+
+# 규모 · 균형 · 종합 · 밀도
+_rule("규모/북적", 지표="규모", 우선=83, 아이콘="🎪", 이름="정출킬러",
+      share=CROWD_SHARE,
+      조건=f"출사 참석 {_C('ATT_MIN_CROWD')}회 이상 · 참석한 출사의 평균 인원이 "
+           f"상위 {_C('CROWD_SHARE', pct=True)}")
+_rule("규모/조용", 지표="규모", 우선=69, 아이콘="🤏", 이름="소수정예",
+      share=CROWD_SHARE,
+      조건=f"출사 참석 {_C('ATT_MIN_CROWD')}회 이상 · 참석한 출사의 평균 인원이 "
+           f"하위 {_C('CROWD_SHARE', pct=True)}")
+_rule("균형/사진없음", 지표="균형", 우선=67, 아이콘="👀", 이름="소모임에요? 글쎄..",
+      share=TOP_SHARE_LOOSE,
+      조건=f"출사 참석은 상위 {_C('TOP_SHARE_LOOSE', pct=True)}인데 올린 사진은 "
+           "2장 이하")
+_rule("균형/참석없음", 지표="균형", 우선=66, 아이콘="🖨", 이름="제가 사진이 좀 많아요",
+      share=TOP_SHARE_LOOSE,
+      조건=f"사진은 상위 {_C('TOP_SHARE_LOOSE', pct=True)}인데 출사 참석은 "
+           "2회 이하")
+_rule("종합/골고루", 지표="종합", 우선=76, 아이콘="🎭", 이름="틈틈이 골고루",
+      조건="참석 5 · 개최 2 · 후기 2 · 사진 5를 **전부** 넘김")
+_rule("밀도/촘촘", 지표="밀도", 우선=68, 아이콘="🔥", 이름="짧은 기간에 진심",
+      share=DENSITY_SHARE,
+      조건=f"출사 참석 {_C('ATT_MIN_HABIT')}회 이상 · **활동 개월 수로 나눈** "
+           f"참석 빈도가 상위 {_C('DENSITY_SHARE', pct=True)}",
+      메모="우선순위를 낮게 둔 것은 의도다 — 누적 상위권은 어차피 세 칸이 차서 "
+           "이 칭호를 표시하지 않고, 그러면 정원이 아래로 흘러 중간층에 닿는다")
+
+# 습관 · 성향 · 요일
+_rule("습관/무펑", 지표="습관", 우선=73, 아이콘="🛡", 이름="펑이 뭐죠?",
+      조건="출사 **5건 이상**을 열면서 취소가 한 번도 없음")
+_rule("습관/펑쟁이", 지표="습관", 우선=60, 아이콘="💥", 이름="그럴만한 이유가...",
+      조건="개최 3건 이상 · 그중 **40% 이상**이 펑")
+_rule("성향/카테고리", 지표="성향", 우선=73, 아이콘="🏞", 이름="{카테고리} 마니아",
+      갈래="카테고리", 동적=True, 이름들=tuple(CATEGORY_TITLES.values()),
+      조건="세 자 중 하나 — 내 참석의 75%+(6회 이상) · 또는 그 계열 출사의 "
+           "40%+에 참석 · 또는 모임 평균의 3배+")
+_rule("성향/잡식", 지표="성향", 우선=71, 아이콘="🌈", 이름="잡식성",
+      조건="출사 참석 6회 이상 · **4가지 이상** 카테고리 · 가장 많은 것도 40% 이하")
+_rule("요일/평일", 지표="요일", 우선=74, 아이콘="🗓", 이름="프로 평일러",
+      조건=f"출사 참석 {_C('ATT_MIN_HABIT')}회 이상 · 그중 **60% 이상이 평일**")
+
+# 벙 · 자발
+_rule("벙/온라인", 지표="벙", 우선=84, 아이콘="💻", 이름="집에서 뵙겠습니다",
+      조건=f"온라인 벙 {_C('BUNG_MIN_JOIN')}회 이상 · 내 참석의 "
+           f"{_C('ONLINE_MIN_SHARE')}% 이상")
+_rule("벙/오프", 지표="벙", 우선=81, 아이콘="🎲", 이름="카메라는 두고 왔어요",
+      조건=f"벙 {_C('BUNG_MIN_JOIN')}회 이상 · 내 참석의 "
+           f"{_C('BUNG_MIN_SHARE')}% 이상",
+      메모="벙 칭호 둘은 한 사람에게 하나만 붙는다 — 벙은 곁가지라 세 칸을 둘씩 "
+           "차지하면 안 된다")
+_rule("자발/비운영진", 지표="자발", 우선=86, 아이콘="🙌", 이름="운영진도 아닌데",
+      조건=f"**운영진이 아닌데** 펑 아닌 **출사**를 {_C('SELF_HOST_MIN')}건 이상")
+
+# 연차
+_rule("연차/고참", 지표="연차", 우선=79, 아이콘="🌳", 이름="아이고 어르신",
+      조건=f"가입일이 {_C('OLD_CLUB_UNTIL')} 이전 · 출사 참석 1회 이상",
+      메모="배지형 — 3칸 제한도 정원도 안 탄다. 활동이 아니라 바뀌지 않는 사실이라")
+_rule("연차/즉시", 지표="연차", 우선=71, 아이콘="🏃", 이름="첫 출사 못 참지",
+      조건="가입하고 **7일 안에** 첫 출사")
+_rule("연차/새싹", 지표="연차", 우선=70, 아이콘="🌱", 이름="새싹",
+      조건="첫 참석이 분석 기간 끝자락(2개월 이내)")
+_rule("연차/휴면", 지표="연차", 우선=55, 아이콘="🌙", 이름="돌아오세요",
+      조건=f"출사 참석 {_C('ATT_MIN_HABIT')}회 이상 나오시다 3개월 넘게 조용함")
+_rule("연차/첫출사전", 지표="연차", 우선=52, 아이콘="🚪", 이름="아직 첫 출사 전",
+      조건=f"활동 0건이지만 가입한 지 {_C('GHOST_GRACE_DAYS')}일이 안 됨")
+_rule("연차/유령", 지표="연차", 우선=50, 아이콘="👻", 이름="유령 회원",
+      조건="이 기간에 글·사진·참석이 **하나도 없음**(가입인사는 활동이 아니다)")
+
 def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
                 months: list[int], ctx: dict | None = None,
-                벙포함: bool = False) -> dict[str, list[dict]]:
+                벙포함: bool = False, 진단: bool = False):
     """전 멤버의 최종 칭호 `{이름: [칭호…]}`.
+
+    `진단=True`면 `{"최종": …, "후보": …, "사유": …}`를 준다 — 🏆 칭호 분포가
+    "왜 이 인원인가"를 말하려면 정원을 걸기 **전**의 후보와 밀린 이유가 있어야
+    한다. 둘 다 이 함수가 이미 안에서 만들고 버리던 것이라 추가 비용이 없다.
 
     **한 사람만 따로 낼 수 없다.** 같은 칭호를 몇 명이 받는지 알아야 정원을
     적용할 수 있기 때문이다. 화면은 이 결과에서 자기 것을 꺼내 쓴다.
@@ -1838,10 +2072,16 @@ def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
     # 뽑는" 것을 더 이상 넘치지 않을 때까지 반복한다. 뺀 사람은 계속 쌓이기만
     # 하므로 반드시 멈춘다.
     banned: dict[str, set[str]] = defaultdict(set)
+    # **못 받은 이유를 그 자리에서 적는다.** 나중에 후보와 최종을 견줘 되짚으면
+    # 이 함수와 갈라진다 — 실제로 지표 규칙을 빼고 되짚었더니 `다 아는 사람들
+    # 이구먼`이 "정원에 4명 잘림"으로 나왔는데 진짜는 "지표에 6명 가림"이었다.
+    # 정원을 늘려도 안 풀리는 것을 정원 탓으로 읽을 뻔했다.
+    사유: dict[str, dict[str, str]] = {}
 
     def pick(n: str) -> list[dict]:
         best: dict[str, dict] = {}
         badge: dict[str, dict] = {}
+        why: dict[str, str] = {}
         for t in cand[n]:
             if t["칭호"] in BADGE_TITLES:
                 # 세 칸도, 지표 경쟁도, 정원도 안 탄다. `best`에 안 넣는 것이
@@ -1850,12 +2090,22 @@ def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
                 badge[t["칭호"]] = t
                 continue
             if n in banned[t["칭호"]]:
-                continue                     # 정원에 밀린 칭호는 건너뛴다
+                why[t["칭호"]] = "정원"       # 정원에 밀린 칭호는 건너뛴다
+                continue
             cur = best.get(t["지표"])
             if cur is None or t["우선"] > cur["우선"]:
+                if cur is not None:
+                    why[cur["칭호"]] = "지표"   # 앉아 있던 형제가 밀려난다
                 best[t["지표"]] = t
+            else:
+                why[t["칭호"]] = "지표"
+        top = sorted(best.values(), key=lambda t: -t["우선"])
+        for t in top[TITLE_LIMIT:]:
+            why[t["칭호"]] = "세칸"
+        # 여러 회차를 돌아도 `out`을 낳은 **마지막 회차**만 남아 화면과 맞는다.
+        사유[n] = why
         return (sorted(badge.values(), key=lambda t: -t["우선"])
-                + sorted(best.values(), key=lambda t: -t["우선"])[:TITLE_LIMIT])
+                + top[:TITLE_LIMIT])
 
     while True:
         out = {n: pick(n) for n in cand}
@@ -1883,8 +2133,102 @@ def club_titles(posts: list[dict], photos: list[dict], members: list[dict],
                 banned[칭호].add(n)
                 cut = True
         if not cut:
-            return out
+            return {"최종": out, "후보": cand, "사유": 사유} if 진단 else out
     return out
+
+
+def title_diagnostics(run: dict) -> list[dict]:
+    """칭호마다 **후보 몇 명 · 최종 몇 명 · 못 받은 이유가 무엇인지**.
+
+    🏆 칭호 분포가 "기준이 적당한지 보는 곳"이려면 인원만으로는 모자란다.
+    "3명"이 조건이 좁아서인지, 정원에 잘려서인지, 우선순위가 낮아 다른 칭호에
+    가려서인지가 안 갈리면 **고치는 방법이 정반대로 갈린다.**
+
+    후보가 0인 칭호는 후보 데이터에 아예 안 나타나므로 `TITLE_RULES`를 훑어
+    행을 만든다 — 아무도 못 받는 칭호가 화면에서 사라지면 이 표의 목적과
+    정면으로 어긋난다.
+
+    불변식: `후보 == 최종 + 지표밀림 + 세칸밀림 + 정원밀림`.
+    """
+    최종, 후보, 사유 = run["최종"], run["후보"], run["사유"]
+    수령: dict[str, list[str]] = defaultdict(list)
+    for n, ts in 최종.items():
+        for t in ts:
+            수령[t["칭호"]].append(n)
+    쳄: dict[str, dict] = {}
+    for n, ts in 후보.items():
+        for t in ts:
+            r = 쳄.setdefault(t["칭호"], {"칭호": t["칭호"], "후보": 0,
+                                        "지표밀림": 0, "세칸밀림": 0, "정원밀림": 0})
+            r["후보"] += 1
+            이유 = 사유.get(n, {}).get(t["칭호"])
+            if 이유:
+                r[f"{이유}밀림"] += 1
+    # 후보 0인 칭호도 행으로 남긴다 — 가장 조율이 급한 줄이다.
+    #
+    # 동적 이름(`{상대}님과 2인 1조`)은 **하나도 안 나왔을 때만** 틀로 적는다.
+    # 실제 이름이 이미 행으로 있는데 틀까지 얹으면 "0명"짜리 유령 행이 생겨,
+    # 정작 받은 사람이 있는 칭호가 못 받는 칭호로 보인다.
+    나온규칙 = {id(title_rule(c)) for c in 쳄}
+    for rule in TITLE_RULES.values():
+        이름들 = set(rule["이름들"])          # 미리 아는 구체 이름은 늘 남긴다
+        if not rule["동적"]:
+            이름들.add(rule["이름"])
+        elif not 이름들 and id(rule) not in 나온규칙:
+            # 이름에 사람이 박히는 칭호는 하나도 안 나왔을 때만 틀로 적는다.
+            # 실제 이름이 이미 행으로 있는데 틀까지 얹으면 "0명"짜리 유령 행이
+            # 생겨, 받은 사람이 있는 칭호가 못 받는 칭호로 보인다.
+            이름들.add(rule["이름"])
+        for 이름 in 이름들:
+            쳄.setdefault(이름, {"칭호": 이름, "후보": 0, "지표밀림": 0,
+                                "세칸밀림": 0, "정원밀림": 0})
+    rows = []
+    for 이름, r in 쳄.items():
+        rule = title_rule(이름) or {}
+        갈래 = rule.get("갈래", "일반")
+        r |= {
+            "지표": rule.get("지표", "—"), "갈래": 갈래,
+            "우선": rule.get("우선", 0),
+            # 문자열로 통일한다 — 배지형만 `—`로 두고 나머지를 숫자로 두면
+            # 열이 섞여 표 변환에서 터진다.
+            "정원": "—(배지형)" if 이름 in BADGE_TITLES
+                   else str(TITLE_QUOTA.get(갈래, TITLE_QUOTA_DEFAULT)),
+            "조건": rule.get("조건", ""),
+            "최종": len(수령.get(이름, [])),
+            "받은 사람": ", ".join(수령.get(이름, [])[:8]) or "—",
+        }
+        r["진단"] = _title_verdict(r, rule)
+        rows.append(r)
+    # **심각한 것을 위로.** 인원 순으로 두면 잘 나가는 칭호가 위를 덮어
+    # 정작 볼 것이 아래로 숨는다.
+    급함 = {"✗": 0, "△": 1, "⚠": 2}
+    return sorted(rows, key=lambda r: (급함.get(r["진단"][:1], 3), -r["후보"]))
+
+
+def _title_verdict(r: dict, rule: dict) -> str:
+    """진단 한 줄 — **먼저 맞는 것 하나**. 짧게 쓴다.
+
+    길게 쓰면 옆 `조건` 칸이 화면 밖으로 밀리는데, 정작 고칠 곳은 그쪽이다.
+    낱말의 뜻은 표 위 캡션이 한 번만 설명한다.
+    """
+    후보, 최종 = r["후보"], r["최종"]
+    if r["칭호"] in BADGE_TITLES:
+        말 = "배지형 — 자격자 전원"
+    elif not 후보:
+        말 = "✗ 조건이 좁다 — 후보 0"
+    elif not 최종:
+        큰것 = max((("지표", r["지표밀림"]), ("세칸", r["세칸밀림"]),
+                  ("정원", r["정원밀림"])), key=lambda x: x[1])
+        말 = f"✗ 안 뜬다 — {큰것[0]}밀림 {큰것[1]}"
+    elif r["정원"].isdigit() and 최종 >= int(r["정원"]) and r["정원밀림"]:
+        말 = f"△ 정원 포화 — {r['정원밀림']}명 잘림"
+    elif r["세칸밀림"] >= max(최종, 1):
+        말 = f"⚠ 우선({r['우선']})에 눌림 — {r['세칸밀림']}명"
+    elif r["지표밀림"] >= max(최종, 1):
+        말 = f"⚠ 지표({r['지표']})에 가림 — {r['지표밀림']}명"
+    else:
+        말 = "적정"
+    return f"{말} · 의도됨" if rule.get("메모") else 말
 
 
 def split_badge_titles(titles: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -1931,6 +2275,12 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
     add: list[dict] = []
 
     def put(지표, 우선, 아이콘, 칭호, 근거, 강도=0.0, 갈래="일반"):
+        """후보 하나.
+
+        **조건(규칙 자체)은 여기 안 적는다** — `TITLE_RULES`가 단일 출처다.
+        여기 적으면 후보가 0명인 칭호의 조건이 화면에 못 뜨는데, 그 칭호가
+        가장 조율이 급하다. 여기 값과 규칙표가 어긋나면 테스트가 잡는다.
+        """
         add.append({"지표": 지표, "우선": 우선, "아이콘": 아이콘, "칭호": 칭호,
                     "근거": 근거, "강도": float(강도), "갈래": 갈래})
 
@@ -1944,11 +2294,14 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
             return [{"지표": "연차", "우선": 52, "아이콘": "🚪", "칭호": "아직 첫 출사 전",
                      "근거": f"{prof['가입일']} 가입 — 아직 첫 출사 전입니다. "
                             "곧 뵙겠습니다",
-                     "강도": 0.0, "갈래": "일반"}]
+                     "강도": 0.0, "갈래": "일반",
+                     "조건": f"활동 0건이지만 가입한 지 {GHOST_GRACE_DAYS}일이 "
+                            "안 됨"}]
         return [{"지표": "연차", "우선": 50, "아이콘": "👻", "칭호": "유령 회원",
                  "근거": "이 기간에 글·사진·참석이 하나도 없습니다 "
                         "(가입인사는 활동으로 세지 않습니다)",
-                 "강도": 0.0, "갈래": "일반"}]
+                 "강도": 0.0, "갈래": "일반",
+                 "조건": "이 기간에 글·사진·참석이 하나도 없음"}]
 
     att, hosted_ran = prof["참석"], prof["개최 진행"]
     n_photo, n_theme = prof["사진"], prof["테마사진"]
@@ -1974,11 +2327,11 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
             f"{_pctstr(top['내 기준'])}, 상대 출사의 "
             f"{_pctstr(top['상대 기준'])}가 서로 겹칩니다. "
             "한 분이 보이면 다른 한 분도 있는 셈입니다",
-            top["함께"], "관계")
+            top["함께"], "관계",)
     # 콤비가 붙은 상대에게는 일방형을 안 붙인다 — 서로 붙어 다니는 것과
     # 한쪽이 쫓아다니는 것은 다른 얘기라, 같은 상대로 둘 다 붙으면 앞말이
     # 뒷말을 부정한다.
-    elif top and att >= 4 and _follows(top, prof):
+    elif top and att >= FOLLOW_MIN_ATT and _follows(top, prof):
         put("동행", 88, "🐾", f"{top['함께 간 사람']}님 오늘도 뵙네요",
             f"내 출사 {att}회 중 {top['함께']}회에 이분이 계셨습니다"
             f"({_pctstr(top['내 기준'])}). 이분이 전체 출사에 나오는 비율"
@@ -2010,14 +2363,16 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
                 f"({_pctstr(me['내비율'])}). {_chance_phrase(me)}했습니다 — "
                 "정작 이분의 1순위는 따로 있고요",
                 me["하한"], "관계")
-    if top_share(name, ctx["동행자"], 0.20, min_value=4):
+    if top_share(name, ctx["동행자"], COMPANION_TOP_SHARE,
+                 min_value=COMPANION_MIN):
         put("동행", 80, "🕸", "다 아는 사람들 이구먼",
             f"함께 출사해 본 사람이 {prof['동행자']}명 — 모임에서 아는 얼굴이 "
             "가장 많은 20% 안에 듭니다", prof["동행자"])
-    if att >= 3 and len(ctx["동행자"]) >= 4 and (
+    if att >= ATT_MIN_RANK and len(ctx["동행자"]) >= 4 and (
             # 아무와도 안 겹친 사람은 `동행자` 목록에 아예 없다 — 분위로만 재면
             # 가장 혼자인 사람이 빠져나간다.
-            prof["동행자"] == 0 or bottom_share(name, ctx["동행자"], 0.25)):
+            prof["동행자"] == 0
+            or bottom_share(name, ctx["동행자"], COMPANION_BOTTOM_SHARE)):
         put("동행", 62, "🕊", "저 신입 아닌데요",
             f"참석 {att}회에 함께 간 사람 {prof['동행자']}명 — 모임에서 동행이 "
             "가장 적은 25%입니다", -prof["동행자"])
@@ -2036,32 +2391,33 @@ def _title_candidates(name: str, prof: dict, companions: list[dict],
         if not 바닥:
             return
         # 1등도 모수를 함께 본다 — 두 사람뿐인 판의 1등은 1등이 아니다.
-        if prof[f"{지표} 순위"] == 1 and len(ctx[지표]) >= 4:
+        if prof[f"{지표} 순위"] == 1 and len(ctx[지표]) >= RANK1_MIN_POOL:
             put(지표, *위, f"{사실}. 모임에서 가장 {순서말} 분입니다", 강도)
         elif top_share(name, ctx[지표], share, min_value=0):
             put(지표, *아래,
                 f"{사실}. {순서말} 순으로 상위 {round(share * 100)}% 안입니다", 강도)
 
     tier("테마", (90, "🎨", "테마사진의 제왕"), (78, "🖌", "테마사진 프로 참석러"),
-         바닥=n_theme >= 2, 강도=n_theme, share=0.15, 순서말="많이 낸",
+         바닥=n_theme >= 2, 강도=n_theme, share=TOP_SHARE_TIGHT, 순서말="많이 낸",
          사실=f"테마사진 {n_theme}장을 {prof['테마 참여월']}개월에 걸쳐 냈습니다")
     # **개최는 참석보다 위에 둔다.** 이 모임은 운영진이 아니어도 출사를 열 수
     # 있고 그것을 지향한다 — 개최 부담을 나눠 지는 것이 그냥 나오는 것보다
     # 귀하다. 그래서 93 > 참석 90, 80 > 참석 76이다. 동행 95는 그대로 위에
     # 남긴다(관계 칭호가 맨 앞에 오는 지금 결이 자연스럽다).
     tier("개최", (93, "📢", "출사장도 장이다"), (80, "🗣", "심심한데 출사쳐야지"),
-         바닥=hosted_ran >= 2, 강도=hosted_ran, share=0.30, 순서말="많이 연",
+         바닥=hosted_ran >= 2, 강도=hosted_ran, share=TOP_SHARE_LOOSE, 순서말="많이 연",
          사실=f"펑이 아닌 출사를 {hosted_ran}건 열었습니다")
     tier("참석", (90, "🥾", "이게 본업이에요"), (76, "🔥", "프로 참석러"),
-         바닥=att >= 3, 강도=att, share=0.15, 순서말="많이 나온",
+         바닥=att >= ATT_MIN_RANK, 강도=att, share=TOP_SHARE_TIGHT, 순서말="많이 나온",
          사실=f"참석 {att}회 — 후기가 매칭된 출사의 "
               f"{_pctstr(prof['참석률'])}에 나왔습니다")
     tier("사진", (85, "📸", "여기 제 인스타인데.."), (75, "🖼", "부지런한 업로더"),
-         바닥=n_photo >= 5, 강도=n_photo, share=0.30, 순서말="많이 올린",
+         바닥=n_photo >= PHOTO_MIN_RANK, 강도=n_photo, share=TOP_SHARE_LOOSE,
+         순서말="많이 올린",
          사실=f"사진 {n_photo}장 · 받은 좋아요 {prof['사진 좋아요']}")
     tier("좋아요", (85, "❤️", "사진 좋아요 1위"), (74, "💗", "느좋 사진러"),
-         바닥=n_photo >= LIKE_RANK_MIN_PHOTOS, 강도=prof["장당 좋아요"], share=0.30,
-         순서말="장당 좋아요가 높은",
+         바닥=n_photo >= LIKE_RANK_MIN_PHOTOS, 강도=prof["장당 좋아요"],
+         share=TOP_SHARE_LOOSE, 순서말="장당 좋아요가 높은",
          사실=f"{n_photo}장을 올려 장당 좋아요 {prof['장당 좋아요']}를 받았습니다")
 
     # ── 후기 (자기 출사 후기율의 양 끝) ──────────────────────
@@ -2302,7 +2658,9 @@ def _combo_partner(companions: list[dict]) -> str | None:
     둔다. 조건이 갈리면 같은 상대로 💞가 두 번 붙는다.
     """
     top = companions[0] if companions else None
-    if top and top["함께"] >= 3 and top["내 기준"] >= 50 and top["상대 기준"] >= 50:
+    if (top and top["함께"] >= PAIR_MIN_JOINT
+            and top["내 기준"] >= COMBO_MIN_SHARE
+            and top["상대 기준"] >= COMBO_MIN_SHARE):
         return top["함께 간 사람"]
     return None
 
@@ -2331,7 +2689,8 @@ def _follows(top: dict, prof: dict) -> bool:
     그보다 확실히 높을 때만 "따라다닌다"고 말할 수 있다.
     """
     baseline = _pct(top["상대 참석"], prof["매칭 출사"])
-    return top["내 기준"] >= 60 and top["내 기준"] - baseline >= 15
+    return (top["내 기준"] >= FOLLOW_MIN_SHARE
+            and top["내 기준"] - baseline >= FOLLOW_MIN_EDGE)
 
 
 def _review_lag(name: str, posts: list[dict],
@@ -3878,7 +4237,11 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
 
     # 정원이 있어 한 사람만 따로 낼 수 없다 — 같은 칭호를 몇 명이 받는지
     # 알아야 자르기 때문이다. 전원을 내고 자기 것을 꺼낸다(0.1초대).
-    all_titles = club_titles(posts, photos, members, months, ctx)
+    # `진단=True`면 후보와 밀린 이유까지 받는다 — 맨 아래 🏆 칭호 분포가
+    # "왜 이 인원인가"를 말하는 재료다. 어차피 안에서 만들고 버리던 것이라
+    # 추가 비용이 없다.
+    run = club_titles(posts, photos, members, months, ctx, 진단=True)
+    all_titles = run["최종"]
     titles = all_titles.get(name) or []
 
     badge_ts, period_ts = split_badge_titles(titles)
@@ -4105,41 +4468,38 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
         st.caption("업로드한 사진이 없습니다.")
 
     st.divider()
-    _title_distribution(names, all_titles)
+    _title_distribution(names, run)
 
 
-def _title_distribution(names: list[str],
-                        all_titles: dict[str, list[dict]]) -> None:
-    """전 멤버에게 칭호가 어떻게 퍼졌는지 — **기준을 조정하려고 보는 화면.**
+def _title_distribution(names: list[str], run: dict) -> None:
+    """칭호가 어떻게 퍼졌는지 — **무엇을 조율할지 보는 화면.**
 
-    칭호는 아무도 못 받아도, 몇 사람이 싹쓸이해도 재미가 없다. 그런데 그건
-    조건을 아무리 들여다봐도 알 수 없고 **실제 데이터에 대고 세어 봐야만**
-    안다. 그래서 세는 화면을 함께 둔다.
+    예전에는 `칭호 / 인원 / 받은 사람` 세 칸이 전부여서, "3명"까지는 알아도
+    **왜 3명인지**를 몰랐다. 조건이 좁아서인지, 정원에 잘려서인지, 우선순위가
+    낮아 같은 지표의 윗 칭호에 가려서인지 — 셋은 고치는 방법이 정반대다.
 
-    `_theme_section`과 같은 상태 있는 expander다 — **닫혀 있으면 전 멤버
-    계산을 아예 안 한다.** 쉰 명분 칭호를 매 rerun마다 돌릴 이유가 없다.
+    그래서 조건·정원·우선과 **못 받은 이유 세 갈래**를 한 줄에 놓는다.
+    조건 문구에는 상수 이름과 현재값이 함께 적혀 있어(`ATT_MIN_RANK(3)`)
+    어느 줄을 고치면 되는지가 그대로 보인다.
+
+    `_theme_section`과 같은 상태 있는 expander다 — **닫혀 있으면 표를 아예 안
+    만든다.** (칭호 계산 자체는 위에서 이미 한 번 돌았고 그 결과를 받아 쓴다.)
     """
-    exp = st.expander("🏆 칭호 분포 — 기준이 적당한지 보는 곳",
+    exp = st.expander("🏆 칭호 분포 — 무엇을 조율할지 보는 곳",
                       key="mf_dist_open", on_change="rerun")
     with exp:
         if not exp.open:
             return
-        st.caption(f"칭호마다 **정원**이 있습니다 — 일반 {TITLE_QUOTA_DEFAULT}명, "
-                   f"관계형·카테고리형 {TITLE_QUOTA['관계']}명. 넘치면 강한 순으로 "
-                   "자르므로 **인원이 정원에 딱 붙어 있으면 조건이 느슨하다는 뜻**"
-                   "입니다. 반대로 **수령 0명인 칭호**는 너무 조인 것입니다. "
-                   f"단 **{', '.join(sorted(BADGE_TITLES))}**은(는) 정원도 3칸 "
-                   "제한도 없습니다 — 활동이 아니라 가입일로 매기는 사실이라 "
-                   "자격이 되면 전원이 받습니다.")
+        all_titles = run["최종"]
+        st.caption(
+            f"칭호마다 **정원**이 있습니다 — 일반 {TITLE_QUOTA_DEFAULT}명, "
+            f"관계형·카테고리형 {TITLE_QUOTA['관계']}명, 유일형 "
+            f"{TITLE_QUOTA['유일']}명. 넘치면 강한 순으로 자릅니다. 단 "
+            f"**{', '.join(sorted(BADGE_TITLES))}**은(는) 정원도 3칸 제한도 "
+            "없습니다 — 활동이 아니라 가입일로 매기는 사실이라 자격이 되면 "
+            "전원이 받습니다.")
 
-        got: dict[str, list[str]] = defaultdict(list)
-        per_person: dict[str, int] = {}
-        for n in names:
-            ts = all_titles.get(n) or []
-            per_person[n] = len(ts)
-            for t in ts:
-                got[t["칭호"]].append(n)
-
+        per_person = {n: len(all_titles.get(n) or []) for n in names}
         held = sum(1 for v in per_person.values() if v)
         c = st.columns(3)
         c[0].metric("칭호를 받은 사람", f"{held}명")
@@ -4148,15 +4508,33 @@ def _title_distribution(names: list[str],
                     f"{round(sum(per_person.values()) / len(names), 2)}개"
                     if names else "—")
 
-        st.markdown("##### 칭호별 수령 인원")
-        # **수령 0명인 칭호도 행으로 남긴다** — 아무도 못 받는 칭호가 있다는
-        # 사실이 조정에 필요한 정보다. 안 걸린 것을 빼 버리면 화면만 보고는
-        # 그 칭호가 존재하는지도 모른다.
-        rows = [{"칭호": t, "인원": len(got.get(t, [])),
-                 "받은 사람": ", ".join(got.get(t, [])[:8]) or "—"}
-                for t in _all_title_names(got)]
-        st.dataframe(pd.DataFrame(rows).sort_values("인원", ascending=False),
-                     hide_index=True, width="stretch", height=460)
+        st.markdown("##### 칭호별 진단")
+        st.caption(
+            "**못 받은 이유를 세 갈래로 가릅니다** — `지표밀림`은 같은 지표의 "
+            "윗 칭호에 가린 것(정원을 늘려도 안 풀립니다), `세칸밀림`은 그 "
+            "사람의 세 칸이 더 높은 우선순위로 먼저 찬 것, `정원밀림`은 칭호 "
+            "정원에 잘린 것입니다. **`후보 = 최종 + 세 밀림`** 이 늘 맞습니다. "
+            "`조건`의 괄호는 그 상수의 **현재값**이라, 코드에서 그 이름을 찾아 "
+            "고치면 됩니다.")
+        rows = title_diagnostics(run)
+        # **칸을 아홉으로 줄인다.** 열셋을 늘어놓으면 정작 볼 `조건`과 `진단`이
+        # 가로로 밀려 안 보인다. 밀림 셋은 `6·2·0` 한 칸으로 묶는다 — 어느 쪽이
+        # 큰지만 보면 되고, 정확한 수는 옆 `후보`·`최종`으로 되짚을 수 있다.
+        # `갈래`는 뺐다. 정원이 곧 갈래이고, 처방에 쓰는 것은 정원 쪽이다.
+        for r in rows:
+            r["밀림 (지표·세칸·정원)"] = (f"{r['지표밀림']}·{r['세칸밀림']}"
+                                    f"·{r['정원밀림']}")
+        st.dataframe(
+            pd.DataFrame(rows)[["칭호", "후보", "최종", "밀림 (지표·세칸·정원)",
+                                "진단", "조건", "지표", "우선", "정원"]],
+            hide_index=True, width="stretch", height=520,
+            column_config={
+                "칭호": st.column_config.TextColumn("칭호", width="medium"),
+                "진단": st.column_config.TextColumn("진단", width="large"),
+                "조건": st.column_config.TextColumn("조건", width="large"),
+                "후보": st.column_config.NumberColumn("후보", width="small"),
+                "최종": st.column_config.NumberColumn("최종", width="small"),
+            })
 
         st.markdown("##### 한 사람이 받은 개수")
         # 배지형은 세 칸 밖이라 `TITLE_LIMIT`까지만 세면 **행이 통째로 사라진다.**
@@ -4172,28 +4550,6 @@ def _title_distribution(names: list[str],
         if none_got:
             st.caption(f"**하나도 못 받은 {len(none_got)}명** — "
                        + ", ".join(none_got))
-
-
-# 이름에 사람·카테고리가 박히는 칭호(`{상대}님과 2인 1조`)는 미리 나열할 수
-# 없다. 그래서 고정 이름 목록에 **이번에 실제로 나온 것**을 합쳐 보여 준다.
-FIXED_TITLE_NAMES = [
-    "테마사진의 제왕", "테마사진 프로 참석러", "출사장도 장이다", "심심한데 출사쳐야지",
-    "이게 본업이에요", "프로 참석러", "여기 제 인스타인데..", "부지런한 업로더",
-    "사진 좋아요 1위", "느좋 사진러", "다 아는 사람들 이구먼", "저 신입 아닌데요",
-    "책임감 100만점", "아맞다후기", "후기는 따끈할때", "내일 출사가실분?",
-    "정출킬러", "소수정예",
-    "소모임에요? 글쎄..", "제가 사진이 좀 많아요", "펑이 뭐죠?", "그럴만한 이유가...",
-    "잡식성", "프로 평일러",
-    "틈틈이 골고루", "짧은 기간에 진심",
-    "아이고 어르신", "첫 출사 못 참지", "새싹", "돌아오세요",
-    "아직 첫 출사 전", "유령 회원",
-    "집에서 뵙겠습니다", "카메라는 두고 왔어요", "운영진도 아닌데",
-    *CATEGORY_TITLES.values(),
-]
-
-
-def _all_title_names(got: dict[str, list[str]]) -> list[str]:
-    return FIXED_TITLE_NAMES + sorted(set(got) - set(FIXED_TITLE_NAMES))
 
 
 # ═══════════════════════════════════════════════════════════════
