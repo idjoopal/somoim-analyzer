@@ -137,6 +137,24 @@ def kind_label(p: dict) -> str:
 KIND_SHOOT, KIND_CULTURE, KIND_RETOUCH = "출사", "문화벙", "보정벙"
 KINDS = (KIND_SHOOT, KIND_CULTURE, KIND_RETOUCH)
 
+# 🏅 순위를 매기는 지표. `club_context`가 같은 이름으로 `[(이름, 값)]`을 낸다.
+# 묶음 순서가 곧 화면에 그리는 순서다 — 나온 자리 → 연 자리 → 남긴 것.
+RANK_GROUPS = {
+    "나온 자리": ("모임참석", "참석", "문화벙참석", "보정벙참석"),
+    "연 자리": ("모임개최", "개최", "문화벙개최", "보정벙개최"),
+    "남긴 것": ("후기", "사진", "테마", "좋아요"),
+}
+RANKED_METRICS = tuple(k for g in RANK_GROUPS.values() for k in g)
+
+# 순위 라벨 — 위 지표 칸과 **글자까지 같아야** 눈이 두 번 훑지 않는다.
+# `참석`·`개최`는 **출사만** 세는 값이라 이름만 보고는 알 수 없다.
+RANK_LABEL = {
+    "참석": "출사 참석", "개최": "출사 개최",
+    "모임참석": "모임 참석", "문화벙참석": "문화벙 참석", "보정벙참석": "보정벙 참석",
+    "모임개최": "모임 개최", "문화벙개최": "문화벙 개최", "보정벙개최": "보정벙 개최",
+    "테마": "테마사진", "좋아요": "장당 좋아요",
+}
+
 
 def post_kind(p: dict) -> str | None:
     """게시글 하나가 어느 칸에 들어가나. 아니면 `None`.
@@ -348,12 +366,16 @@ def hosting_by_kind(posts: list[dict]) -> list[dict]:
     표에서 갈라 보이게 한다 — 실데이터의 김지우는 출사 1건·보정벙 9건이라
     한 숫자로는 "거의 안 여는 사람"이 된다.
 
-    `모임 개최`는 **펑을 뺀 진행 건수**라 `출사 진행 + 문화벙 + 보정벙`과 정확히
-    맞는다. 펑까지 세면 한 줄 안에서 합이 안 맞아 보는 사람이 먼저 의심한다 —
-    참석 쪽 `모임 참석`에 같은 규칙을 쓴다. 펑은 아래 두 칸이 따로 말한다.
+    `모임 개최`는 **펑을 뺀 진행 건수**라 `출사 진행 + 문화벙 진행 + 보정벙 진행`과
+    정확히 맞는다. 펑까지 세면 한 줄 안에서 합이 안 맞아 보는 사람이 먼저
+    의심한다 — 참석 쪽 `모임 참석`에 같은 규칙을 쓴다.
 
-    `출사 취소율`의 분모는 **출사 공지 전부**다. 벙은 펑이 드물어 섞으면
-    취소율이 실제보다 낮아 보인다.
+    **갈래마다 진행과 취소를 함께 낸다.** 벙 취소를 안 세면 벙 쪽 데이터가
+    반쪽이 된다. 실데이터에서 벙 펑은 드물지 않다 — 문화벙 3건(13.0%)·보정벙
+    4건(12.1%)이고 여덟 명이 냈다. 출사 21.4%보다 낮을 뿐이다.
+
+    `출사 취소율`의 분모는 **출사 공지 전부**다. 갈래마다 펑 비율이 달라
+    (21.4% vs 12~13%) 섞으면 어느 쪽 비율도 아니게 된다.
     """
     agg: dict[str, Counter] = defaultdict(Counter)
     for p in posts:
@@ -364,15 +386,15 @@ def hosting_by_kind(posts: list[dict]) -> list[dict]:
     rows = []
     for who, c in agg.items():
         출사 = c["출사진행"] + c["출사취소"]
-        rows.append({
-            "작성자": who,
-            "모임 개최": c["출사진행"] + c["문화벙진행"] + c["보정벙진행"],
-            "출사 진행": c["출사진행"],
-            "출사 취소": c["출사취소"],
-            "출사 취소율": round(c["출사취소"] / 출사 * 100, 1) if 출사 else 0.0,
-            "문화벙 개최": c["문화벙진행"],
-            "보정벙 개최": c["보정벙진행"],
-        })
+        row = {"작성자": who,
+               "모임 개최": sum(c[f"{k}진행"] for k in KINDS)}
+        # 갈래마다 진행·취소를 **짝으로** 낸다. 한쪽만 있으면 그 갈래의 얘기가
+        # 반쪽이 된다.
+        for k in KINDS:
+            row[f"{k} 진행"] = c[f"{k}진행"]
+            row[f"{k} 취소"] = c[f"{k}취소"]
+        row["출사 취소율"] = round(c["출사취소"] / 출사 * 100, 1) if 출사 else 0.0
+        rows.append(row)
     return sorted(rows, key=lambda r: (-r["모임 개최"], -r["출사 진행"], r["작성자"]))
 
 
@@ -738,8 +760,8 @@ def activity_ranking(posts: list[dict], photos: list[dict]) -> list[dict]:
             "게시글": pr["게시글"] if pr else 0,
             "사진": photo_cnt.get(author, 0),
             "출사 개최": h["출사 진행"] if h else 0,
-            "문화벙 개최": h["문화벙 개최"] if h else 0,
-            "보정벙 개최": h["보정벙 개최"] if h else 0,
+            "문화벙 개최": h["문화벙 진행"] if h else 0,
+            "보정벙 개최": h["보정벙 진행"] if h else 0,
             "후기": pr["후기"] if pr else 0,
             "좋아요": pr["좋아요"] if pr else 0,
         })
@@ -1298,19 +1320,31 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
     # 문화와 보정은 따로 센다. 같은 벙이라도 문화는 클라이밍·전시처럼 나가서
     # 노는 자리이고 보정은 절반 이상이 온라인이라, 한 덩어리로 묶으면 성향이
     # 정반대인 두 사람이 같은 숫자로 보인다.
+    # 개최도 참석과 같은 결로 쪼갠다. 참석은 문화/보정으로 갈라 놓고 개최만
+    # `벙 개최` 한 덩어리로 두면, 문화벙만 여는 사람과 보정벙만 여는 사람이
+    # 같은 숫자로 보인다 — 참석 쪽을 쪼갠 이유가 개최에도 그대로 적용된다.
     벙참석: Counter = Counter()
     문화참석: Counter = Counter()
     보정참석: Counter = Counter()
     온라인참석: Counter = Counter()
     벙개최: Counter = Counter()
+    문화개최: Counter = Counter()
+    보정개최: Counter = Counter()
+    출사개최: Counter = Counter()
     모임참석: Counter = Counter()
     for p in posts:
         # **`post_kind`로 거른다.** `cat == "A"`로만 세면 `일반공지`와 카테고리
         # 미상까지 들어와 `모임 참석 = 출사 + 문화벙 + 보정벙` 항등식이 깨진다.
         # 참석 탭이 네 숫자를 한 줄에 놓으므로 합이 안 맞으면 바로 보인다.
-        if post_kind(p) and p.get("actually_held"):
+        갈래 = post_kind(p)
+        if 갈래 and p.get("actually_held"):
             for n in set(p.get("attendees") or []):
                 모임참석[n] += 1
+        # 개최는 **펑을 뺀다** — `모임 개최 = 출사 + 문화벙 + 보정벙`이 맞아야
+        # 한 줄에 나란히 놓을 수 있다. 펑은 `개최 취소`가 따로 말한다.
+        if 갈래 and not p.get("is_canceled") and p.get("author"):
+            {KIND_SHOOT: 출사개최, KIND_CULTURE: 문화개최,
+             KIND_RETOUCH: 보정개최}[갈래][p["author"]] += 1
         if not is_bung(p):
             continue
         if not p.get("is_canceled") and p.get("author"):
@@ -1324,6 +1358,7 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
             칸[n] += 1
             if 온라인:
                 온라인참석[n] += 1
+    모임개최 = Counter(출사개최) + Counter(문화개최) + Counter(보정개최)
 
     return {
         "참석": [(r["멤버"], r["참석횟수"]) for r in attendance_counts(모수)],
@@ -1356,8 +1391,23 @@ def club_context(posts: list[dict], photos: list[dict], members: list[dict],
         "보정참석수": dict(보정참석),
         "온라인참석수": dict(온라인참석),
         "벙개최수": dict(벙개최),
+        "문화개최수": dict(문화개최),
+        "보정개최수": dict(보정개최),
+        "모임개최수": dict(모임개최),
         # 출사 + 문화벙 + 보정벙 — 이 모임에 나온 **모든** 자리
         "모임참석수": dict(모임참석),
+        # ── 순위용 목록 ──────────────────────────────────────
+        # `competition_rank`가 `[(이름, 값)]`을 받는다. 0인 사람은 넣지 않는다 —
+        # 모수는 "그 활동을 한 번이라도 한 사람 수"라야 등수가 뜻을 가진다.
+        "모임참석": [(n, c) for n, c in 모임참석.items() if c],
+        "문화벙참석": [(n, c) for n, c in 문화참석.items() if c],
+        "보정벙참석": [(n, c) for n, c in 보정참석.items() if c],
+        "모임개최": [(n, c) for n, c in 모임개최.items() if c],
+        "문화벙개최": [(n, c) for n, c in 문화개최.items() if c],
+        "보정벙개최": [(n, c) for n, c in 보정개최.items() if c],
+        "후기": [(n, c) for n, c in Counter(
+            p["author"] for p in posts
+            if p.get("cat") == "E" and p.get("author")).items() if c],
         "밀도": density,
         "_축": months,
         # 여기서 한 번만 읽는다. 멤버마다 `date.today()`를 부르면 자정을 넘기는
@@ -1584,8 +1634,12 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
     likes = sum(p.get("likes", 0) for p in my_photos)
 
     # 순위는 전체에서의 자리 — "12회 참석"만으로는 그게 많은 건지 모른다.
-    ranks = {k: competition_rank(name, ctx[k])
-             for k in ("참석", "개최", "사진", "테마", "좋아요")}
+    #
+    # **지표마다 매긴다.** 예전에는 다섯 개를 계산해 놓고 화면은 셋만 그렸다.
+    # 벙만 다니는 사람에게 "출사 87명 중 몇 등"만 보여 주면 그 사람이 이 모임에서
+    # 무엇을 하는 사람인지가 화면에서 통째로 빠진다.
+    ranks = {k: competition_rank(name, ctx.get(k) or [])
+             for k in RANKED_METRICS}
     out = {
         "이름": name,
         "운영진": bool(m.get("is_admin")),
@@ -1598,6 +1652,9 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
         "참석": len(attended),
         "매칭 출사": len(held),
         "참석률": _pct(len(attended), len(held)),
+        # `개최`는 **출사만**이고 펑을 포함한다(`모수`가 출사만이라서). 화면이
+        # 이 값을 `개최(전체)`라 부르며 "출사와 벙을 합친 수"라고 적어 두었던
+        # 것은 거짓말이었다 — 벙까지 세는 것은 위 `모임 개최`다.
         "개최": len(hosted), "개최 취소": len(canceled), "개최 진행": len(ran),
         "취소율": _pct(len(canceled), len(hosted)),
         "후기": len(reviews),
@@ -1625,6 +1682,12 @@ def member_profile(name: str, posts: list[dict], photos: list[dict],
         "보정벙 참석": (ctx.get("보정참석수") or {}).get(name, 0),
         "온라인 벙 참석": (ctx.get("온라인참석수") or {}).get(name, 0),
         "벙 개최": (ctx.get("벙개최수") or {}).get(name, 0),
+        "문화벙 개최": (ctx.get("문화개최수") or {}).get(name, 0),
+        "보정벙 개최": (ctx.get("보정개최수") or {}).get(name, 0),
+        # 출사 + 문화벙 + 보정벙, 펑 제외. `개최`(아래)와 헷갈리지 말 것 —
+        # 저쪽은 **출사만**이고 펑까지 센다. 화면은 `개최(전체)`라고 적어
+        # 놓고 저 값을 쓰고 있었다(김지우 님: 출사 1 · 보정벙 9인데 1로 표시).
+        "모임 개최": (ctx.get("모임개최수") or {}).get(name, 0),
         # 출사 + 문화벙 + 보정벙. `참석`은 **출사만**이라 이름이 헷갈리기 쉬워
         # 둘을 나란히 두고 화면에서 이름으로 구분한다.
         "모임 참석": (ctx.get("모임참석수") or {}).get(name, 0),
@@ -2893,8 +2956,11 @@ def _tab_outings(posts: list[dict], months: list[int]) -> None:
 
     st.markdown("#### 공지 작성 순위 (출사 기준)")
     st.caption("**정렬과 막대는 `출사 진행`** 입니다 — 이 모임의 주목적이라서요. "
-               "문화벙·보정벙은 같은 줄에 병기만 합니다. `출사 취소율`의 분모도 "
-               "출사 공지뿐입니다(벙은 펑이 드물어 섞으면 낮아 보입니다). "
+               "문화벙·보정벙은 같은 줄에 병기만 합니다. **갈래마다 진행과 취소를 "
+               "짝으로 적습니다** — 한쪽만 있으면 그 갈래의 얘기가 반쪽이 됩니다. "
+               "`모임 개최`는 펑을 뺀 세 진행의 합입니다. `출사 취소율`의 분모는 "
+               "출사 공지뿐입니다 — 이 모임의 펑 비율은 출사 21.4% · 문화벙 13.0% · "
+               "보정벙 12.1%로 갈래마다 달라, 섞으면 어느 쪽 비율도 아니게 됩니다. "
                "출사일이 대상 기간에 든 공지만 집계합니다.")
     ranking = hosting_by_kind(posts)
     if ranking:
@@ -3837,38 +3903,76 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
 
     # **셋을 나란히 놓고 이름으로 구분한다.** `참석`이 무엇을 센 것인지 감추면
     # 어떤 숫자도 읽을 수 없다 — 출사만인지 벙까지인지가 사람마다 크게 다르다.
+    # **묶어서 그린다.** 예전에는 5칸씩 세 줄에 참석·개최·생산·시점이 뒤섞여
+    # 있어서, 옆칸과 무슨 관계인지가 배치에서 아무것도 안 읽혔다 — `벙 개최`
+    # 옆에 `후기`가 있고 `개최(전체)` 옆에 `첫 등장`이 있는 식이었다. 줄마다
+    # 한 가지 얘기만 하게 하고, **모든 칸에 무엇을 센 숫자인지 help를 단다**.
+    st.markdown("###### 나온 자리")
     c = st.columns(5)
     c[0].metric("모임 참석", prof["모임 참석"],
-                help="출사 + 문화벙 + 보정벙 — 이 모임에 나온 모든 자리입니다.")
+                help="출사 + 문화벙 + 보정벙 — 이 모임에 나온 모든 자리입니다. "
+                     "오른쪽 세 칸을 더한 값입니다.")
     c[1].metric("출사 참석", prof["참석"],
                 help="촬영이 목적인 자리(인물·인물&풍경·풍경·GN)만 셉니다. "
                      "순위와 칭호는 이 숫자를 봅니다.")
-    c[2].metric("출사 참석률", f"{prof['참석률']}%",
+    c[2].metric("문화벙 참석", prof["문화벙 참석"],
+                help="클라이밍·전시·보드게임처럼 촬영이 곁다리이거나 없는 번개.")
+    c[3].metric("보정벙 참석", prof["보정벙 참석"],
+                help=f"촬영 없이 모여 사진을 다듬는 자리. "
+                     f"그중 온라인 {prof['온라인 벙 참석']}회.")
+    c[4].metric("출사 참석률", f"{prof['참석률']}%",
                 help=f"이 기간에 열린 출사 {prof['매칭 출사']}건 중 나온 비율. "
                      "후기가 매칭된 출사만 분모에 넣습니다 — 후기가 없으면 "
                      "누가 갔는지 알 수 없기 때문입니다.")
-    c[3].metric("문화벙 참석", prof["문화벙 참석"],
-                help="클라이밍·전시·보드게임처럼 촬영이 곁다리이거나 없는 번개.")
-    c[4].metric("보정벙 참석", prof["보정벙 참석"],
-                help=f"촬영 없이 모여 사진을 다듬는 자리. "
-                     f"그중 온라인 {prof['온라인 벙 참석']}회.")
+
+    st.markdown("###### 연 자리")
     c = st.columns(5)
-    c[0].metric("출사 개최", prof["출사 개최"],
+    c[0].metric("모임 개최", prof["모임 개최"],
+                help="출사 + 문화벙 + 보정벙, **펑은 뺀 수**입니다. 오른쪽 세 "
+                     "칸을 더한 값입니다.")
+    c[1].metric("출사 개최", prof["출사 개최"],
                 help="펑이 아닌 출사만. 이 모임은 운영진이 아니어도 출사를 열 수 "
                      "있고 그것을 지향합니다 — `운영진도 아닌데` 칭호가 보는 숫자입니다.")
-    c[1].metric("벙 개최", prof["벙 개최"])
-    c[2].metric("후기", prof["후기"])
-    c[3].metric("사진", prof["사진"],
+    c[2].metric("문화벙 개최", prof["문화벙 개최"], help="펑이 아닌 문화벙만.")
+    c[3].metric("보정벙 개최", prof["보정벙 개최"], help="펑이 아닌 보정벙만.")
+    c[4].metric("펑(출사 취소)", prof["개최 취소"],
+                help=f"열었다가 취소한 출사. 낸 출사 공지 {prof['개최']}건 중 "
+                     f"{prof['취소율']}%입니다. 벙은 펑이 드물어 따로 안 셉니다.")
+
+    st.markdown("###### 남긴 것")
+    c = st.columns(5)
+    c[0].metric("후기", prof["후기"],
+                help="이 사람이 쓴 후기 글 수. 자기가 연 출사의 후기율은 아래 "
+                     "`개최한 출사`에 따로 있습니다.")
+    c[1].metric("사진", prof["사진"],
                 help="사진 업로드는 모임이 앱 상위에 노출되도록 장려하는 "
                      "활동이지 모임의 목적은 아닙니다.")
-    c[4].metric("테마사진", prof["테마사진"])
-    c = st.columns(5)
-    c[0].metric("개최(전체)", prof["개최"],
-                help="펑 포함. 출사와 벙을 합친 수입니다.")
-    c[1].metric("첫 등장", prof["첫 등장"])
-    c[2].metric("최근 참석", prof["최근 참석"])
-    c[3].metric("가입일", prof["가입일"])
-    c[4].metric("마지막 방문", prof["마지막 방문"])
+    c[2].metric("테마사진", prof["테마사진"],
+                help=f"월별 테마에 낸 사진. {prof['테마 참여월']}개월에 걸쳐 "
+                     "냈습니다 — 한 달에 몰아 내는 것과 다릅니다.")
+    c[3].metric("사진 좋아요", prof["사진 좋아요"],
+                help=f"받은 좋아요 합. 장당 {prof['장당 좋아요']}개입니다 — "
+                     "많이 올리면 합은 저절로 커지므로 순위는 장당으로 봅니다.")
+    c[4].metric("게시글 좋아요", prof["게시글 좋아요"],
+                help="공지·후기 글이 받은 좋아요 합입니다(사진과 별개).")
+
+    st.markdown("###### 언제부터, 언제까지")
+    # **두 칸씩 두 줄.** 위 줄들처럼 넉넉히 늘어놓으면 `2026-07-19`가 폭에 밀려
+    # `2026-07-…`로 잘린다 — 날짜는 뒤가 잘리면 아무 쓸모가 없다.
+    c = st.columns(2)
+    c[0].metric("가입일", prof["가입일"],
+                help="가입인사를 쓴 날. 분석 기간과 무관한 사실이라 "
+                     "`아이고 어르신` 칭호가 이 날짜로 매겨집니다.")
+    c[1].metric("첫 등장", prof["첫 등장"],
+                help="**이 분석 기간 안에서** 처음 참석한 자리의 날짜입니다 — "
+                     "기간을 좁히면 늦어집니다.")
+    c = st.columns(2)
+    c[0].metric("최근 참석", prof["최근 참석"],
+                help="마지막으로 나온 자리의 날짜. 3개월이 넘으면 `휴면` 배지가 "
+                     "붙습니다.")
+    c[1].metric("마지막 방문", prof["마지막 방문"],
+                help="앱에 마지막으로 들어온 날(멤버 목록에서 옵니다). 참석과는 "
+                     "다릅니다 — 눈팅만 해도 갱신됩니다.")
     st.caption(f"**참석률의 분모는 후기가 매칭된 출사 {prof['매칭 출사']}건**입니다. "
                "후기가 없는 출사는 누가 갔는지 알 방법이 없어, 분모에 넣으면 아무 "
                "잘못 없이 모두의 참석률이 낮아집니다.")
@@ -3879,12 +3983,21 @@ def _tab_member_focus(posts: list[dict], photos: list[dict],
     #
     # 모수는 **라벨에** 넣는다. `delta`로 빼면 증감 화살표가 붙어 "18명 늘었다"로
     # 읽힌다.
-    for col, key in zip(st.columns(3), ("참석", "개최", "사진")):
-        rank = prof[f"{key} 순위"]
-        col.metric(f"{key} ({prof[f'{key} 모수']}명 중)",
-                   f"{rank}등" if rank else "—")
-    st.caption("같은 횟수면 **같은 등수**입니다(1·2·2·4). 모수는 그 활동을 한 번이라도 "
-               "한 사람 수 — 개최는 펑 아닌 출사를 연 사람만 셉니다.")
+    #
+    # **위 지표와 같은 묶음·같은 순서로 그린다.** 셋만 그리던 시절에는 벙만
+    # 다니는 분에게 "출사 87명 중 몇 등"만 보여 줘, 그 사람이 이 모임에서 무엇을
+    # 하는 사람인지가 화면에서 통째로 빠졌다.
+    for 묶음, keys in RANK_GROUPS.items():
+        st.markdown(f"###### {묶음}")
+        for col, key in zip(st.columns(len(keys)), keys):
+            rank, total = prof[f"{key} 순위"], prof[f"{key} 모수"]
+            col.metric(f"{RANK_LABEL.get(key, key)} ({total}명 중)",
+                       f"{rank}등" if rank else "—")
+    st.caption("같은 횟수면 **같은 등수**입니다(1·2·2·4). 모수는 **그 활동을 한 "
+               "번이라도 한 사람 수**라, 지표마다 다릅니다 — 출사 참석은 87명이지만 "
+               "문화벙 개최는 9명입니다. 아홉 명 중 1등과 여든일곱 명 중 1등은 무게가 "
+               "다르니 괄호 안 숫자를 함께 보세요. `—`는 그 활동을 한 번도 안 한 "
+               "것입니다. 개최는 펑 아닌 것만 셉니다.")
 
     st.markdown("#### 월별 활동 추이")
     mm, _ = attendance_monthly_matrix(posts)
