@@ -4,7 +4,7 @@
 믿고 덜 채워진 결과를 그대로 읽게 된다.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from core.store import (
     TAB_ATTENDEE_FIX,
@@ -13,6 +13,9 @@ from core.store import (
     TAB_POST_FIX,
 )
 from streamlit_app import (
+    BADGE_TITLES,
+    FIXED_TITLE_NAMES,
+    TITLE_LIMIT,
     avg_attendance_trend,
     co_attendance,
     confidence_report,
@@ -1161,27 +1164,81 @@ def _old_crowd(n=30):
     return posts, members
 
 
+def _cands_all(posts, photos, members, months=None):
+    """전원의 후보 `{이름: [칭호…]}` — ctx를 **한 번만** 만든다.
+
+    `_cands`는 부를 때마다 ctx를 새로 만들어, 수십 명한테 돌리면 그것만으로
+    몇 초가 든다.
+    """
+    from streamlit_app import (_title_candidates, club_context,
+                               member_companions, member_profile)
+    months = months or [202603]
+    ctx = club_context(posts, photos, members, months)
+    return {m["mn"]: [t["칭호"] for t in _title_candidates(
+        m["mn"], member_profile(m["mn"], posts, photos, members, ctx),
+        member_companions(m["mn"], posts, ctx["쌍"]), posts, photos,
+        months, ctx)] for m in members}
+
+
+def _uneven_crowd(n=80):
+    """참석 횟수가 저마다 다른 판 — `i`번은 `i+1`회 나온다.
+
+    `_old_crowd`는 전원이 똑같이 나와 강도가 전부 동점이라, **정원이 무엇으로
+    줄을 세우는지**는 이 판으로만 볼 수 있다. 여든 명인 것은 `프로 참석러`가
+    상위 15%여서, 후보가 정원 9명을 넘으려면 그만큼 필요하기 때문이다.
+    """
+    people = [f"고참{i:02d}" for i in range(n)]
+    day = date(2026, 3, 1)
+    posts = [notice(f"n{j}", str(day + timedelta(days=j)), people[j:])
+             for j in range(n)]
+    members = [member(f"w{i}", p, datetime(2024, 1 + i % 12, 1 + i % 28))
+               for i, p in enumerate(people)]
+    return posts, members
+
+
 def test_no_title_goes_over_its_quota():
     """실제 데이터에서 `인풍 애호가`가 94명 중 20명에게 붙었다."""
     from collections import Counter as C
 
-    from streamlit_app import TITLE_QUOTA_DEFAULT
+    from streamlit_app import BADGE_TITLES, TITLE_QUOTA_DEFAULT
     posts, members = _old_crowd()
     counts = C(t["칭호"] for ts in _club(posts, [], members).values() for t in ts)
-    assert counts["아이고 어르신"] == TITLE_QUOTA_DEFAULT
-    assert max(counts.values()) <= TITLE_QUOTA_DEFAULT, counts
+    assert counts["이게 본업이에요"] == TITLE_QUOTA_DEFAULT
+    over = {k: v for k, v in counts.items()
+            if v > TITLE_QUOTA_DEFAULT and k not in BADGE_TITLES}
+    assert not over, over
+
+
+def test_a_badge_title_ignores_the_quota():
+    """배지형은 정원을 안 탄다 — 서른 명이 자격이면 서른 명이 받는다.
+
+    실데이터에서 `아이고 어르신` 자격자 14명 중 한 명이, 칭호가 하나뿐인데도
+    정원 9명에 잘렸다. 가입일이 가장 늦다는 이유였다 — 활동으로 진 것이
+    아니라 자리가 없어서 진 것이라 규칙이 잘못이었다.
+    """
+    from collections import Counter as C
+
+    from streamlit_app import TITLE_QUOTA_DEFAULT
+    posts, members = _old_crowd(30)
+    counts = C(t["칭호"] for ts in _club(posts, [], members).values() for t in ts)
+    assert counts["아이고 어르신"] == 30 > TITLE_QUOTA_DEFAULT
 
 
 def test_the_quota_keeps_the_strongest():
-    """자를 때는 그 칭호가 재는 바로 그 숫자로 줄을 세운다 — 여기서는 가입일."""
-    posts, members = _old_crowd()
-    joined = {m["mn"]: m["joined_at"] for m in members}
+    """자를 때는 그 칭호가 재는 바로 그 숫자로 줄을 세운다 — 여기서는 참석 수."""
+    posts, members = _uneven_crowd()
+    att = {m["mn"]: sum(m["mn"] in p["attendees"] for p in posts)
+           for m in members}
     got = _club(posts, [], members)
     kept = [n for n, ts in got.items()
-            if any(t["칭호"] == "아이고 어르신" for t in ts)]
-    cut = [m["mn"] for m in members if m["mn"] not in kept]
+            if any(t["칭호"] == "프로 참석러" for t in ts)]
+    # 후보이면서 못 받은 사람 = 정원에 잘린 사람. 1등은 `이게 본업이에요`로
+    # 빠지므로 후보 목록에서 직접 캔다.
+    cand = _cands_all(posts, [], members)
+    cut = [n for n, ts in cand.items()
+           if "프로 참석러" in ts and n not in kept]
     assert kept and cut
-    assert max(joined[k] for k in kept) <= min(joined[c] for c in cut)
+    assert min(att[k] for k in kept) >= max(att[c] for c in cut)
 
 
 def test_a_metric_keeps_more_than_one_candidate():
@@ -1201,9 +1258,132 @@ def test_a_cut_person_still_keeps_titles_from_other_metrics():
     posts, members = _old_crowd(12)
     got = _club(posts, [], members)
     cut = [m["mn"] for m in members
-           if "아이고 어르신" not in _names(got[m["mn"]])]
+           if "이게 본업이에요" not in _names(got[m["mn"]])]
     assert cut, "정원에 밀린 사람이 없다 — 픽스처가 잘못됐다"
     assert all(got[n] for n in cut), [n for n in cut if not got[n]]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 배지형 칭호 — 활동에 밀려 사라지면 안 되는 사실
+# ═══════════════════════════════════════════════════════════════
+
+def _busy_oldtimer(n=6):
+    """세 칸이 꽉 차고도 남을 만큼 활동하는 고참 한 명 + 들러리들."""
+    me = "고참"
+    others = [f"동료{i}" for i in range(n)]
+    posts = [notice(f"n{j}", "2026-03-%02d" % (j + 1), [me, *others],
+                    author=me) for j in range(10)]
+    members = [member("w0", me, datetime(2021, 6, 22))]
+    members += [member(f"w{i + 1}", p, datetime(2025, 12, 1))
+                for i, p in enumerate(others)]
+    return posts, members
+
+
+def test_a_badge_title_survives_a_full_three_slots():
+    """세 칸이 다 차도 배지형은 나온다.
+
+    실데이터에서 가장 활동이 많은 분이 95·93·90짜리 셋으로 칸을 채워
+    `아이고 어르신`(79)이 밀려 있었다. 2021년부터 자리를 지켜 온 것이 요즘
+    부지런하다는 이유로 가려지면 안 된다.
+    """
+    posts, members = _busy_oldtimer()
+    got = _names(_club(posts, [], members)["고참"])
+    assert "아이고 어르신" in got, got
+    assert len(got) > TITLE_LIMIT, got
+
+
+def test_a_badge_title_does_not_eat_a_slot():
+    """배지형을 받아도 기간 칭호는 여전히 셋까지 받는다."""
+    posts, members = _busy_oldtimer()
+    got = _club(posts, [], members)["고참"]
+    기간 = [t for t in got if t["칭호"] not in BADGE_TITLES]
+    assert len(기간) == TITLE_LIMIT, _names(got)
+
+
+def test_a_badge_title_leaves_its_metric_to_the_others():
+    """배지형은 지표 경쟁에서도 빠진다.
+
+    `아이고 어르신`과 `돌아오세요`는 둘 다 `연차` 지표다. 지표당 하나 규칙에
+    묶여 있으면, 오래 계신 분이 한동안 안 나오셨다는 사실이 통째로 가려진다.
+    """
+    # 다섯 번 나오시다 넉 달째 조용한 고참 한 분. 카테고리를 흩어 놓은 것은
+    # 한 갈래로 몰리면 카테고리 칭호가 붙어 칸을 먹기 때문이다.
+    me, others = "고참", [f"동료{i}" for i in range(4)]
+    cats = ["풍경", "인물", "GN", "인물&풍경", "풍경"]
+    early = ["2026-03-07", "2026-03-14", "2026-03-21", "2026-03-28",
+             "2026-04-04"]
+    late = ["2026-08-01", "2026-08-08", "2026-08-15"]
+    posts = [notice(f"n{j}", d, [me, *others], author="동료0",
+                    category=cats[j], title=f"[{cats[j]}] n{j}")
+             for j, d in enumerate(early)]
+    posts += [notice(f"m{j}", d, others, author="동료0", category=cats[j],
+                     title=f"[{cats[j]}] m{j}") for j, d in enumerate(late)]
+    members = [member("w0", me, datetime(2021, 6, 22))]
+    members += [member(f"w{i + 1}", p, datetime(2025, 12, 1))
+                for i, p in enumerate(others)]
+    months = [202603, 202604, 202605, 202606, 202607, 202608]
+
+    got = _names(_club(posts, [], members, months)[me])
+    연차 = [t for t in got if t in ("아이고 어르신", "돌아오세요")]
+    assert set(연차) == {"아이고 어르신", "돌아오세요"}, got
+
+
+def test_a_badge_title_ignores_the_period():
+    """기간을 좁혀도 받는 사람이 그대로다 — 배지형의 자격 요건.
+
+    `아이고 어르신`은 가입일로만 재서 이 성질을 지킨다. 옆자리 `첫 출사 못
+    참지`는 `첫등장`을 써서 기간을 좁히면 사라진다 — 그래서 배지형이 아니다.
+    """
+    people = [f"고참{i:02d}" for i in range(6)]
+    early = [notice(f"e{j}", "2026-01-%02d" % (j + 1), people) for j in range(3)]
+    late = [notice(f"l{j}", "2026-03-%02d" % (j + 1), people) for j in range(3)]
+    members = [member(f"w{i}", p, datetime(2024, 1 + i, 1))
+               for i, p in enumerate(people)]
+
+    def holders(posts, months):
+        return {n for n, ts in _club(posts, [], members, months).items()
+                if "아이고 어르신" in _names(ts)}
+
+    전체 = holders(early + late, [202601, 202602, 202603])
+    최근 = holders(late, [202603])
+    assert 전체 == 최근 == set(people), (전체, 최근)
+
+
+def test_only_period_proof_titles_are_badges():
+    """배지형 목록에 기간 종속 칭호가 섞이면 안 된다.
+
+    `첫 출사 못 참지`가 대표적인 유혹이다 — 가입 직후 나왔다는 사실은 안
+    변할 것 같지만, 기간을 좁히면 `첫등장`이 밀려 값이 커지고 사라진다.
+    """
+    assert "첫 출사 못 참지" not in BADGE_TITLES
+    assert "새싹" not in BADGE_TITLES
+    assert BADGE_TITLES <= set(FIXED_TITLE_NAMES), \
+        BADGE_TITLES - set(FIXED_TITLE_NAMES)
+
+
+def test_badge_titles_come_first():
+    """화면이 배지형과 기간형을 갈라 그릴 수 있게 앞에 모아 둔다."""
+    posts, members = _busy_oldtimer()
+    got = _names(_club(posts, [], members)["고참"])
+    assert got[0] in BADGE_TITLES, got
+    assert not (set(got[1:]) & BADGE_TITLES), got
+
+
+def test_the_screen_splits_badges_from_period_titles():
+    """멤버 상세가 두 줄로 나눠 그리는 근거 — 하나도 흘리지 않는다."""
+    from streamlit_app import split_badge_titles
+    posts, members = _busy_oldtimer()
+    titles = _club(posts, [], members)["고참"]
+    badge, period = split_badge_titles(titles)
+    assert [t["칭호"] for t in badge] == ["아이고 어르신"]
+    assert len(period) == TITLE_LIMIT
+    assert badge + period == titles, "순서나 개수가 바뀌면 화면이 어긋난다"
+
+
+def test_splitting_titles_handles_an_empty_list():
+    """칭호가 하나도 없는 사람도 화면을 그린다."""
+    from streamlit_app import split_badge_titles
+    assert split_badge_titles([]) == ([], [])
 
 
 def test_ties_are_broken_differently_for_each_title():
